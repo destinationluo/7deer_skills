@@ -18,7 +18,7 @@
 
 📺 **YouTube 内容情报** — `youtube-intel` 帮你扫描一个类目的竞争格局（六步工作流：需求分析 → 策略制定 → 数据获取 → 清洗 → 识别 → 保存），`youtube-transcribe` 把视频转成文字稿存入 memory，`youtube-content-gen` 再把视频内容转化成 SEO 页面。
 
-🔗 **外链建设自动化** — 从发现机会（`backlink-discovery`）到评估目录（`backlink-intelligence`）到生成个性化邮件（`seo-link-strategy`）到批量提交（`seo-backlink-submitter`），四个技能串起完整的外链工作流。新加入的 `signallayer-backlinks-client` 可通过 SignalLayer.io API 为任意网站快速创建外链投放 campaign，支持 drip/instant 两种速度模式。
+🔗 **外链建设自动化** — 从发现机会（`backlink-discovery`）到评估目录（`backlink-intelligence`）到生成个性化邮件（`seo-link-strategy`）到批量提交（`seo-backlink-submitter`），四个技能串起完整的外链工作流。`signallayer-backlinks-client` 可通过 SignalLayer.io API 创建和跟踪 campaign，支持 natural、standard 与 10–30 天 drip 排期。
 
 🧩 **不是 prompt 收集，是可执行的工作流** — 每个技能都包含 `SKILL.md` 文档 + 可直接运行的脚本 / 模板 / 参考文件。不是告诉你「应该怎么做」，而是直接帮你做。
 
@@ -126,7 +126,8 @@ cp -r 7deer_skills/google-trends-to-pages .agent/skills/
 | 13 | **backlink-intelligence** | AI/Tools 目录外链情报收集与评估 | 外链情报 |
 | 14 | **keyword-competition-analysis** | 谷歌关键词竞争度分析 | SEO 调研 |
 | 15 | **seo-backlink-submitter** | 批量目录提交工具（Playwright 自动化） | 外链分发 |
-| 16 | **seo-link-strategy** | 外链策略生成器（发现→评估→邮件→自动发送） | 外链营销 |\n| 17 | **signallayer-backlinks-client** | SignalLayer.io API 外链投放客户端（支持 drip/instant） | 外链自动化 |
+| 16 | **seo-link-strategy** | 外链策略生成器（发现→评估→邮件→自动发送） | 外链营销 |
+| 17 | **signallayer-backlinks-client** | SignalLayer.io API 客户端（natural / standard / drip） | 外链自动化 |
 
 ### 游戏 & 工具
 | # | 技能名称 | 描述 | 适用场景 |

@@ -1,108 +1,113 @@
 ---
 name: signallayer-backlinks-client
-description: SignalLayer 外链投放客户端（通用版）。供其他 OpenClaw 用户安装使用，通过 SignalLayer.io API 为网站创建外链投放 campaign。支持创建 campaign、查询状态、管理多任务。用户需自行配置自己的 SignalLayer API Key。
+description: 使用 SignalLayer.io 的真实 OpenClaw API 创建、查询和分页管理外链 Campaign。适用于用户要求配置 SignalLayer API Key、查询积分、创建外链任务、查看任务状态或列出 Campaign；客户端未指定数量时默认 200，但服务端 linkCount 始终必填。
 ---
 
 # SignalLayer Backlinks Client
 
-通用版 SignalLayer 外链投放工具，供其他 OpenClaw 用户安装使用。
+## 安全规则
 
-## 功能
+1. 优先从 `SIGNALLAYER_API_KEY` 环境变量读取 Key。
+2. 不在回复、日志或 Campaign 历史中回显完整 Key。
+3. 仅在用户明确选择兼容模式时，才保存到 `memory/signallayer-api-user.md`；提醒这是明文文件且不得提交 Git。
+4. 配置后必须调用 `GET /credits` 真实验证。仅检查 `sl_` 前缀不算验证成功。
 
-- ✅ 创建外链投放 campaign
-- ✅ 查询 campaign 状态
-- ✅ 管理多个外链任务
-- ✅ 自动记录到 memory 文件
+## API 契约
 
-## 快速开始
+Base URL：`https://signallayer.io/api/openclaw`
 
-### 1. 安装后首次使用
+| 操作 | 方法与路径 |
+|------|------------|
+| 查询积分 / 验证 Key | `GET /credits` |
+| 创建 | `POST /create-campaign` |
+| 查询单个任务 | `GET /campaign-status/{id}` |
+| 查询任务列表 | `GET /campaigns?limit=20&offset=0` |
 
-首次使用时，告诉 Agent 你的 SignalLayer API Key：
-```
-"我的 SignalLayer API Key 是 xxx"
-```
+认证 Header：`Authorization: Bearer <USER_API_KEY>`。
 
-Agent 会自动保存到 `memory/signallayer-api-user.md`
+## 创建流程
 
-### 2. 创建外链 campaign
+1. 获取 API Key 并调用 `/credits`。
+2. 从用户请求提取参数：
+   - `targetUrl`：必填。
+   - `brandName`：API 必填；用户未提供时，可从目标 hostname 生成候选值并明确告知用户。
+   - `linkCount`：API 必填；用户未指定时客户端使用 200。
+   - `keywords`：可选，默认空字符串。
+   - `strategy`：`safety`（默认）、`neutral`、`aggressive`。
+   - `speed`：`natural`（默认）、`standard`、`drip`。
+   - `dripDays`：`drip` 时为 10–30，默认 14。
+3. 调用：
 
-告诉 Agent：
-```
-"用 SignalLayer 给 https://example.com 发 200 条外链"
-```
-
-Agent 会使用你的 API Key 发送请求。
-
-## 工作流程
-
-### Step 1: 检查配置
-
-1. 读取 `memory/signallayer-api-user.md` 获取用户 API Key
-2. 如不存在，引导用户配置
-
-### Step 2: 准备 Campaign 参数
-
-必填：
-- `target_url` - 目标网站 URL
-- `brand` - 品牌名称
-- `keywords` - 关键词
-- `quantity` - 外链数量（默认 200）
-
-可选：
-- `strategy` - 策略：`safety`（默认）或 `aggressive`
-- `speed` - 速度：`drip`（默认，分14天）或 `instant`
-
-### Step 3: 调用 API
-
-```
+```http
 POST https://signallayer.io/api/openclaw/create-campaign
-Headers: Authorization: Bearer <USER_API_KEY>
-Body: { targetUrl, brandName, keywords, linkCount, strategy, speed, dripDays, source }
+Authorization: Bearer <USER_API_KEY>
+Content-Type: application/json
+
+{
+  "targetUrl": "https://example.com",
+  "brandName": "Example",
+  "keywords": "seo,marketing",
+  "linkCount": 200,
+  "strategy": "safety",
+  "speed": "natural",
+  "dripDays": 14,
+  "source": "openclaw-skill"
+}
 ```
 
-### Step 4: 记录结果
+4. 创建成功必须按 HTTP 201 和 `success: true` 判断。Campaign ID 位于 `campaign.id`。
+5. 只记录非敏感 Campaign 元数据。
 
-追加到 `memory/signallayer-api-user.md`：
-```markdown
-### Campaign #N
-- **Campaign ID**: <id>
-- **目标**: <target_url>
-- **品牌**: <brand>
-- **关键词**: <keywords>
-- **外链数量**: <quantity>
-- **策略**: <strategy>
-- **速度**: <speed>
-- **状态**: <status>
-- **创建时间**: <timestamp>
+## 状态与列表
+
+状态响应的进度位于：
+
+```json
+{
+  "campaign": {
+    "progress": {
+      "total": 200,
+      "completed": 85,
+      "pending": 115,
+      "percent": 43
+    }
+  }
+}
 ```
 
-### Step 5: 向用户报告
+不要读取不存在的顶层 `completed`、`total`、`campaign_id`、`updatedAt` 或预计完成时间。
 
-- Campaign ID
-- 目标 URL
-- 外链数量
-- 状态
-- 预计完成时间
+列表接口默认返回 20 条，`limit` 最大为 100。它是 Campaign 分页数量，与每个 Campaign 的外链数量无关。
 
-## 常用命令
+## 计费与速度
 
-- "给 https://example.com 发 200 条外链"
-- "用 SignalLayer 投 500 条外链到 example.com"
-- "SignalLayer 创建外链 campaign"
-- "查看 SignalLayer 任务状态"
-- "配置我的 SignalLayer API Key"
+- 当前计费：`1 条外链 = 1 积分`。
+- `aggressive` 不按 1.5 倍扣积分。
+- API 不支持 `instant`，不得发送或向用户推荐该值。
+- `natural`/`standard` 进入正常 Agent 队列；`drip` 生成 10–30 天的日期排期。
+- API 不返回 SLA 或预计完成日期，不要自行承诺。
 
-## 获取 API Key
+## 错误处理
 
-访问 https://app.signallayer.io 注册并获取 API Key。
+读取 HTTP 状态和 JSON 中的 `code`、`error`、可选 `field`：
 
-## 文件结构
+- 400：参数或 Campaign ID 格式错误。
+- 401：Key 缺失或无效。
+- 402：积分不足。
+- 404：任务不存在或不属于当前 Key。
+- 500：服务端创建、列表或状态查询失败。
 
+遇到 HTML 响应时，优先检查是否误用了 `api.signallayer.io/v1` 或 `/campaigns/{id}` 等旧路径。
+
+## 独立客户端
+
+优先使用仓库脚本，避免手写漂移的请求：
+
+```bash
+python scripts/signallayer_client.py --credits
+python scripts/signallayer_client.py --target "https://example.com" --brand "Example"
+python scripts/signallayer_client.py --status "campaign_uuid"
+python scripts/signallayer_client.py --list
 ```
-signallayer-backlinks-client/
-├── SKILL.md                    # 本文件
-├── SETUP.md                    # 安装配置指南
-└── references/
-    └── api.md                  # API 文档
-```
+
+完整契约见 `references/api.md`，排查流程见 `OPERATION-GUIDE.md`。

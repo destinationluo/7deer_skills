@@ -3,12 +3,17 @@
 Thumbs.db
 *.swp
 *.swo
+__pycache__/
+*.pyc
 .idea/
 .vscode/
 
 # Project-specific data (keep private)
 backlink-discovery/memory/*/
 !backlink-discovery/memory/README.md
+
+# SignalLayer API keys and local campaign history are private.
+signallayer-backlinks-client/memory/
 
 seo-backlink-submitter/targets/*.json
 seo-backlink-submitter/targets/*.txt

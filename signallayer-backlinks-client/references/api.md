@@ -1,198 +1,200 @@
-# SignalLayer.io API 参考
+# SignalLayer OpenClaw API 参考
 
 ## 基础信息
 
-- **API 文档**: https://docs.signallayer.com
-- **Base URL**: https://signallayer.io/api/openclaw
-- **认证**: Bearer Token (API Key)
+- Base URL：`https://signallayer.io/api/openclaw`
+- 认证：`Authorization: Bearer sl_xxx`
+- Content-Type：创建请求使用 `application/json`
+- 所有响应都是 JSON，包含布尔字段 `success`
+
+错误响应统一包含：
+
+```json
+{
+  "success": false,
+  "error": "Human-readable message",
+  "code": "STABLE_ERROR_CODE",
+  "field": "optionalFieldName"
+}
+```
+
+## 查询积分
+
+```http
+GET /credits
+```
+
+成功响应（HTTP 200）：
+
+```json
+{
+  "success": true,
+  "email": "user@example.com",
+  "credits": {
+    "paid": 500,
+    "dailyFreeRemaining": 10,
+    "dailyFreeTotal": 10,
+    "totalAvailable": 510
+  }
+}
+```
 
 ## 创建 Campaign
 
-### Endpoint
-```
+```http
 POST /create-campaign
 ```
 
-### Headers
-```
-Authorization: Bearer <API_KEY>
-Content-Type: application/json
-```
+### 请求字段
 
-### Request Body
+| 字段 | 类型 | 必填 | 默认值 / 约束 |
+|------|------|------|---------------|
+| `targetUrl` | string | 是 | HTTP/HTTPS URL；无协议时补 HTTPS |
+| `targetUrls` | string[] | 否 | 多页面目标 URL |
+| `brandName` | string | 是 | 1–200 字符 |
+| `keywords` | string | 否 | 默认空，最多 5000 字符 |
+| `linkCount` | integer | 是 | 1–10000；服务端没有 200 默认值 |
+| `strategy` | string | 否 | `safety` / `neutral` / `aggressive`，默认 `safety` |
+| `speed` | string | 否 | `natural` / `standard` / `drip`，默认 `natural` |
+| `dripDays` | integer | 否 | 默认 14；`drip` 时必须 10–30 |
+| `source` | string | 否 | 默认 `openclaw`，最多 100 字符 |
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| targetUrl | string | 是 | 目标网站 URL |
-| brandName | string | 是 | 品牌名称 |
-| keywords | string | 是 | SEO 关键词（逗号分隔） |
-| linkCount | integer | 是 | 外链数量（建议 50-500） |
-| strategy | string | 否 | `safety`（默认）或 `aggressive` |
-| speed | string | 否 | `drip`（默认）或 `instant` |
-| dripDays | integer | 否 | drip 模式天数（默认 14） |
-| source | string | 否 | 来源标识（建议填写） |
-
-### Request 示例
+请求示例：
 
 ```json
 {
   "targetUrl": "https://example.com",
   "brandName": "Example Brand",
-  "keywords": "example, keywords, for, seo",
+  "keywords": "example,seo",
   "linkCount": 200,
   "strategy": "safety",
   "speed": "drip",
   "dripDays": 14,
-  "source": "openclaw"
+  "source": "openclaw-client"
 }
 ```
 
-### Response 成功示例
+成功响应（HTTP 201）：
 
 ```json
 {
   "success": true,
   "campaign": {
     "id": "8b8ff7e3-f29d-4b7d-b0cb-f3e00b731233",
-    "targetUrl": "https://example.com",
+    "targetUrl": "https://example.com/",
     "brandName": "Example Brand",
-    "keywords": "example,keywords,for,seo",
+    "keywords": "example,seo",
     "linkCount": 200,
     "strategy": "safety",
     "speed": "drip",
     "dripDays": 14,
     "status": "processing",
-    "createdAt": "2026-05-19T22:30:00Z"
-  }
+    "createdAt": "2026-08-03T10:00:00Z"
+  },
+  "credits": {
+    "freeUsed": 10,
+    "paidUsed": 190,
+    "paidBalance": 310,
+    "dailyFreeRemaining": 0
+  },
+  "message": "Campaign created: 200 backlinks for https://example.com/. Agent will start processing shortly."
 }
 ```
 
-### Response 错误示例
+订单、积分交易和全部订单明细在一个数据库事务中创建；任一步失败都会回滚。
 
-```json
-{
-  "success": false,
-  "error": "Invalid API key"
-}
+## 查询单个 Campaign
+
+```http
+GET /campaign-status/{campaign_id}
 ```
 
-## 查询 Campaign 状态
-
-### Endpoint
-```
-GET /campaigns/{campaign_id}
-```
-
-### Headers
-```
-Authorization: Bearer <API_KEY>
-```
-
-### Response 示例
+成功响应（HTTP 200）：
 
 ```json
 {
   "success": true,
   "campaign": {
     "id": "8b8ff7e3-f29d-4b7d-b0cb-f3e00b731233",
+    "targetUrl": "https://example.com/",
+    "brandName": "Example Brand",
     "status": "processing",
     "progress": {
       "total": 200,
-      "completed": 45,
-      "remaining": 155
+      "completed": 85,
+      "pending": 115,
+      "percent": 43
     },
-    "createdAt": "2026-05-19T22:30:00Z",
-    "updatedAt": "2026-05-19T23:00:00Z"
+    "strategy": "safety",
+    "speed": "drip",
+    "createdAt": "2026-08-03T10:00:00Z"
+  },
+  "liveLinks": []
+}
+```
+
+不存在 `updatedAt` 或预计完成时间字段。
+
+## 查询 Campaign 列表
+
+```http
+GET /campaigns?limit=20&offset=0
+```
+
+- `limit` 默认 20，范围 1–100。
+- `offset` 默认 0，范围 0–100000。
+- 分页数量与 Campaign 的 `linkCount` 无关。
+
+```json
+{
+  "success": true,
+  "campaigns": [],
+  "pagination": {
+    "limit": 20,
+    "offset": 0,
+    "total": 0,
+    "hasMore": false
   }
 }
 ```
 
-## Campaign 状态
+## 状态与计费
 
-| 状态 | 说明 |
-|------|------|
-| pending | 等待处理 |
-| processing | 处理中 |
-| completed | 已完成 |
-| failed | 失败 |
-| paused | 暂停 |
+订单状态可能是 `pending`、`processing`、`completed`、`cancelled`。
 
-## 策略说明
+当前公开 API 始终按 `linkCount` 扣积分：`1 条外链 = 1 积分`。策略不会产生 1.5 倍系数。
 
-| 策略 | 说明 |
-|------|------|
-| safety | 安全策略，外链逐步释放，降低风险（推荐） |
-| aggressive | 激进策略，更快投放，可能有更高风险 |
+## 常见错误
 
-## 速度说明
+| HTTP | code | 含义 |
+|------|------|------|
+| 400 | `INVALID_REQUEST` | 请求字段、URL、枚举或范围错误 |
+| 400 | `INVALID_CAMPAIGN_ID` | Campaign ID 不是 UUID |
+| 400 | `INVALID_PAGINATION` | 列表分页参数错误 |
+| 401 | `MISSING_API_KEY` | 缺少 Bearer Header |
+| 401 | `INVALID_API_KEY` | Key 格式或凭证无效 |
+| 402 | `INSUFFICIENT_CREDITS` | 可用积分不足 |
+| 404 | `CAMPAIGN_NOT_FOUND` | 任务不存在或不属于当前用户 |
+| 500 | `CAMPAIGN_CREATE_FAILED` | 创建事务失败 |
+| 500 | `CAMPAIGN_STATUS_FAILED` | 状态查询失败 |
+| 500 | `CAMPAIGN_LIST_FAILED` | 列表查询失败 |
 
-| 速度 | 说明 |
-|------|------|
-| drip | 滴灌模式，分批逐步投放（默认 14 天） |
-| instant | 即时模式，快速投放所有外链 |
-
-## 错误码
-
-| 错误 | 说明 |
-|------|------|
-| Invalid API key | API Key 无效或已过期 |
-| Insufficient credits | 积分不足 |
-| Invalid target URL | 目标 URL 格式错误 |
-| Rate limit exceeded | 请求频率过高，请稍后重试 |
-
-## 示例代码
-
-### Python
-
-```python
-import requests
-
-API_KEY = "sl_your_api_key_here"
-BASE_URL = "https://signallayer.io/api/openclaw"
-
-def create_campaign(target_url, brand, keywords, quantity=200):
-    response = requests.post(
-        f"{BASE_URL}/create-campaign",
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "targetUrl": target_url,
-            "brandName": brand,
-            "keywords": keywords,
-            "linkCount": quantity,
-            "strategy": "safety",
-            "speed": "drip",
-            "dripDays": 14,
-            "source": "openclaw"
-        }
-    )
-    return response.json()
-
-result = create_campaign(
-    "https://example.com",
-    "Example Brand",
-    "example,keywords,for,seo",
-    200
-)
-print(result)
-```
-
-### curl
+## curl 调试
 
 ```bash
-curl -X POST https://signallayer.io/api/openclaw/create-campaign \
-  -H "Authorization: Bearer sl_your_api_key_here" \
+curl -i https://signallayer.io/api/openclaw/credits \
+  -H "Authorization: Bearer $SIGNALLAYER_API_KEY"
+```
+
+```bash
+curl -i -X POST https://signallayer.io/api/openclaw/create-campaign \
+  -H "Authorization: Bearer $SIGNALLAYER_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "targetUrl": "https://example.com",
-    "brandName": "Example Brand",
-    "keywords": "example,keywords,for,seo",
-    "linkCount": 200,
+    "brandName": "Example",
+    "linkCount": 50,
     "strategy": "safety",
-    "speed": "drip",
-    "dripDays": 14,
-    "source": "openclaw"
+    "speed": "natural"
   }'
 ```
