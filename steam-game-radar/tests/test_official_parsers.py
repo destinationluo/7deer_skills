@@ -12,12 +12,14 @@ sys.path.insert(0, str(PROJECT_DIR))
 
 from steam_game_radar.official_provider import (
     AppIdentity,
+    DiscoveryCandidate,
     STEAM_APPDETAILS_SOURCE_ID,
     parse_appdetails,
     parse_current_players,
     parse_featured,
     parse_most_played,
 )
+from steam_game_radar.errors import InputValidationError
 
 
 OBSERVED_AT = "2026-08-24T03:00:00Z"
@@ -42,6 +44,7 @@ class MostPlayedParserTests(unittest.TestCase):
         payload = load_fixture("most_played.json")
         result = parse_most_played(payload, OBSERVED_AT)
 
+        self.assertEqual(payload["response"]["ranks"][2]["last_week_rank"], -1)
         self.assertEqual(result.warnings, ())
         self.assertEqual(
             [
@@ -107,6 +110,35 @@ class MostPlayedParserTests(unittest.TestCase):
             result.value[0].source_ranks["new"] = result.value[0].source_ranks[
                 "most_played_rank"
             ]
+        for invalid_names in ("most_played", b"most_played"):
+            with self.subTest(invalid_names=invalid_names), self.assertRaises(
+                InputValidationError
+            ):
+                DiscoveryCandidate(
+                    appid=730,
+                    priority=(0, 1, 730),
+                    source_ranks={},
+                    source_names=invalid_names,
+                )
+        names = ["most_played"]
+        isolated = DiscoveryCandidate(
+            appid=730,
+            priority=(0, 1, 730),
+            source_ranks={},
+            source_names=names,
+        )
+        names.append("top_sellers")
+        self.assertEqual(isolated.source_names, ("most_played",))
+        for invalid_names in ((), ("",)):
+            with self.subTest(invalid_names=invalid_names), self.assertRaises(
+                InputValidationError
+            ):
+                DiscoveryCandidate(
+                    appid=730,
+                    priority=(0, 1, 730),
+                    source_ranks={},
+                    source_names=invalid_names,
+                )
 
     def test_most_played_missing_optional_fields_remain_absent(self) -> None:
         result = parse_most_played(
@@ -139,6 +171,20 @@ class MostPlayedParserTests(unittest.TestCase):
                     "ranks": [
                         {"rank": 1, "appid": 730},
                         {"rank": True, "appid": 570},
+                    ]
+                }
+            },
+            {
+                "response": {
+                    "ranks": [
+                        {"rank": 1, "appid": 730, "last_week_rank": 0}
+                    ]
+                }
+            },
+            {
+                "response": {
+                    "ranks": [
+                        {"rank": 1, "appid": 730, "last_week_rank": -2}
                     ]
                 }
             },
@@ -344,6 +390,32 @@ class AppDetailsParserTests(unittest.TestCase):
                 result = parse_appdetails(appid, payload, OBSERVED_AT)
                 self.assertEqual(result.warnings, ())
                 self.assertEqual(result.value, identity)
+        numeric_dates = (
+            ("2026 年 9 月 7 日", "2026-09-07"),
+            ("2026年9月7日", "2026-09-07"),
+            ("2026년 9월 7일", "2026-09-07"),
+            ("2026/09/07", "2026-09-07"),
+            ("2026.09.07", "2026-09-07"),
+        )
+        for raw_date, normalized_date in numeric_dates:
+            with self.subTest(raw_date=raw_date):
+                localized_payload = {
+                    "730": {
+                        "success": True,
+                        "data": {
+                            "steam_appid": 730,
+                            "name": "Counter-Strike 2",
+                            "type": "game",
+                            "release_date": {
+                                "coming_soon": False,
+                                "date": raw_date,
+                            },
+                        },
+                    }
+                }
+                localized = parse_appdetails(730, localized_payload, OBSERVED_AT)
+                self.assertEqual(localized.warnings, ())
+                self.assertEqual(localized.value.release_date, normalized_date)
         payload["730"]["data"]["genres"][0]["description"] = "Changed"
         result = parse_appdetails(730, payload, OBSERVED_AT)
         payload["730"]["data"]["genres"][0]["description"] = "Changed Again"
@@ -375,6 +447,54 @@ class AppDetailsParserTests(unittest.TestCase):
                 observed_at=OBSERVED_AT,
             ),
         )
+        for raw_date in ("2026年2月30日", "07/09/2026"):
+            impossible_date = {
+                "440": {
+                    "success": True,
+                    "data": {
+                        "steam_appid": 440,
+                        "name": "Team Fortress 2",
+                        "type": "game",
+                        "release_date": {
+                            "coming_soon": False,
+                            "date": raw_date,
+                        },
+                    },
+                }
+            }
+            with self.subTest(raw_date=raw_date):
+                invalid_date_result = parse_appdetails(
+                    440, impossible_date, OBSERVED_AT
+                )
+                self.assertEqual(
+                    invalid_date_result.value.release_status, "released"
+                )
+                self.assertIsNone(invalid_date_result.value.release_date)
+        for invalid_genres in ("Action", b"Action", ("",)):
+            with self.subTest(invalid_genres=invalid_genres), self.assertRaises(
+                InputValidationError
+            ):
+                AppIdentity(
+                    appid=440,
+                    name="Team Fortress 2",
+                    app_type="game",
+                    release_status="released",
+                    release_date=None,
+                    genres=invalid_genres,
+                    observed_at=OBSERVED_AT,
+                )
+        genres = ["Action"]
+        isolated = AppIdentity(
+            appid=440,
+            name="Team Fortress 2",
+            app_type="game",
+            release_status="released",
+            release_date=None,
+            genres=genres,
+            observed_at=OBSERVED_AT,
+        )
+        genres.append("Free to Play")
+        self.assertEqual(isolated.genres, ("Action",))
 
     def test_appdetails_malformed_capability_returns_no_identity(self) -> None:
         payloads = (

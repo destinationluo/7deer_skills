@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
+import re
 from types import MappingProxyType
 from typing import Generic, TypeVar, cast
 
@@ -41,6 +42,24 @@ _FEATURED_METRICS = {
     "coming_soon": (0, "coming_soon_rank", STEAM_COMING_SOON_RANK_SOURCE_ID),
 }
 _RELEASE_STATUSES = {"released", "unreleased", "unknown"}
+_LOCALIZED_DATE_PATTERNS = (
+    re.compile(
+        r"(?P<year>[0-9]{4})\s*年\s*(?P<month>[0-9]{1,2})\s*"
+        r"月\s*(?P<day>[0-9]{1,2})\s*日"
+    ),
+    re.compile(
+        r"(?P<year>[0-9]{4})\s*년\s*(?P<month>[0-9]{1,2})\s*"
+        r"월\s*(?P<day>[0-9]{1,2})\s*일"
+    ),
+    re.compile(
+        r"(?P<year>[0-9]{4})/(?P<month>[0-9]{1,2})/"
+        r"(?P<day>[0-9]{1,2})"
+    ),
+    re.compile(
+        r"(?P<year>[0-9]{4})\.(?P<month>[0-9]{1,2})\."
+        r"(?P<day>[0-9]{1,2})"
+    ),
+)
 
 T = TypeVar("T")
 
@@ -94,12 +113,11 @@ class DiscoveryCandidate:
                     "source-rank values must be MetricObservation values"
                 )
             frozen_ranks[metric_name] = observation
-        names = tuple(self.source_names)
-        if not names or any(
-            not isinstance(source_name, str) or not source_name
-            for source_name in names
-        ):
-            raise InputValidationError("source_names must contain non-empty strings")
+        names = _immutable_strings(
+            self.source_names,
+            "source_names",
+            require_item=True,
+        )
         object.__setattr__(self, "source_ranks", MappingProxyType(frozen_ranks))
         object.__setattr__(self, "source_names", names)
 
@@ -125,9 +143,7 @@ class AppIdentity:
                 datetime.strptime(self.release_date, "%Y-%m-%d")
             except (TypeError, ValueError) as error:
                 raise InputValidationError("release_date must be an ISO date") from error
-        genres = tuple(self.genres)
-        if any(not isinstance(genre, str) or not genre for genre in genres):
-            raise InputValidationError("genres must contain non-empty strings")
+        genres = _immutable_strings(self.genres, "genres")
         _validate_observed_at(self.observed_at)
         object.__setattr__(self, "genres", genres)
 
@@ -156,12 +172,20 @@ def parse_most_played(
                 )
             }
             if "last_week_rank" in row:
-                previous_rank = _positive_integer(row["last_week_rank"])
-                metrics["previous_rank"] = _observation(
-                    previous_rank,
-                    STEAM_PREVIOUS_RANK_SOURCE_ID,
-                    observed_at,
-                )
+                previous_rank = row["last_week_rank"]
+                if (
+                    isinstance(previous_rank, bool)
+                    or not isinstance(previous_rank, int)
+                    or previous_rank == 0
+                    or previous_rank < -1
+                ):
+                    raise _MalformedPayload
+                if previous_rank > 0:
+                    metrics["previous_rank"] = _observation(
+                        previous_rank,
+                        STEAM_PREVIOUS_RANK_SOURCE_ID,
+                        observed_at,
+                    )
             if "peak_in_game" in row:
                 peak_players = _nonnegative_integer(row["peak_in_game"])
                 metrics["peak_players"] = _observation(
@@ -321,6 +345,19 @@ def _parse_release_date(value: object) -> tuple[str, str | None]:
             return status, datetime.strptime(date_text, date_format).date().isoformat()
         except ValueError:
             continue
+    for pattern in _LOCALIZED_DATE_PATTERNS:
+        match = pattern.fullmatch(date_text)
+        if match is None:
+            continue
+        try:
+            normalized = date(
+                int(match.group("year")),
+                int(match.group("month")),
+                int(match.group("day")),
+            ).isoformat()
+        except ValueError:
+            return status, None
+        return status, normalized
     return status, None
 
 
@@ -398,6 +435,26 @@ def _warning_appid(value: object) -> int | None:
 
 def _empty_featured() -> Mapping[str, tuple[DiscoveryCandidate, ...]]:
     return {category: () for category in _FEATURED_CATEGORIES}
+
+
+def _immutable_strings(
+    value: object,
+    field_name: str,
+    *,
+    require_item: bool = False,
+) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(
+        value, Sequence
+    ):
+        raise InputValidationError(f"{field_name} must be a sequence of strings")
+    items = tuple(value)
+    if require_item and not items:
+        raise InputValidationError(f"{field_name} must not be empty")
+    if any(not isinstance(item, str) or not item for item in items):
+        raise InputValidationError(
+            f"{field_name} must contain non-empty strings"
+        )
+    return items
 
 
 def _freeze_container(value: T) -> T:
