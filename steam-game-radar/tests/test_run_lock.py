@@ -197,17 +197,24 @@ class RunLockTests(unittest.TestCase):
             )
 
             original_working_directory = Path.cwd()
+            relative_root = Path(directory) / "relative"
+            alternate_working_directory = Path(directory) / "alternate-cwd"
+            alternate_working_directory.mkdir()
             try:
                 os.chdir(directory)
                 relative_path = Path("relative/nested/radar.lock")
-                with self._lock(relative_path):
-                    self.assertTrue(relative_path.exists())
-                self.assertFalse(relative_path.exists())
-                self.assertTrue(
-                    Path("relative/nested/.steam-radar-run-lock.gate").exists()
-                )
+                relative_lock = self._lock(relative_path)
+                relative_lock.__enter__()
+                self.assertTrue(relative_path.exists())
+                os.chdir(alternate_working_directory)
+                self.assertFalse(relative_lock.__exit__(None, None, None))
             finally:
                 os.chdir(original_working_directory)
+            self.assertFalse((relative_root / "nested/radar.lock").exists())
+            self.assertTrue(
+                (relative_root / "nested/.steam-radar-run-lock.gate").exists()
+            )
+            self.assertFalse((alternate_working_directory / "relative").exists())
 
             for unsafe_path in (Path("../radar.lock"), Path("safe/../radar.lock")):
                 with self.subTest(unsafe_path=unsafe_path), self.assertRaises(

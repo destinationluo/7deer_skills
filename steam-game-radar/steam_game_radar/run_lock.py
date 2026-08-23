@@ -189,6 +189,7 @@ class RunLock:
         self._acquired = False
         self._payload: Optional[LockPayload] = None
         self._created_identity: Optional[LockIdentity] = None
+        self._parent_descriptor: Optional[int] = None
 
     def _callback_context(self) -> tuple[datetime, str, int]:
         try:
@@ -675,6 +676,7 @@ class RunLock:
         self._encode_payload(payload)
         parent_descriptor = self._open_parent()
         gate_descriptor: Optional[int] = None
+        retain_parent_descriptor = False
         try:
             gate_descriptor = self._acquire_gate(parent_descriptor)
             removed_stale_lock = False
@@ -683,7 +685,9 @@ class RunLock:
                 if identity is not None:
                     self._payload = payload
                     self._created_identity = identity
+                    self._parent_descriptor = parent_descriptor
                     self._acquired = True
+                    retain_parent_descriptor = True
                     return self
                 if removed_stale_lock:
                     raise RunBusyError(
@@ -714,27 +718,28 @@ class RunLock:
         finally:
             if gate_descriptor is not None:
                 self._release_gate(gate_descriptor)
-            try:
-                os.close(parent_descriptor)
-            except OSError:
-                pass
+            if not retain_parent_descriptor:
+                try:
+                    os.close(parent_descriptor)
+                except OSError:
+                    pass
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
         if not self._acquired:
             return False
         payload = self._payload
         identity = self._created_identity
+        parent_descriptor = self._parent_descriptor
         self._acquired = False
         self._payload = None
         self._created_identity = None
-        if payload is None or identity is None:
-            return False
-
-        try:
-            parent_descriptor = self._open_parent()
-        except PersistenceError:
-            if exc_type is None:
-                raise
+        self._parent_descriptor = None
+        if payload is None or identity is None or parent_descriptor is None:
+            if parent_descriptor is not None:
+                try:
+                    os.close(parent_descriptor)
+                except OSError:
+                    pass
             return False
         gate_descriptor: Optional[int] = None
         try:
