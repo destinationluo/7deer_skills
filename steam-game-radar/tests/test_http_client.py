@@ -225,16 +225,33 @@ class HttpClientTests(unittest.TestCase):
 
     def test_retry_exhaustion_uses_exactly_initial_attempt_plus_max_retries(self) -> None:
         url = "https://api.steampowered.com/example"
+        clock = FakeClock()
         final_timeout = socket.timeout("private timeout detail")
         opener = FakeOpener(
-            [socket.timeout("one"), socket.timeout("two"), final_timeout]
+            [
+                socket.timeout("one"),
+                socket.timeout("two"),
+                socket.timeout("three"),
+                final_timeout,
+            ],
+            clock,
         )
-        client = client_for(opener, max_retries=2)
+        client = client_for(
+            opener,
+            clock=clock,
+            max_retries=3,
+            interval=1.5,
+        )
 
         with self.assertRaises(ProviderUnavailableError) as captured:
             client.get_json(url)
 
-        self.assertEqual(len(opener.calls), 3)
+        self.assertEqual(len(opener.calls), 4)
+        self.assertEqual(
+            [call[2] for call in opener.calls],
+            [100.0, 101.5, 103.5, 107.5],
+        )
+        self.assertEqual(clock.sleeps, [1, 0.5, 2, 4])
         self.assertIs(captured.exception.__cause__, final_timeout)
         self.assertNotIn("private timeout detail", str(captured.exception))
 
@@ -273,6 +290,9 @@ class HttpClientTests(unittest.TestCase):
             (FakeResponse(b"123456"), 5),
             (FakeResponse(b'"\xff"'), 1024),
             (FakeResponse(b'{"broken":'), 1024),
+            (FakeResponse(b"NaN"), 1024),
+            (FakeResponse(b"Infinity"), 1024),
+            (FakeResponse(b"-Infinity"), 1024),
         )
         for response, max_bytes in cases:
             with self.subTest(body=response.body, max_bytes=max_bytes):

@@ -167,8 +167,8 @@ class JsonHttpClient:
                     "Steam provider response is not valid UTF-8"
                 ) from error
             try:
-                return json.loads(text)
-            except json.JSONDecodeError as error:
+                return json.loads(text, parse_constant=_reject_json_constant)
+            except (json.JSONDecodeError, ValueError) as error:
                 raise ProviderUnavailableError(
                     "Steam provider response is not valid JSON"
                 ) from error
@@ -176,6 +176,11 @@ class JsonHttpClient:
 
 def _url_error_is_timeout(error: urllib.error.URLError) -> bool:
     return isinstance(error.reason, (socket.timeout, TimeoutError))
+
+
+def _reject_json_constant(value: str) -> None:
+    del value
+    raise ValueError("non-standard JSON constant")
 
 
 def _close_quietly(value: object) -> None:

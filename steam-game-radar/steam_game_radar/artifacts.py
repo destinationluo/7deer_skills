@@ -28,16 +28,24 @@ _PROVIDER_ID = re.compile(
 def redact(value: object) -> object:
     """Return a recursively redacted copy of a JSON-compatible value."""
 
+    try:
+        _validate_json_native(value)
+        return _redact(value)
+    except RecursionError as error:
+        raise InputValidationError("artifact nesting is too deep") from error
+
+
+def _redact(value: object) -> object:
     if isinstance(value, dict):
-        redacted: dict[object, object] = {}
+        redacted: dict[str, object] = {}
         for key, item in value.items():
             if isinstance(key, str) and _is_sensitive_key(key):
                 redacted[key] = _REDACTED
             else:
-                redacted[key] = redact(item)
+                redacted[key] = _redact(item)
         return redacted
     if isinstance(value, list):
-        return [redact(item) for item in value]
+        return [_redact(item) for item in value]
     return value
 
 
@@ -142,11 +150,16 @@ def _serialize_json(value: object) -> str:
         )
         serialized.encode("utf-8")
         return serialized
-    except (TypeError, ValueError, UnicodeError) as error:
+    except (TypeError, ValueError, UnicodeError, RecursionError) as error:
         raise InputValidationError("artifact must contain valid JSON values") from error
 
 
-def _validate_json_native(value: object) -> None:
+def _validate_json_native(
+    value: object,
+    active_containers: set[int] | None = None,
+) -> None:
+    if active_containers is None:
+        active_containers = set()
     if value is None or isinstance(value, (bool, str, int)):
         return
     if isinstance(value, float):
@@ -154,16 +167,34 @@ def _validate_json_native(value: object) -> None:
             return
         raise InputValidationError("artifact numbers must be finite")
     if isinstance(value, list):
-        for item in value:
-            _validate_json_native(item)
+        identity = _enter_container(value, active_containers)
+        try:
+            for item in value:
+                _validate_json_native(item, active_containers)
+        finally:
+            active_containers.remove(identity)
         return
     if isinstance(value, dict):
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise InputValidationError("artifact mapping keys must be strings")
-            _validate_json_native(item)
+        identity = _enter_container(value, active_containers)
+        try:
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise InputValidationError(
+                        "artifact mapping keys must be strings"
+                    )
+                _validate_json_native(item, active_containers)
+        finally:
+            active_containers.remove(identity)
         return
     raise InputValidationError("artifact must contain only JSON-native values")
+
+
+def _enter_container(value: object, active_containers: set[int]) -> int:
+    identity = id(value)
+    if identity in active_containers:
+        raise InputValidationError("artifact must not contain circular values")
+    active_containers.add(identity)
+    return identity
 
 
 def _validate_run_id(run_id: str) -> None:
@@ -188,6 +219,7 @@ def _prune_candidates(
     for directory, directory_names, file_names in os.walk(
         raw_root,
         topdown=True,
+        onerror=_raise_walk_error,
         followlinks=False,
     ):
         current = Path(directory)
@@ -210,6 +242,10 @@ def _prune_candidates(
                 raise PersistenceError("raw artifact resolves outside raw root")
             candidates.append((candidate, candidate_status.st_mtime))
     return candidates
+
+
+def _raise_walk_error(error: OSError) -> None:
+    raise error
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:

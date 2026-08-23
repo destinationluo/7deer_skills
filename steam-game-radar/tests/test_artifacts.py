@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from typing import Callable, Iterator
 import unittest
 from unittest import mock
 
@@ -48,6 +49,14 @@ class ArtifactTests(unittest.TestCase):
             },
         )
         self.assertEqual(value["apiKey"], "alpha")
+        shared = {"secret": "hidden"}
+        self.assertEqual(
+            redact([shared, shared]),
+            [
+                {"secret": "[REDACTED]"},
+                {"secret": "[REDACTED]"},
+            ],
+        )
 
     def test_persist_raw_rejects_original_size_before_redaction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -63,6 +72,26 @@ class ArtifactTests(unittest.TestCase):
                     {"secret": "x" * 100},
                     datetime.now(timezone.utc),
                 )
+
+            cyclic_list: list[object] = []
+            cyclic_list.append(cyclic_list)
+            cyclic_dict: dict[str, object] = {}
+            cyclic_dict["nested"] = cyclic_dict
+            for cyclic_value in (cyclic_list, cyclic_dict):
+                with self.subTest(
+                    cyclic_type=type(cyclic_value).__name__
+                ), self.assertRaises(InputValidationError):
+                    redact(cyclic_value)
+                with self.subTest(
+                    persisted_cyclic_type=type(cyclic_value).__name__
+                ), self.assertRaises(InputValidationError):
+                    persist_raw(
+                        config,
+                        "20260824T030405Z-1234abcd",
+                        "steam_store",
+                        cyclic_value,
+                        datetime.now(timezone.utc),
+                    )
             with self.assertRaises(InputValidationError):
                 persist_raw(
                     config,
@@ -215,6 +244,41 @@ class ArtifactTests(unittest.TestCase):
 
             self.assertNotIn("disk unavailable", str(captured.exception))
             self.assertEqual(list(path.parent.glob(f".{path.name}.*.tmp")), [])
+
+            config = RadarConfig(data_dir=Path(directory), raw_retention_days=14)
+            run_dir = (
+                config.data_dir / "raw/20260801T000000Z-1234abcd"
+            )
+            run_dir.mkdir(parents=True)
+            expired = run_dir / "expired.json"
+            expired.write_text("{}", encoding="utf-8")
+            now = datetime(2026, 8, 24, tzinfo=timezone.utc)
+            expired_timestamp = (now - timedelta(days=15)).timestamp()
+            os.utime(expired, (expired_timestamp, expired_timestamp))
+
+            def failing_walk(
+                top: object,
+                *,
+                topdown: bool,
+                onerror: Callable[[OSError], None],
+                followlinks: bool,
+            ) -> Iterator[tuple[str, list[str], list[str]]]:
+                del top, topdown, followlinks
+
+                def entries() -> Iterator[tuple[str, list[str], list[str]]]:
+                    yield str(run_dir), [], [expired.name]
+                    onerror(PermissionError("private traversal detail"))
+
+                return entries()
+
+            with mock.patch(
+                "steam_game_radar.artifacts.os.walk",
+                side_effect=failing_walk,
+            ), self.assertRaises(PersistenceError) as captured:
+                prune_raw(config, now)
+
+            self.assertNotIn("private traversal detail", str(captured.exception))
+            self.assertTrue(expired.exists())
 
 
 if __name__ == "__main__":
