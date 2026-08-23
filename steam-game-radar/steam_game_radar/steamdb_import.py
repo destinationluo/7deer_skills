@@ -619,7 +619,18 @@ def _copy_json(value: object) -> object:
     if isinstance(value, list):
         return [_copy_json(item) for item in value]
     if isinstance(value, Mapping):
-        return _normalize_row_mapping(value)
+        copied: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise InputValidationError("JSON mapping keys must be strings")
+            try:
+                key.encode("utf-8")
+            except UnicodeError as error:
+                raise InputValidationError(
+                    "JSON mapping keys must be valid UTF-8"
+                ) from error
+            copied[key] = _copy_json(item)
+        return copied
     raise InputValidationError("value must contain only JSON-native data")
 
 

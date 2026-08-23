@@ -9,7 +9,10 @@
       "follows": "2.5M",
       "rating_percent": "92%",
       "steamdb_url": "https://steamdb.info/app/24680/",
-      "Campaign": "organic"
+      "Campaign": "organic",
+      " Meta ": {
+        " inner ": 2
+      }
     }
   ]
 }

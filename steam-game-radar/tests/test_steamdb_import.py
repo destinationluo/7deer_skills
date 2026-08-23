@@ -132,6 +132,16 @@ class SteamDBImportTests(unittest.TestCase):
         self.assertEqual(first.metrics["wishlist_gain_7d"].value, 1250)
         self.assertEqual(first.metrics["followers"].value, 2500)
         self.assertEqual(first.metrics["rating_percent"].value, 91)
+        self.assertEqual(first.metrics["release_date"].value, "2026-09-10")
+        self.assertEqual(
+            first.metrics["release_date"].source_id,
+            "steamdb_wishlist_activity_release_date",
+        )
+        self.assertEqual(
+            first.metrics["release_date"].source_kind,
+            "steamdb_manual_import",
+        )
+        self.assertEqual(first.metrics["release_date"].observed_at, OBSERVED_AT)
         for metric_name, metric in first.metrics.items():
             with self.subTest(metric_name=metric_name):
                 self.assertEqual(metric.source_kind, "steamdb_manual_import")
@@ -170,9 +180,16 @@ class SteamDBImportTests(unittest.TestCase):
         self.assertEqual(record.metrics["follower_gain_7d"].value, 1200)
         self.assertEqual(record.metrics["followers"].value, 2_500_000)
         self.assertEqual(dict(record.source_extra)["Campaign"], "organic")
+        self.assertEqual(
+            dict(record.source_extra)["Meta"],
+            {" inner ": 2},
+        )
         exported = result.raw_to_dict()
+        self.assertEqual(exported["rows"][0]["Meta"], {" inner ": 2})
         exported["rows"][0]["title"] = "changed"
+        exported["rows"][0]["Meta"][" inner "] = 99
         self.assertEqual(result.raw_to_dict()["rows"][0]["title"], "Follower Rising")
+        self.assertEqual(result.raw_to_dict()["rows"][0]["Meta"], {" inner ": 2})
 
     def test_json_row_array_requires_explicit_view_and_imports_trending_games(self) -> None:
         rows = [{"appid": 11, "name": "Trending", "#": "+3", "online": "4K"}]
