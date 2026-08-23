@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -57,6 +58,7 @@ class SteamDBImportTests(unittest.TestCase):
             "1.25K": 1250,
             "2m": 2_000_000,
             str(MAX_JSON_SAFE_INTEGER): MAX_JSON_SAFE_INTEGER,
+            "000" + str(MAX_JSON_SAFE_INTEGER): MAX_JSON_SAFE_INTEGER,
             str(MAX_STEAM_APPID + 1): MAX_STEAM_APPID + 1,
             "87.5%": 87.5,
             "+1.2K%": 1200,
@@ -94,6 +96,15 @@ class SteamDBImportTests(unittest.TestCase):
         for value in invalid:
             with self.subTest(value=value), self.assertRaises(InputValidationError):
                 parse_number(value)
+        oversized_digits = "9" * 250_000
+        with mock.patch(
+            "steam_game_radar.steamdb_import.Decimal",
+            side_effect=AssertionError("impossible integer reached conversion"),
+        ), mock.patch(
+            "steam_game_radar.steamdb_import._convert_bounded_digits",
+            side_effect=AssertionError("impossible integer reached int conversion"),
+        ), self.assertRaises(InputValidationError):
+            parse_number(oversized_digits)
 
     def test_parse_release_date_normalizes_supported_formats_and_rejects_invalid(self) -> None:
         self.assertIsNone(parse_release_date(None))
@@ -136,6 +147,16 @@ class SteamDBImportTests(unittest.TestCase):
         self.assertEqual(extract_appid({"appid": MAX_STEAM_APPID}), MAX_STEAM_APPID)
         self.assertEqual(extract_appid({"app_id": max_text}), MAX_STEAM_APPID)
         self.assertEqual(
+            extract_appid({"app_id": "+000" + max_text}),
+            MAX_STEAM_APPID,
+        )
+        self.assertEqual(
+            extract_appid(
+                {"url": "https://steamdb.info/app/000" + max_text + "/"}
+            ),
+            MAX_STEAM_APPID,
+        )
+        self.assertEqual(
             extract_appid(
                 {
                     "appid": max_text,
@@ -157,6 +178,22 @@ class SteamDBImportTests(unittest.TestCase):
         ):
             with self.subTest(row=row), self.assertRaises(InputValidationError):
                 extract_appid(row)
+        oversized_digits = "9" * 250_000
+        with mock.patch(
+            "steam_game_radar.steamdb_import.Decimal",
+            side_effect=AssertionError("impossible AppID reached conversion"),
+        ), mock.patch(
+            "steam_game_radar.steamdb_import._convert_bounded_digits",
+            side_effect=AssertionError("impossible AppID reached int conversion"),
+        ):
+            for oversized_row in (
+                {"app_id": oversized_digits},
+                {"url": "https://steamdb.info/app/" + oversized_digits + "/"},
+            ):
+                with self.subTest(oversized_row=tuple(oversized_row)), self.assertRaises(
+                    InputValidationError
+                ):
+                    extract_appid(oversized_row)
 
     def test_wishlist_csv_fixture_maps_metrics_unknown_columns_and_persists_raw(self) -> None:
         result = import_steamdb(
@@ -506,6 +543,13 @@ class SteamDBImportTests(unittest.TestCase):
                 "too-negative.json",
                 [{"appid": 1, "name": "Game", "rank": 1, "Meta": MIN_JSON_SAFE_INTEGER - 1}],
             )
+            oversized_json = Path(directory) / "oversized-integer.json"
+            oversized_json.write_text(
+                '[{"appid":'
+                + "9" * 250_000
+                + ',"name":"Oversized","rank":1}]',
+                encoding="utf-8",
+            )
             valid = self._write(directory, "valid.json", [{"appid": 1, "name": "Game", "rank": 1}])
             for path, observed_at in (
                 (malformed, OBSERVED_AT),
@@ -518,6 +562,21 @@ class SteamDBImportTests(unittest.TestCase):
             ):
                 with self.subTest(path=path, observed_at=observed_at), self.assertRaises(InputValidationError):
                     import_steamdb(path, "trending_games", observed_at)
+
+            with mock.patch(
+                "steam_game_radar.steamdb_import.Decimal",
+                side_effect=AssertionError("impossible JSON integer reached conversion"),
+            ), mock.patch(
+                "steam_game_radar.steamdb_import._convert_bounded_digits",
+                side_effect=AssertionError(
+                    "impossible JSON integer reached int conversion"
+                ),
+            ), self.assertRaises(InputValidationError):
+                import_steamdb(
+                    oversized_json,
+                    "trending_games",
+                    OBSERVED_AT,
+                )
 
             deep_value = "{\"x\":" * 600 + "0" + "}" * 600
             deep = Path(directory) / "deep.json"

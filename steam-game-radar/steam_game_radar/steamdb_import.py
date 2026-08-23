@@ -29,6 +29,9 @@ from .schemas import (
 
 _MAX_INPUT_BYTES = 5 * 1024 * 1024
 _MAX_JSON_DEPTH = 256
+_MAX_STEAM_APPID_TEXT = str(MAX_STEAM_APPID)
+_MAX_JSON_SAFE_INTEGER_TEXT = str(MAX_JSON_SAFE_INTEGER)
+_MIN_JSON_SAFE_MAGNITUDE_TEXT = str(abs(MIN_JSON_SAFE_INTEGER))
 _ALLOWED_VIEWS = {
     "trending_games",
     "wishlist_activity",
@@ -147,14 +150,32 @@ def parse_number(value: object) -> int | float | None:
     if match is None:
         raise InputValidationError("number has an invalid format")
     number_text = match.group("number").replace(",", "")
-    digit_count = sum(character.isdigit() for character in number_text)
+    integer_part, separator, fractional_part = number_text.partition(".")
+    normalized_integer = _bounded_unsigned_digits(
+        integer_part,
+        _MAX_JSON_SAFE_INTEGER_TEXT,
+        "number",
+    )
+    suffix = match.group("suffix")
+    if not separator:
+        parsed_integer = _convert_bounded_digits(normalized_integer, "number")
+        multiplier = 1
+        if suffix is not None:
+            multiplier = 1_000 if suffix.lower() == "k" else 1_000_000
+        if parsed_integer > MAX_JSON_SAFE_INTEGER // multiplier:
+            raise InputValidationError(
+                "number must be finite, non-negative, and JSON-safe"
+            )
+        return parsed_integer * multiplier
+
+    normalized_number = normalized_integer + "." + fractional_part
+    digit_count = len(normalized_integer) + len(fractional_part)
     try:
         with localcontext() as context:
             context.prec = max(1, digit_count + 6)
             context.Emax = max(context.Emax, digit_count + 6)
             context.Emin = min(context.Emin, -(digit_count + 6))
-            parsed = Decimal(number_text)
-            suffix = match.group("suffix")
+            parsed = Decimal(normalized_number)
             if suffix is not None:
                 parsed *= Decimal(
                     1_000 if suffix.lower() == "k" else 1_000_000
@@ -474,7 +495,14 @@ def _parse_appid_value(value: object) -> int:
         parsed = int(value)
     elif isinstance(value, str) and re.fullmatch(r"\+?[0-9]+", value.strip(), re.ASCII):
         digits = value.strip().lstrip("+")
-        parsed = _decimal_text_to_integer(digits, "AppID")
+        parsed = _convert_bounded_digits(
+            _bounded_unsigned_digits(
+                digits,
+                _MAX_STEAM_APPID_TEXT,
+                "AppID",
+            ),
+            "AppID",
+        )
     else:
         raise InputValidationError("AppID must be a positive integer")
     return _steam_appid(parsed)
@@ -488,7 +516,14 @@ def _parse_url(value: object) -> tuple[str, list[int]]:
     for matched_digits in _APP_PATH.findall(normalized):
         identifiers.append(
             _steam_appid(
-                _decimal_text_to_integer(matched_digits, "URL AppID")
+                _convert_bounded_digits(
+                    _bounded_unsigned_digits(
+                        matched_digits,
+                        _MAX_STEAM_APPID_TEXT,
+                        "URL AppID",
+                    ),
+                    "URL AppID",
+                )
             )
         )
     return normalized, identifiers
@@ -702,9 +737,23 @@ def _reject_json_constant(value: str) -> object:
 
 
 def _parse_json_integer(value: str) -> int:
-    return _json_safe_integer(
-        _decimal_text_to_integer(value, "JSON integer")
+    negative = value.startswith("-")
+    digits = value[1:] if negative else value
+    maximum_text = (
+        _MIN_JSON_SAFE_MAGNITUDE_TEXT
+        if negative
+        else _MAX_JSON_SAFE_INTEGER_TEXT
     )
+    magnitude = _convert_bounded_digits(
+        _bounded_unsigned_digits(
+            digits,
+            maximum_text,
+            "JSON integer",
+        ),
+        "JSON integer",
+    )
+    parsed = -magnitude if negative else magnitude
+    return _json_safe_integer(parsed)
 
 
 def _parse_json_float(value: str) -> float:
@@ -717,12 +766,27 @@ def _parse_json_float(value: str) -> float:
     return parsed
 
 
-def _decimal_text_to_integer(value: str, field: str) -> int:
+def _bounded_unsigned_digits(
+    digits: str,
+    maximum_text: str,
+    field: str,
+) -> str:
+    if re.fullmatch(r"[0-9]+", digits, re.ASCII) is None:
+        raise InputValidationError(f"{field} must be an integer")
+    significant = digits.lstrip("0") or "0"
+    if len(significant) > len(maximum_text) or (
+        len(significant) == len(maximum_text)
+        and significant > maximum_text
+    ):
+        raise InputValidationError(f"{field} is outside the allowed range")
+    return significant
+
+
+def _convert_bounded_digits(value: str, field: str) -> int:
     try:
-        parsed = Decimal(value)
-    except (DecimalException, ValueError, OverflowError) as error:
+        return int(value)
+    except (ValueError, OverflowError) as error:
         raise InputValidationError(f"{field} must be an integer") from error
-    return _decimal_to_integer(parsed, field)
 
 
 def _decimal_to_integer(value: Decimal, field: str) -> int:
