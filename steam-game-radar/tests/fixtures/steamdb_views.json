@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "view": "trending_followers",
+  "rows": [
+    {
+      "steam_appid": 24680,
+      "title": "Follower Rising",
+      "followers_7d_gain": "+1.2K",
+      "follows": "2.5M",
+      "rating_percent": "92%",
+      "steamdb_url": "https://steamdb.info/app/24680/",
+      "Campaign": "organic"
+    }
+  ]
+}
