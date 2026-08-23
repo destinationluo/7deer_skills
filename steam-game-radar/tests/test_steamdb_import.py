@@ -18,6 +18,7 @@ sys.path.insert(0, str(PROJECT_DIR))
 from steam_game_radar.artifacts import persist_raw
 from steam_game_radar.config import RadarConfig
 from steam_game_radar.errors import InputValidationError
+from steam_game_radar.schemas import MAX_STEAM_APPID
 from steam_game_radar.steamdb_import import (
     ImportResult,
     extract_appid,
@@ -52,14 +53,13 @@ class SteamDBImportTests(unittest.TestCase):
             "1.25K": 1250,
             "2m": 2_000_000,
             "9007199254740993": 9007199254740993,
+            str(MAX_STEAM_APPID + 1): MAX_STEAM_APPID + 1,
             "87.5%": 87.5,
             "+1.2K%": 1200,
         }
         for value, expected in cases.items():
             with self.subTest(value=value):
                 self.assertEqual(parse_number(value), expected)
-        large_digits = "9" * 5_000
-        self.assertEqual(parse_number(large_digits), 10**5_000 - 1)
 
     def test_parse_number_rejects_negative_nonfinite_bool_and_malformed_values(self) -> None:
         invalid = (
@@ -120,15 +120,17 @@ class SteamDBImportTests(unittest.TestCase):
             ),
             321,
         )
-        large_digits = "9" * 5_000
-        large_appid = 10**5_000 - 1
-        self.assertEqual(extract_appid({"appid": large_appid}), large_appid)
-        self.assertEqual(extract_appid({"app_id": large_digits}), large_appid)
+        max_text = str(MAX_STEAM_APPID)
+        self.assertEqual(extract_appid({"appid": MAX_STEAM_APPID}), MAX_STEAM_APPID)
+        self.assertEqual(extract_appid({"app_id": max_text}), MAX_STEAM_APPID)
         self.assertEqual(
             extract_appid(
-                {"url": "https://steamdb.info/app/" + large_digits + "/"}
+                {
+                    "appid": max_text,
+                    "url": "https://steamdb.info/app/" + max_text + "/",
+                }
             ),
-            large_appid,
+            MAX_STEAM_APPID,
         )
         for row in (
             {"name": "Name only"},
@@ -137,6 +139,9 @@ class SteamDBImportTests(unittest.TestCase):
             {"appid": "1", "url": "https://steamdb.info/app/2/"},
             {"url": "https://steamdb.info/app/1/", "app_url": "https://steamdb.info/app/2/charts/"},
             {"url": "https://steamdb.info/apps/1/"},
+            {"appid": MAX_STEAM_APPID + 1},
+            {"app_id": str(MAX_STEAM_APPID + 1)},
+            {"url": f"https://steamdb.info/app/{MAX_STEAM_APPID + 1}/"},
         ):
             with self.subTest(row=row), self.assertRaises(InputValidationError):
                 extract_appid(row)
@@ -232,16 +237,22 @@ class SteamDBImportTests(unittest.TestCase):
                 "trending_games",
                 OBSERVED_AT,
             )
-            large_digits = "9" * 5_000
-            large_json = Path(directory) / "large-appid.json"
-            large_json.write_text(
-                '[{"appid":'
-                + large_digits
-                + ',"name":"Large JSON","rank":1}]',
-                encoding="utf-8",
+            bounds_path = self._write(
+                directory,
+                "appid-bounds.json",
+                [
+                    {"appid": MAX_STEAM_APPID, "name": "Max", "rank": 1},
+                    {"appid": MAX_STEAM_APPID + 1, "name": "Native", "rank": 2},
+                    {"app_id": str(MAX_STEAM_APPID + 1), "name": "String", "rank": 3},
+                    {
+                        "url": f"https://steamdb.info/app/{MAX_STEAM_APPID + 1}/",
+                        "name": "URL",
+                        "rank": 4,
+                    },
+                ],
             )
-            large_result = import_steamdb(
-                large_json,
+            bounds_result = import_steamdb(
+                bounds_path,
                 "trending_games",
                 OBSERVED_AT,
             )
@@ -249,10 +260,20 @@ class SteamDBImportTests(unittest.TestCase):
         self.assertEqual(result.records[0].metrics["rank"].value, 3)
         self.assertEqual(result.records[0].metrics["current_players"].value, 4000)
         self.assertEqual(bom_result.records[0].appid, 11)
-        self.assertEqual(large_result.records[0].appid, 10**5_000 - 1)
         self.assertEqual(
-            large_result.records[0].store_url,
-            "https://store.steampowered.com/app/" + large_digits + "/",
+            [record.appid for record in bounds_result.records],
+            [MAX_STEAM_APPID],
+        )
+        self.assertEqual(
+            [
+                (row.row_number, row.code, row.appid)
+                for row in bounds_result.rejected_rows
+            ],
+            [
+                (2, "steamdb_row_invalid", None),
+                (3, "steamdb_row_invalid", None),
+                (4, "steamdb_row_invalid", None),
+            ],
         )
 
     def test_recent_releases_requires_date_and_players_and_normalizes_date(self) -> None:
@@ -325,22 +346,36 @@ class SteamDBImportTests(unittest.TestCase):
                 ).records[0].appid,
                 2,
             )
-            large_digits = "9" * 5_000
-            large_csv = Path(directory) / "large.csv"
-            large_csv.write_text(
-                "app_id,name,rank\n" + large_digits + ",Large CSV,1\n",
+            max_csv = Path(directory) / "max.csv"
+            max_csv.write_text(
+                "app_id,name,rank\n"
+                + str(MAX_STEAM_APPID)
+                + ",Max CSV,1\n"
+                + str(MAX_STEAM_APPID + 1)
+                + ",Too Large,2\n",
                 encoding="utf-8",
             )
-            large_csv_result = import_steamdb(
-                large_csv,
+            max_result = import_steamdb(
+                max_csv,
                 "trending_games",
                 OBSERVED_AT,
             )
-            self.assertEqual(large_csv_result.records[0].appid, 10**5_000 - 1)
+            self.assertEqual(max_result.records[0].appid, MAX_STEAM_APPID)
             self.assertEqual(
-                large_csv_result.records[0].store_url,
-                "https://store.steampowered.com/app/" + large_digits + "/",
+                max_result.records[0].store_url,
+                f"https://store.steampowered.com/app/{MAX_STEAM_APPID}/",
             )
+            self.assertEqual(max_result.rejected_rows[0].appid, None)
+            json.dumps(max_result.records[0].to_dict(), allow_nan=False)
+            json.dumps(max_result.raw_to_dict(), allow_nan=False)
+            persisted = persist_raw(
+                RadarConfig(data_dir=Path(directory) / "persisted-max"),
+                "20260824T030405Z-abcdef12",
+                "steamdb_max_appid",
+                max_result.raw_to_dict(),
+                datetime(2026, 8, 24, 3, 4, 5, tzinfo=timezone.utc),
+            )
+            self.assertTrue(persisted.is_file())
             for name, content in (
                 ("empty.csv", ""),
                 ("broken.csv", 'appid,name,rank\n1,"unterminated,1\n'),

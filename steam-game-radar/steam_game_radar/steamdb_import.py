@@ -17,7 +17,12 @@ from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
 
 from .errors import InputValidationError
-from .schemas import GameRecord, MetricObservation, RejectedRow
+from .schemas import (
+    MAX_STEAM_APPID,
+    GameRecord,
+    MetricObservation,
+    RejectedRow,
+)
 
 
 _MAX_INPUT_BYTES = 5 * 1024 * 1024
@@ -70,26 +75,6 @@ _MONTHS = {
     "Dec": 12,
 }
 _APP_PATH = re.compile(r"/app/([0-9]+)(?=/|[?#]|$)", flags=re.ASCII)
-
-
-class _CanonicalAppID(int):
-    """An int whose decimal formatting is independent of runtime digit caps."""
-
-    def __new__(cls, value: int) -> "_CanonicalAppID":
-        instance = int.__new__(cls, value)
-        instance._decimal_text = _integer_to_decimal_text(value)
-        return instance
-
-    def __str__(self) -> str:
-        return self._decimal_text
-
-    def __repr__(self) -> str:
-        return self._decimal_text
-
-    def __format__(self, format_spec: str) -> str:
-        if format_spec in {"", "d"}:
-            return self._decimal_text
-        return int.__format__(self, format_spec)
 
 
 @dataclass(frozen=True)
@@ -339,7 +324,6 @@ def _record_from_row(
     observed_at: str,
 ) -> GameRecord:
     appid = extract_appid(row)
-    record_appid = _CanonicalAppID(appid)
     _validate_reserved_view(row, view)
     name = _canonical_alias(
         row,
@@ -390,18 +374,14 @@ def _record_from_row(
     extra["steamdb_view"] = view
     return GameRecord(
         schema_version=1,
-        appid=record_appid,
+        appid=appid,
         name=name,
         release_status=(
             "released"
             if view in {"trending_games", "recent_releases"}
             else "unreleased"
         ),
-        store_url=(
-            "https://store.steampowered.com/app/"
-            + _integer_to_decimal_text(appid)
-            + "/"
-        ),
+        store_url=f"https://store.steampowered.com/app/{appid}/",
         metrics=observations,
         source_extra=extra,
     )
@@ -481,9 +461,7 @@ def _parse_appid_value(value: object) -> int:
         parsed = _decimal_text_to_integer(digits, "AppID")
     else:
         raise InputValidationError("AppID must be a positive integer")
-    if parsed <= 0:
-        raise InputValidationError("AppID must be a positive integer")
-    return parsed
+    return _steam_appid(parsed)
 
 
 def _parse_url(value: object) -> tuple[str, list[int]]:
@@ -493,10 +471,10 @@ def _parse_url(value: object) -> tuple[str, list[int]]:
     identifiers: list[int] = []
     for matched_digits in _APP_PATH.findall(normalized):
         identifiers.append(
-            _decimal_text_to_integer(matched_digits, "URL AppID")
+            _steam_appid(
+                _decimal_text_to_integer(matched_digits, "URL AppID")
+            )
         )
-    if any(appid <= 0 for appid in identifiers):
-        raise InputValidationError("URL AppID must be positive")
     return normalized, identifiers
 
 
@@ -727,11 +705,12 @@ def _decimal_to_integer(value: Decimal, field: str) -> int:
         raise InputValidationError(f"{field} must be an integer") from error
 
 
-def _integer_to_decimal_text(value: int) -> str:
-    try:
-        return format(Decimal(value), "f")
-    except (DecimalException, ValueError, OverflowError) as error:
-        raise InputValidationError("AppID must be an integer") from error
+def _steam_appid(value: int) -> int:
+    if value < 1 or value > MAX_STEAM_APPID:
+        raise InputValidationError(
+            f"AppID must be from 1 through {MAX_STEAM_APPID}"
+        )
+    return value
 
 
 def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
