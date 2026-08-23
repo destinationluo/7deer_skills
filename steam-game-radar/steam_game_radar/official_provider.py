@@ -8,6 +8,7 @@ from datetime import date, datetime
 import re
 from types import MappingProxyType
 from typing import Generic, TypeVar, cast
+import unicodedata
 
 from .errors import InputValidationError
 from .schemas import MetricObservation, WarningRecord
@@ -60,6 +61,53 @@ _LOCALIZED_DATE_PATTERNS = (
         r"(?P<day>[0-9]{1,2})"
     ),
 )
+_ALPHABETIC_DATE_PATTERNS = (
+    re.compile(
+        r"(?P<day>[0-9]{1,2})/(?P<month>[^\W\d_]+)\.?/"
+        r"(?P<year>[0-9]{4})"
+    ),
+    re.compile(
+        r"(?P<day>[0-9]{1,2})\.?\s+(?P<month>[^\W\d_]+)\.?\s+"
+        r"(?P<year>[0-9]{4})"
+    ),
+)
+# Deliberately bounded aliases for common Steam Store month abbreviations in
+# English, French, German, Spanish, and Portuguese. Tokens are case-folded and
+# stripped of accents before lookup; unknown locales are never guessed.
+_MONTH_ALIASES = {
+    "jan": 1,
+    "janv": 1,
+    "ene": 1,
+    "feb": 2,
+    "fev": 2,
+    "fevr": 2,
+    "mar": 3,
+    "mars": 3,
+    "marz": 3,
+    "mrz": 3,
+    "apr": 4,
+    "avr": 4,
+    "abr": 4,
+    "may": 5,
+    "mai": 5,
+    "jun": 6,
+    "juin": 6,
+    "jul": 7,
+    "juil": 7,
+    "aug": 8,
+    "aout": 8,
+    "ago": 8,
+    "sep": 9,
+    "sept": 9,
+    "set": 9,
+    "oct": 10,
+    "okt": 10,
+    "out": 10,
+    "nov": 11,
+    "dec": 12,
+    "dez": 12,
+    "dic": 12,
+}
 
 T = TypeVar("T")
 
@@ -266,7 +314,9 @@ def parse_appdetails(
             raise _MalformedPayload
         name = _non_empty_string(data.get("name"))
         app_type = _non_empty_string(data.get("type"))
-        release_status, release_date = _parse_release_date(data.get("release_date"))
+        release_status, release_date, date_unparsed = _parse_release_date(
+            data.get("release_date")
+        )
         genres = _parse_genres(data.get("genres"))
         identity = AppIdentity(
             appid=requested_appid,
@@ -277,7 +327,18 @@ def parse_appdetails(
             genres=genres,
             observed_at=observed_at,
         )
-        return ParseResult(value=identity, warnings=())
+        warnings: tuple[WarningRecord, ...] = ()
+        if date_unparsed:
+            warnings = (
+                WarningRecord(
+                    code="steam_appdetails_release_date_unparsed",
+                    message=(
+                        "Steam app-details release date could not be normalized."
+                    ),
+                    appid=requested_appid,
+                ),
+            )
+        return ParseResult(value=identity, warnings=warnings)
     except (KeyError, TypeError, ValueError, RecursionError, InputValidationError):
         return ParseResult(
             value=None,
@@ -329,20 +390,21 @@ def parse_current_players(
         )
 
 
-def _parse_release_date(value: object) -> tuple[str, str | None]:
+def _parse_release_date(value: object) -> tuple[str, str | None, bool]:
     if not isinstance(value, Mapping):
-        return "unknown", None
+        return "unknown", None, False
     coming_soon = value.get("coming_soon")
     if not isinstance(coming_soon, bool):
-        return "unknown", None
+        return "unknown", None, _has_nonempty_date(value.get("date"))
     status = "unreleased" if coming_soon else "released"
     raw_date = value.get("date")
     if not isinstance(raw_date, str) or not raw_date.strip():
-        return status, None
+        return status, None, _has_nonempty_date(raw_date)
     date_text = raw_date.strip()
     for date_format in ("%Y-%m-%d", "%d %b, %Y", "%b %d, %Y"):
         try:
-            return status, datetime.strptime(date_text, date_format).date().isoformat()
+            normalized = datetime.strptime(date_text, date_format).date().isoformat()
+            return status, normalized, False
         except ValueError:
             continue
     for pattern in _LOCALIZED_DATE_PATTERNS:
@@ -356,9 +418,49 @@ def _parse_release_date(value: object) -> tuple[str, str | None]:
                 int(match.group("day")),
             ).isoformat()
         except ValueError:
-            return status, None
-        return status, normalized
-    return status, None
+            return status, None, True
+        return status, normalized, False
+    alphabetic = _normalize_alphabetic_date(date_text)
+    if alphabetic is not None:
+        return status, alphabetic, False
+    return status, None, True
+
+
+def _normalize_alphabetic_date(value: str) -> str | None:
+    """Normalize only explicitly allowlisted localized month-name dates."""
+
+    for pattern in _ALPHABETIC_DATE_PATTERNS:
+        match = pattern.fullmatch(value)
+        if match is None:
+            continue
+        month_token = unicodedata.normalize(
+            "NFKD", match.group("month").casefold()
+        )
+        month_alias = "".join(
+            character
+            for character in month_token
+            if not unicodedata.combining(character)
+        )
+        month = _MONTH_ALIASES.get(month_alias)
+        if month is None:
+            return None
+        try:
+            return date(
+                int(match.group("year")),
+                month,
+                int(match.group("day")),
+            ).isoformat()
+        except ValueError:
+            return None
+    return None
+
+
+def _has_nonempty_date(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
 
 
 def _parse_genres(value: object) -> tuple[str, ...]:

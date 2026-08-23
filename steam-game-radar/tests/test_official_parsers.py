@@ -396,6 +396,13 @@ class AppDetailsParserTests(unittest.TestCase):
             ("2026년 9월 7일", "2026-09-07"),
             ("2026/09/07", "2026-09-07"),
             ("2026.09.07", "2026-09-07"),
+            ("1/nov./2000", "2000-11-01"),
+            ("7 sept. 2026", "2026-09-07"),
+            ("7. Sept. 2026", "2026-09-07"),
+            ("7 FÉVR. 2026", "2026-02-07"),
+            ("7. März. 2026", "2026-03-07"),
+            ("7 abr. 2026", "2026-04-07"),
+            ("7 out. 2026", "2026-10-07"),
         )
         for raw_date, normalized_date in numeric_dates:
             with self.subTest(raw_date=raw_date):
@@ -447,7 +454,11 @@ class AppDetailsParserTests(unittest.TestCase):
                 observed_at=OBSERVED_AT,
             ),
         )
-        for raw_date in ("2026年2月30日", "07/09/2026"):
+        for raw_date in (
+            "2026年2月30日",
+            "07/09/2026",
+            "7 xyz. 2026",
+        ):
             impossible_date = {
                 "440": {
                     "success": True,
@@ -470,6 +481,22 @@ class AppDetailsParserTests(unittest.TestCase):
                     invalid_date_result.value.release_status, "released"
                 )
                 self.assertIsNone(invalid_date_result.value.release_date)
+                self.assertEqual(
+                    [
+                        warning.to_dict()
+                        for warning in invalid_date_result.warnings
+                    ],
+                    [
+                        {
+                            "code": "steam_appdetails_release_date_unparsed",
+                            "message": (
+                                "Steam app-details release date could not be "
+                                "normalized."
+                            ),
+                            "appid": 440,
+                        }
+                    ],
+                )
         for invalid_genres in ("Action", b"Action", ("",)):
             with self.subTest(invalid_genres=invalid_genres), self.assertRaises(
                 InputValidationError
