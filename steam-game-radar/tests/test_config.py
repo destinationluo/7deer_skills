@@ -104,12 +104,26 @@ class RadarConfigTests(unittest.TestCase):
         self.assertEqual(config.stale_fallback_limit_hours, 48)
         self.assertEqual(config.data_dir, root / "state")
         self.assertEqual(config.report_dir, root / "output")
+        numeric_schedule = "*/15 0-23/2 1,15 1-12 0,7"
+        self.assertEqual(
+            RadarConfig.from_mapping({"schedule": numeric_schedule}).schedule,
+            numeric_schedule,
+        )
 
         invalid_fields = {
             "country": ("us", "USA", "中国", " US"),
             "language": ("English", "7english", "schinese-cn", "english "),
             "timezone": ("Mars/Olympus", " UTC"),
-            "schedule": ("0 11 * *", "0 11 * * * *", "0 noon * * *", " 0 11 * * *"),
+            "schedule": (
+                "0 11 * *",
+                "0 11 * * * *",
+                "0 noon * * *",
+                " 0 11 * * *",
+                "99 99 99 99 99",
+                "*/0 * * * *",
+                "10-1 * * * *",
+                "0 11 * * 8",
+            ),
         }
         for field, invalid_values in invalid_fields.items():
             for invalid_value in invalid_values:

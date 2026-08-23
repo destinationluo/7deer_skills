@@ -336,7 +336,7 @@ def _freeze_json(value: object, name: str) -> object:
                 )
             frozen[key] = _freeze_json(nested_value, name)
         return MappingProxyType(frozen)
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list):
         return tuple(_freeze_json(item, name) for item in value)
     raise InputValidationError(f"{name} must be JSON-compatible")
 

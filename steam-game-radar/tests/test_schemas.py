@@ -67,6 +67,11 @@ class SchemaTests(unittest.TestCase):
         with self.assertRaises(InputValidationError):
             MetricObservation.from_dict(non_string_key)
 
+        tuple_value = self.metric_dict()
+        tuple_value["value"] = {"not_json_array": (1, 2)}
+        with self.assertRaises(InputValidationError):
+            MetricObservation.from_dict(tuple_value)
+
     def test_game_round_trip(self) -> None:
         expected = self.game_dict()
         game = GameRecord.from_dict(expected)

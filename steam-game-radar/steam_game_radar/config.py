@@ -15,8 +15,14 @@ from .errors import ConfigurationError
 
 _COUNTRY = re.compile(r"[A-Z]{2}", flags=re.ASCII)
 _LANGUAGE = re.compile(r"[a-z][a-z0-9_]*", flags=re.ASCII)
-_CRON_ITEM = r"(?:\*|\d+(?:-\d+)?)(?:/\d+)?"
-_CRON_FIELD = re.compile(rf"{_CRON_ITEM}(?:,{_CRON_ITEM})*", flags=re.ASCII)
+_ASCII_INTEGER = re.compile(r"[0-9]+", flags=re.ASCII)
+_CRON_FIELD_RANGES = (
+    (0, 59),
+    (0, 23),
+    (1, 31),
+    (1, 12),
+    (0, 7),
+)
 
 
 @dataclass(frozen=True)
@@ -192,13 +198,58 @@ def _timezone(value: object) -> str:
 def _schedule(value: object) -> str:
     schedule = _string_without_surrounding_whitespace(value, "schedule")
     cron_fields = schedule.split()
-    if len(cron_fields) != 5 or any(
-        _CRON_FIELD.fullmatch(field) is None for field in cron_fields
-    ):
+    if len(cron_fields) != 5:
         raise ConfigurationError(
             "schedule must contain exactly five numeric cron fields"
         )
+    for field, (minimum, maximum) in zip(cron_fields, _CRON_FIELD_RANGES):
+        if not _valid_cron_field(field, minimum, maximum):
+            raise ConfigurationError(
+                f"invalid cron field {field!r}; expected values from "
+                f"{minimum} through {maximum}"
+            )
     return schedule
+
+
+def _valid_cron_field(value: str, minimum: int, maximum: int) -> bool:
+    span = maximum - minimum + 1
+    for item in value.split(","):
+        step_parts = item.split("/")
+        if len(step_parts) > 2:
+            return False
+        base = step_parts[0]
+        if len(step_parts) == 2:
+            step = _cron_integer(step_parts[1])
+            if step is None or step <= 0 or step > span:
+                return False
+
+        if base == "*":
+            continue
+        range_parts = base.split("-")
+        if len(range_parts) == 1:
+            number = _cron_integer(base)
+            if number is None or number < minimum or number > maximum:
+                return False
+            continue
+        if len(range_parts) != 2:
+            return False
+        start = _cron_integer(range_parts[0])
+        end = _cron_integer(range_parts[1])
+        if (
+            start is None
+            or end is None
+            or start < minimum
+            or end > maximum
+            or start > end
+        ):
+            return False
+    return True
+
+
+def _cron_integer(value: str) -> int | None:
+    if _ASCII_INTEGER.fullmatch(value) is None:
+        return None
+    return int(value)
 
 
 def _path(value: object, name: str) -> Path:
