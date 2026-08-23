@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "country": "US",
+  "language": "english",
+  "timezone": "Asia/Shanghai",
+  "schedule": "0 11 * * *",
+  "released_candidate_limit": 100,
+  "unreleased_candidate_limit": 100,
+  "preliminary_top_n": 50,
+  "enrichment_top_n": 20,
+  "final_top_n": 20,
+  "request_timeout_seconds": 10.0,
+  "max_retries": 2,
+  "minimum_request_interval_seconds": 1.0,
+  "raw_retention_days": 14,
+  "raw_max_bytes_per_provider": 5242880,
+  "stale_warning_hours": 24,
+  "stale_fallback_limit_hours": 72,
+  "data_dir": "data",
+  "report_dir": "reports"
+}
