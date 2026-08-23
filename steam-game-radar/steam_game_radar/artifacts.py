@@ -127,6 +127,13 @@ def persist_raw(
         raise InputValidationError("raw provider artifact exceeds configured size")
 
     serialized_redacted = _serialize_json(redact(value))
+    if (
+        len(serialized_redacted.encode("utf-8"))
+        > config.raw_max_bytes_per_provider
+    ):
+        raise InputValidationError(
+            "redacted raw provider artifact exceeds configured size"
+        )
     path, confinement = _prepare_raw_destination(config, run_id, provider_id)
     _atomic_write_serialized(path, serialized_redacted, confinement)
     return path

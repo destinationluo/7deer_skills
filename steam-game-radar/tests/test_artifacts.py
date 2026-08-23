@@ -74,6 +74,21 @@ class ArtifactTests(unittest.TestCase):
                     datetime.now(timezone.utc),
                 )
 
+            expansion_data = Path(directory) / "redaction-expansion"
+            expansion_config = RadarConfig(
+                data_dir=expansion_data,
+                raw_max_bytes_per_provider=15,
+            )
+            with self.assertRaises(InputValidationError):
+                persist_raw(
+                    expansion_config,
+                    "20260824T030405Z-1234abcd",
+                    "steam_store",
+                    {"key": "x"},
+                    datetime.now(timezone.utc),
+                )
+            self.assertFalse(expansion_data.exists())
+
             cyclic_list: list[object] = []
             cyclic_list.append(cyclic_list)
             cyclic_dict: dict[str, object] = {}
