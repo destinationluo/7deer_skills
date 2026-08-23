@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 .idea/
 .vscode/
+.worktrees/
 
 # Project-specific data (keep private)
 backlink-discovery/memory/*/
