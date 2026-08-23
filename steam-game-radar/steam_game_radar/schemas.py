@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
-import json
+import math
 import re
-from typing import Literal, Mapping
+from types import MappingProxyType
+from typing import Literal, Mapping, cast
 from urllib.parse import urlsplit
 
 from .errors import InputValidationError
@@ -35,15 +35,18 @@ class MetricObservation:
     observed_at: str
 
     def __post_init__(self) -> None:
-        _json_value(self.value, "value")
+        object.__setattr__(self, "value", _freeze_json(self.value, "value"))
         _non_empty_string(self.source_id, "source_id")
-        if not isinstance(self.source_kind, str) or self.source_kind not in _SOURCE_KINDS:
+        if (
+            not isinstance(self.source_kind, str)
+            or self.source_kind not in _SOURCE_KINDS
+        ):
             raise InputValidationError(f"invalid source_kind: {self.source_kind!r}")
         _utc_timestamp(self.observed_at)
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "value": deepcopy(self.value),
+            "value": _thaw_json(self.value),
             "source_id": self.source_id,
             "source_kind": self.source_kind,
             "observed_at": self.observed_at,
@@ -57,7 +60,7 @@ class MetricObservation:
             record_name="MetricObservation",
         )
         return cls(
-            value=deepcopy(value["value"]),
+            value=value["value"],
             source_id=_non_empty_string(value["source_id"], "source_id"),
             source_kind=_source_kind(value["source_kind"]),
             observed_at=_utc_timestamp(value["observed_at"]),
@@ -93,15 +96,19 @@ class GameRecord:
         _store_url(self.store_url, self.appid)
         if not isinstance(self.metrics, Mapping):
             raise InputValidationError("metrics must be a mapping")
+        frozen_metrics: dict[str, MetricObservation] = {}
         for metric_name, observation in self.metrics.items():
-            _non_empty_string(metric_name, "metric name")
+            name = _non_empty_string(metric_name, "metric name")
             if not isinstance(observation, MetricObservation):
                 raise InputValidationError(
                     f"metric {metric_name!r} must be a MetricObservation"
                 )
+            frozen_metrics[name] = observation
         if not isinstance(self.source_extra, Mapping):
             raise InputValidationError("source_extra must be a mapping")
-        _json_value(self.source_extra, "source_extra")
+        frozen_extra = _freeze_json(self.source_extra, "source_extra")
+        object.__setattr__(self, "metrics", MappingProxyType(frozen_metrics))
+        object.__setattr__(self, "source_extra", frozen_extra)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -114,7 +121,7 @@ class GameRecord:
                 name: observation.to_dict()
                 for name, observation in self.metrics.items()
             },
-            "source_extra": deepcopy(dict(self.source_extra)),
+            "source_extra": _thaw_json(self.source_extra),
         }
 
     @classmethod
@@ -155,7 +162,6 @@ class GameRecord:
         source_extra = value["source_extra"]
         if not isinstance(source_extra, Mapping):
             raise InputValidationError("source_extra must be a mapping")
-        _json_value(source_extra, "source_extra")
 
         return cls(
             schema_version=1,
@@ -164,7 +170,7 @@ class GameRecord:
             release_status=_release_status(value["release_status"]),
             store_url=_store_url(value["store_url"], appid),
             metrics=metrics,
-            source_extra=deepcopy(dict(source_extra)),
+            source_extra=source_extra,
         )
 
 
@@ -275,13 +281,13 @@ def _optional_appid(value: object) -> int | None:
 def _source_kind(value: object) -> SourceKind:
     if not isinstance(value, str) or value not in _SOURCE_KINDS:
         raise InputValidationError(f"invalid source_kind: {value!r}")
-    return value  # type: ignore[return-value]
+    return cast(SourceKind, value)
 
 
 def _release_status(value: object) -> ReleaseStatus:
     if not isinstance(value, str) or value not in _RELEASE_STATUSES:
         raise InputValidationError(f"invalid release_status: {value!r}")
-    return value  # type: ignore[return-value]
+    return cast(ReleaseStatus, value)
 
 
 def _utc_timestamp(value: object) -> str:
@@ -314,8 +320,30 @@ def _store_url(value: object, appid: int) -> str:
     return value
 
 
-def _json_value(value: object, name: str) -> None:
-    try:
-        json.dumps(value, ensure_ascii=False, allow_nan=False)
-    except (TypeError, ValueError) as error:
-        raise InputValidationError(f"{name} must be JSON-compatible") from error
+def _freeze_json(value: object, name: str) -> object:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise InputValidationError(f"{name} must be JSON-compatible")
+        return value
+    if isinstance(value, Mapping):
+        frozen: dict[str, object] = {}
+        for key, nested_value in value.items():
+            if not isinstance(key, str):
+                raise InputValidationError(
+                    f"{name} mappings must use string keys"
+                )
+            frozen[key] = _freeze_json(nested_value, name)
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item, name) for item in value)
+    raise InputValidationError(f"{name} must be JSON-compatible")
+
+
+def _thaw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(nested) for key, nested in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -43,6 +44,28 @@ class SchemaTests(unittest.TestCase):
 
         self.assertEqual(metric.to_dict(), expected)
         self.assertEqual(MetricObservation.from_dict(metric.to_dict()), metric)
+        self.assertEqual(json.loads(json.dumps(metric.to_dict())), expected)
+
+        caller_value = {"history": [1, {"label": "before"}]}
+        isolated = MetricObservation(
+            value=caller_value,
+            source_id="test-source",
+            source_kind="steam_official",
+            observed_at="2026-08-24T03:00:00Z",
+        )
+        caller_value["history"].append(2)
+        caller_value["history"][1]["label"] = "after"
+        self.assertEqual(
+            isolated.to_dict()["value"],
+            {"history": [1, {"label": "before"}]},
+        )
+        with self.assertRaises(TypeError):
+            isolated.value["new"] = "blocked"
+
+        non_string_key = self.metric_dict()
+        non_string_key["value"] = {"nested": {1: "invalid"}}
+        with self.assertRaises(InputValidationError):
+            MetricObservation.from_dict(non_string_key)
 
     def test_game_round_trip(self) -> None:
         expected = self.game_dict()
@@ -50,6 +73,7 @@ class SchemaTests(unittest.TestCase):
 
         self.assertEqual(game.to_dict(), expected)
         self.assertEqual(GameRecord.from_dict(game.to_dict()), game)
+        self.assertEqual(json.loads(json.dumps(game.to_dict())), expected)
         warning = {"code": "stale", "message": "data is stale", "appid": 730}
         rejected = {
             "row_number": 4,
@@ -59,6 +83,30 @@ class SchemaTests(unittest.TestCase):
         }
         self.assertEqual(WarningRecord.from_dict(warning).to_dict(), warning)
         self.assertEqual(RejectedRow.from_dict(rejected).to_dict(), rejected)
+
+        caller_metrics = {"current_players": MetricObservation.from_dict(self.metric_dict())}
+        caller_extra = {"tags": ["FPS"], "nested": {"label": "before"}}
+        isolated = GameRecord(
+            schema_version=1,
+            appid=730,
+            name="Counter-Strike 2",
+            release_status="released",
+            store_url="https://store.steampowered.com/app/730",
+            metrics=caller_metrics,
+            source_extra=caller_extra,
+        )
+        caller_metrics.clear()
+        caller_extra["tags"].append("Action")
+        caller_extra["nested"]["label"] = "after"
+        self.assertEqual(set(isolated.metrics), {"current_players"})
+        self.assertEqual(
+            isolated.to_dict()["source_extra"],
+            {"tags": ["FPS"], "nested": {"label": "before"}},
+        )
+        with self.assertRaises(TypeError):
+            isolated.metrics["followers"] = MetricObservation.from_dict(
+                self.metric_dict()
+            )
 
     def test_required_schema_version(self) -> None:
         missing = self.game_dict()

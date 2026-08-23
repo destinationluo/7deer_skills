@@ -28,17 +28,17 @@ class RadarConfigTests(unittest.TestCase):
         self.assertEqual(config.language, "english")
         self.assertEqual(config.timezone, "Asia/Shanghai")
         self.assertEqual(config.schedule, "0 11 * * *")
-        self.assertEqual(config.released_candidate_limit, 100)
-        self.assertEqual(config.unreleased_candidate_limit, 100)
-        self.assertEqual(config.preliminary_top_n, 50)
-        self.assertEqual(config.enrichment_top_n, 20)
-        self.assertEqual(config.final_top_n, 20)
-        self.assertEqual(config.request_timeout_seconds, 10.0)
-        self.assertEqual(config.max_retries, 2)
+        self.assertEqual(config.released_candidate_limit, 50)
+        self.assertEqual(config.unreleased_candidate_limit, 50)
+        self.assertEqual(config.preliminary_top_n, 20)
+        self.assertEqual(config.enrichment_top_n, 10)
+        self.assertEqual(config.final_top_n, 10)
+        self.assertEqual(config.request_timeout_seconds, 15.0)
+        self.assertEqual(config.max_retries, 3)
         self.assertEqual(config.minimum_request_interval_seconds, 1.0)
         self.assertEqual(config.raw_retention_days, 14)
         self.assertEqual(config.raw_max_bytes_per_provider, 5_242_880)
-        self.assertEqual(config.stale_warning_hours, 24)
+        self.assertEqual(config.stale_warning_hours, 36)
         self.assertEqual(config.stale_fallback_limit_hours, 72)
         self.assertEqual(config.data_dir, data_dir)
         self.assertEqual(config.report_dir, report_dir)
@@ -50,9 +50,12 @@ class RadarConfigTests(unittest.TestCase):
 
         self.assert_config_values(
             config,
-            data_dir=root / "data",
-            report_dir=root / "reports",
+            data_dir=root / "data/steam-game-radar",
+            report_dir=root / "reports/steam-game-radar",
         )
+        direct = RadarConfig()
+        self.assertEqual(direct.data_dir, Path("data/steam-game-radar"))
+        self.assertEqual(direct.report_dir, Path("reports/steam-game-radar"))
 
     def test_from_file(self) -> None:
         values = {
@@ -102,9 +105,24 @@ class RadarConfigTests(unittest.TestCase):
         self.assertEqual(config.data_dir, root / "state")
         self.assertEqual(config.report_dir, root / "output")
 
+        invalid_fields = {
+            "country": ("us", "USA", "中国", " US"),
+            "language": ("English", "7english", "schinese-cn", "english "),
+            "timezone": ("Mars/Olympus", " UTC"),
+            "schedule": ("0 11 * *", "0 11 * * * *", "0 noon * * *", " 0 11 * * *"),
+        }
+        for field, invalid_values in invalid_fields.items():
+            for invalid_value in invalid_values:
+                with self.subTest(
+                    field=field, invalid_value=invalid_value
+                ), self.assertRaises(ConfigurationError):
+                    RadarConfig.from_mapping({field: invalid_value})
+
     def test_unknown_schema_version(self) -> None:
         with self.assertRaises(ConfigurationError):
             RadarConfig.from_mapping({"schema_version": 2})
+        with self.assertRaises(ConfigurationError):
+            RadarConfig(schema_version=2)
 
     def test_invalid_integer_limit(self) -> None:
         positive_integer_fields = (
@@ -122,6 +140,8 @@ class RadarConfigTests(unittest.TestCase):
             RadarConfig.from_mapping({"released_candidate_limit": True})
         with self.assertRaises(ConfigurationError):
             RadarConfig.from_mapping({"max_retries": -1})
+        with self.assertRaises(ConfigurationError):
+            RadarConfig(released_candidate_limit=0)
 
     def test_invalid_timeout(self) -> None:
         for field in (
@@ -137,11 +157,17 @@ class RadarConfigTests(unittest.TestCase):
             RadarConfig.from_mapping(
                 {"stale_warning_hours": 72, "stale_fallback_limit_hours": 72}
             )
+        with self.assertRaises(ConfigurationError):
+            RadarConfig(request_timeout_seconds=0)
+        with self.assertRaises(ConfigurationError):
+            RadarConfig(stale_warning_hours=72, stale_fallback_limit_hours=72)
 
     def test_invalid_retention(self) -> None:
         for field in ("raw_retention_days", "raw_max_bytes_per_provider"):
             with self.subTest(field=field), self.assertRaises(ConfigurationError):
                 RadarConfig.from_mapping({field: 0})
+        with self.assertRaises(ConfigurationError):
+            RadarConfig(raw_retention_days=0)
 
     def test_absolute_paths_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -178,8 +204,8 @@ class RadarConfigTests(unittest.TestCase):
         finally:
             os.chdir(previous)
 
-        self.assertEqual(config.data_dir, active_root / "data")
-        self.assertEqual(config.report_dir, active_root / "reports")
+        self.assertEqual(config.data_dir, active_root / "data/steam-game-radar")
+        self.assertEqual(config.report_dir, active_root / "reports/steam-game-radar")
 
     def test_serialized_example_matches_defaults(self) -> None:
         example_path = PROJECT_DIR / "references/config.example.json"
@@ -190,20 +216,20 @@ class RadarConfigTests(unittest.TestCase):
             "language": "english",
             "timezone": "Asia/Shanghai",
             "schedule": "0 11 * * *",
-            "released_candidate_limit": 100,
-            "unreleased_candidate_limit": 100,
-            "preliminary_top_n": 50,
-            "enrichment_top_n": 20,
-            "final_top_n": 20,
-            "request_timeout_seconds": 10.0,
-            "max_retries": 2,
+            "released_candidate_limit": 50,
+            "unreleased_candidate_limit": 50,
+            "preliminary_top_n": 20,
+            "enrichment_top_n": 10,
+            "final_top_n": 10,
+            "request_timeout_seconds": 15.0,
+            "max_retries": 3,
             "minimum_request_interval_seconds": 1.0,
             "raw_retention_days": 14,
             "raw_max_bytes_per_provider": 5_242_880,
-            "stale_warning_hours": 24,
+            "stale_warning_hours": 36,
             "stale_fallback_limit_hours": 72,
-            "data_dir": "data",
-            "report_dir": "reports",
+            "data_dir": "data/steam-game-radar",
+            "report_dir": "reports/steam-game-radar",
         }
         self.assertEqual(values, expected)
 
@@ -212,8 +238,8 @@ class RadarConfigTests(unittest.TestCase):
             config = RadarConfig.from_mapping(values, project_root=root)
         self.assert_config_values(
             config,
-            data_dir=root / "data",
-            report_dir=root / "reports",
+            data_dir=root / "data/steam-game-radar",
+            report_dir=root / "reports/steam-game-radar",
         )
 
 

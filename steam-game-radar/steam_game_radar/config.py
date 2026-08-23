@@ -6,9 +6,17 @@ from dataclasses import dataclass, fields
 import json
 import math
 from pathlib import Path
+import re
 from typing import Mapping
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .errors import ConfigurationError
+
+
+_COUNTRY = re.compile(r"[A-Z]{2}", flags=re.ASCII)
+_LANGUAGE = re.compile(r"[a-z][a-z0-9_]*", flags=re.ASCII)
+_CRON_ITEM = r"(?:\*|\d+(?:-\d+)?)(?:/\d+)?"
+_CRON_FIELD = re.compile(rf"{_CRON_ITEM}(?:,{_CRON_ITEM})*", flags=re.ASCII)
 
 
 @dataclass(frozen=True)
@@ -20,20 +28,70 @@ class RadarConfig:
     language: str = "english"
     timezone: str = "Asia/Shanghai"
     schedule: str = "0 11 * * *"
-    released_candidate_limit: int = 100
-    unreleased_candidate_limit: int = 100
-    preliminary_top_n: int = 50
-    enrichment_top_n: int = 20
-    final_top_n: int = 20
-    request_timeout_seconds: float = 10.0
-    max_retries: int = 2
+    released_candidate_limit: int = 50
+    unreleased_candidate_limit: int = 50
+    preliminary_top_n: int = 20
+    enrichment_top_n: int = 10
+    final_top_n: int = 10
+    request_timeout_seconds: float = 15.0
+    max_retries: int = 3
     minimum_request_interval_seconds: float = 1.0
     raw_retention_days: int = 14
     raw_max_bytes_per_provider: int = 5_242_880
-    stale_warning_hours: int = 24
+    stale_warning_hours: int = 36
     stale_fallback_limit_hours: int = 72
-    data_dir: Path = Path("data")
-    report_dir: Path = Path("reports")
+    data_dir: Path = Path("data/steam-game-radar")
+    report_dir: Path = Path("reports/steam-game-radar")
+
+    def __post_init__(self) -> None:
+        schema_version = _integer(self.schema_version, "schema_version")
+        if schema_version != 1:
+            raise ConfigurationError(
+                f"unsupported configuration schema_version: {schema_version}"
+            )
+
+        _country(self.country)
+        _language(self.language)
+        _timezone(self.timezone)
+        _schedule(self.schedule)
+
+        for name in (
+            "released_candidate_limit",
+            "unreleased_candidate_limit",
+            "preliminary_top_n",
+            "enrichment_top_n",
+            "final_top_n",
+            "raw_retention_days",
+            "raw_max_bytes_per_provider",
+            "stale_warning_hours",
+            "stale_fallback_limit_hours",
+        ):
+            parsed = _integer(getattr(self, name), name)
+            if parsed <= 0:
+                raise ConfigurationError(f"{name} must be positive")
+
+        max_retries = _integer(self.max_retries, "max_retries")
+        if max_retries < 0:
+            raise ConfigurationError("max_retries must not be negative")
+
+        for name in (
+            "request_timeout_seconds",
+            "minimum_request_interval_seconds",
+        ):
+            parsed_float = _positive_number(getattr(self, name), name)
+            object.__setattr__(self, name, parsed_float)
+
+        if self.stale_warning_hours >= self.stale_fallback_limit_hours:
+            raise ConfigurationError(
+                "stale_warning_hours must be below stale_fallback_limit_hours"
+            )
+
+        object.__setattr__(self, "data_dir", _path(self.data_dir, "data_dir"))
+        object.__setattr__(
+            self,
+            "report_dir",
+            _path(self.report_dir, "report_dir"),
+        )
 
     @classmethod
     def from_mapping(
@@ -56,49 +114,6 @@ class RadarConfig:
             for field in fields(cls)
         }
 
-        schema_version = _integer(values["schema_version"], "schema_version")
-        if schema_version != 1:
-            raise ConfigurationError(
-                f"unsupported configuration schema_version: {schema_version}"
-            )
-
-        positive_integer_fields = (
-            "released_candidate_limit",
-            "unreleased_candidate_limit",
-            "preliminary_top_n",
-            "enrichment_top_n",
-            "final_top_n",
-            "raw_retention_days",
-            "raw_max_bytes_per_provider",
-            "stale_warning_hours",
-            "stale_fallback_limit_hours",
-        )
-        for name in positive_integer_fields:
-            parsed = _integer(values[name], name)
-            if parsed <= 0:
-                raise ConfigurationError(f"{name} must be positive")
-            values[name] = parsed
-
-        max_retries = _integer(values["max_retries"], "max_retries")
-        if max_retries < 0:
-            raise ConfigurationError("max_retries must not be negative")
-        values["max_retries"] = max_retries
-
-        for name in (
-            "request_timeout_seconds",
-            "minimum_request_interval_seconds",
-        ):
-            parsed_float = _positive_number(values[name], name)
-            values[name] = parsed_float
-
-        if values["stale_warning_hours"] >= values["stale_fallback_limit_hours"]:
-            raise ConfigurationError(
-                "stale_warning_hours must be below stale_fallback_limit_hours"
-            )
-
-        for name in ("country", "language", "timezone", "schedule"):
-            values[name] = _non_empty_string(values[name], name)
-
         root = Path.cwd() if project_root is None else Path(project_root)
         for name in ("data_dir", "report_dir"):
             configured_path = _path(values[name], name)
@@ -108,7 +123,6 @@ class RadarConfig:
                 else root / configured_path
             )
 
-        values["schema_version"] = schema_version
         return cls(**values)
 
     @classmethod
@@ -141,10 +155,50 @@ def _positive_number(value: object, name: str) -> float:
     return parsed
 
 
-def _non_empty_string(value: object, name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ConfigurationError(f"{name} must be a non-empty string")
+def _string_without_surrounding_whitespace(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ConfigurationError(
+            f"{name} must be a non-empty string without surrounding whitespace"
+        )
     return value
+
+
+def _country(value: object) -> str:
+    country = _string_without_surrounding_whitespace(value, "country")
+    if _COUNTRY.fullmatch(country) is None:
+        raise ConfigurationError("country must be two uppercase ASCII letters")
+    return country
+
+
+def _language(value: object) -> str:
+    language = _string_without_surrounding_whitespace(value, "language")
+    if _LANGUAGE.fullmatch(language) is None:
+        raise ConfigurationError(
+            "language must begin with a lowercase ASCII letter and contain only "
+            "lowercase ASCII letters, digits, or underscores"
+        )
+    return language
+
+
+def _timezone(value: object) -> str:
+    timezone = _string_without_surrounding_whitespace(value, "timezone")
+    try:
+        ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError) as error:
+        raise ConfigurationError(f"unknown timezone: {timezone}") from error
+    return timezone
+
+
+def _schedule(value: object) -> str:
+    schedule = _string_without_surrounding_whitespace(value, "schedule")
+    cron_fields = schedule.split()
+    if len(cron_fields) != 5 or any(
+        _CRON_FIELD.fullmatch(field) is None for field in cron_fields
+    ):
+        raise ConfigurationError(
+            "schedule must contain exactly five numeric cron fields"
+        )
+    return schedule
 
 
 def _path(value: object, name: str) -> Path:
