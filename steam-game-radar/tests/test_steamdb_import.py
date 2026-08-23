@@ -18,7 +18,11 @@ sys.path.insert(0, str(PROJECT_DIR))
 from steam_game_radar.artifacts import persist_raw
 from steam_game_radar.config import RadarConfig
 from steam_game_radar.errors import InputValidationError
-from steam_game_radar.schemas import MAX_STEAM_APPID
+from steam_game_radar.schemas import (
+    MAX_JSON_SAFE_INTEGER,
+    MAX_STEAM_APPID,
+    MIN_JSON_SAFE_INTEGER,
+)
 from steam_game_radar.steamdb_import import (
     ImportResult,
     extract_appid,
@@ -52,7 +56,7 @@ class SteamDBImportTests(unittest.TestCase):
             "+1,234": 1234,
             "1.25K": 1250,
             "2m": 2_000_000,
-            "9007199254740993": 9007199254740993,
+            str(MAX_JSON_SAFE_INTEGER): MAX_JSON_SAFE_INTEGER,
             str(MAX_STEAM_APPID + 1): MAX_STEAM_APPID + 1,
             "87.5%": 87.5,
             "+1.2K%": 1200,
@@ -60,6 +64,11 @@ class SteamDBImportTests(unittest.TestCase):
         for value, expected in cases.items():
             with self.subTest(value=value):
                 self.assertEqual(parse_number(value), expected)
+        self.assertEqual(parse_number(MAX_JSON_SAFE_INTEGER), MAX_JSON_SAFE_INTEGER)
+        self.assertEqual(
+            parse_number(float(MAX_JSON_SAFE_INTEGER)),
+            MAX_JSON_SAFE_INTEGER,
+        )
 
     def test_parse_number_rejects_negative_nonfinite_bool_and_malformed_values(self) -> None:
         invalid = (
@@ -70,6 +79,9 @@ class SteamDBImportTests(unittest.TestCase):
             math.inf,
             math.nan,
             [],
+            MAX_JSON_SAFE_INTEGER + 1,
+            float(MAX_JSON_SAFE_INTEGER + 1),
+            str(MAX_JSON_SAFE_INTEGER + 1),
             "-1",
             "++1",
             "1,23",
@@ -241,7 +253,14 @@ class SteamDBImportTests(unittest.TestCase):
                 directory,
                 "appid-bounds.json",
                 [
-                    {"appid": MAX_STEAM_APPID, "name": "Max", "rank": 1},
+                    {
+                        "appid": MAX_STEAM_APPID,
+                        "name": "Max",
+                        "rank": 1,
+                        "Minimum": MIN_JSON_SAFE_INTEGER,
+                        "Maximum": MAX_JSON_SAFE_INTEGER,
+                        "Fraction": 1.25,
+                    },
                     {"appid": MAX_STEAM_APPID + 1, "name": "Native", "rank": 2},
                     {"app_id": str(MAX_STEAM_APPID + 1), "name": "String", "rank": 3},
                     {
@@ -249,6 +268,7 @@ class SteamDBImportTests(unittest.TestCase):
                         "name": "URL",
                         "rank": 4,
                     },
+                    {"appid": 35, "name": "Negative metric", "rank": -1},
                 ],
             )
             bounds_result = import_steamdb(
@@ -265,6 +285,17 @@ class SteamDBImportTests(unittest.TestCase):
             [MAX_STEAM_APPID],
         )
         self.assertEqual(
+            dict(bounds_result.records[0].source_extra),
+            {
+                "Minimum": MIN_JSON_SAFE_INTEGER,
+                "Maximum": MAX_JSON_SAFE_INTEGER,
+                "Fraction": 1.25,
+                "steamdb_view": "trending_games",
+            },
+        )
+        json.dumps(bounds_result.records[0].to_dict(), allow_nan=False)
+        json.dumps(bounds_result.raw_to_dict(), allow_nan=False)
+        self.assertEqual(
             [
                 (row.row_number, row.code, row.appid)
                 for row in bounds_result.rejected_rows
@@ -273,6 +304,7 @@ class SteamDBImportTests(unittest.TestCase):
                 (2, "steamdb_row_invalid", None),
                 (3, "steamdb_row_invalid", None),
                 (4, "steamdb_row_invalid", None),
+                (5, "steamdb_row_invalid", 35),
             ],
         )
 
@@ -348,11 +380,16 @@ class SteamDBImportTests(unittest.TestCase):
             )
             max_csv = Path(directory) / "max.csv"
             max_csv.write_text(
-                "app_id,name,rank\n"
+                "app_id,name,rank,players_now\n"
                 + str(MAX_STEAM_APPID)
-                + ",Max CSV,1\n"
+                + ",Max CSV,1,"
+                + str(MAX_JSON_SAFE_INTEGER)
+                + "\n"
                 + str(MAX_STEAM_APPID + 1)
-                + ",Too Large,2\n",
+                + ",Too Large AppID,2,1\n"
+                + "123,Too Large Metric,3,"
+                + str(MAX_JSON_SAFE_INTEGER + 1)
+                + "\n",
                 encoding="utf-8",
             )
             max_result = import_steamdb(
@@ -362,20 +399,44 @@ class SteamDBImportTests(unittest.TestCase):
             )
             self.assertEqual(max_result.records[0].appid, MAX_STEAM_APPID)
             self.assertEqual(
+                max_result.records[0].metrics["current_players"].value,
+                MAX_JSON_SAFE_INTEGER,
+            )
+            self.assertEqual(
                 max_result.records[0].store_url,
                 f"https://store.steampowered.com/app/{MAX_STEAM_APPID}/",
             )
-            self.assertEqual(max_result.rejected_rows[0].appid, None)
+            self.assertEqual(
+                [
+                    (row.row_number, row.code, row.appid)
+                    for row in max_result.rejected_rows
+                ],
+                [
+                    (2, "steamdb_row_invalid", None),
+                    (3, "steamdb_row_invalid", 123),
+                ],
+            )
             json.dumps(max_result.records[0].to_dict(), allow_nan=False)
             json.dumps(max_result.raw_to_dict(), allow_nan=False)
-            persisted = persist_raw(
-                RadarConfig(data_dir=Path(directory) / "persisted-max"),
+            persistence_config = RadarConfig(
+                data_dir=Path(directory) / "persisted-max"
+            )
+            persisted_raw = persist_raw(
+                persistence_config,
                 "20260824T030405Z-abcdef12",
                 "steamdb_max_appid",
                 max_result.raw_to_dict(),
                 datetime(2026, 8, 24, 3, 4, 5, tzinfo=timezone.utc),
             )
-            self.assertTrue(persisted.is_file())
+            persisted_record = persist_raw(
+                persistence_config,
+                "20260824T030405Z-abcdef12",
+                "steamdb_max_metric",
+                max_result.records[0].to_dict(),
+                datetime(2026, 8, 24, 3, 4, 5, tzinfo=timezone.utc),
+            )
+            self.assertTrue(persisted_raw.is_file())
+            self.assertTrue(persisted_record.is_file())
             for name, content in (
                 ("empty.csv", ""),
                 ("broken.csv", 'appid,name,rank\n1,"unterminated,1\n'),
@@ -430,10 +491,28 @@ class SteamDBImportTests(unittest.TestCase):
             malformed.write_text('{"rows": [', encoding="utf-8")
             nonfinite = Path(directory) / "nonfinite.json"
             nonfinite.write_text('[{"appid":1,"name":"Game","rank":NaN}]', encoding="utf-8")
+            overflow_float = Path(directory) / "overflow-float.json"
+            overflow_float.write_text(
+                '[{"appid":1,"name":"Game","rank":1,"Meta":1e400}]',
+                encoding="utf-8",
+            )
+            too_positive = self._write(
+                directory,
+                "too-positive.json",
+                [{"appid": 1, "name": "Game", "rank": 1, "Meta": MAX_JSON_SAFE_INTEGER + 1}],
+            )
+            too_negative = self._write(
+                directory,
+                "too-negative.json",
+                [{"appid": 1, "name": "Game", "rank": 1, "Meta": MIN_JSON_SAFE_INTEGER - 1}],
+            )
             valid = self._write(directory, "valid.json", [{"appid": 1, "name": "Game", "rank": 1}])
             for path, observed_at in (
                 (malformed, OBSERVED_AT),
                 (nonfinite, OBSERVED_AT),
+                (overflow_float, OBSERVED_AT),
+                (too_positive, OBSERVED_AT),
+                (too_negative, OBSERVED_AT),
                 (valid, "2026-08-24T03:04:05+00:00"),
                 (valid, "not-a-time"),
             ):
@@ -460,6 +539,53 @@ class SteamDBImportTests(unittest.TestCase):
                     raw_canonical=cyclic,
                     view="trending_games",
                 )
+
+            safe_raw = ImportResult(
+                records=(),
+                rejected_rows=(),
+                raw_canonical={
+                    "bounds": {
+                        "minimum": MIN_JSON_SAFE_INTEGER,
+                        "maximum": MAX_JSON_SAFE_INTEGER,
+                    },
+                    "flag": True,
+                    "fraction": 1.5,
+                },
+                view="trending_games",
+            )
+            self.assertEqual(
+                safe_raw.raw_to_dict(),
+                {
+                    "bounds": {
+                        "minimum": MIN_JSON_SAFE_INTEGER,
+                        "maximum": MAX_JSON_SAFE_INTEGER,
+                    },
+                    "flag": True,
+                    "fraction": 1.5,
+                },
+            )
+            json.dumps(safe_raw.raw_to_dict(), allow_nan=False)
+            safe_path = persist_raw(
+                RadarConfig(data_dir=Path(directory) / "safe-raw"),
+                "20260824T030405Z-12345678",
+                "steamdb_safe_integers",
+                safe_raw.raw_to_dict(),
+                datetime(2026, 8, 24, 3, 4, 5, tzinfo=timezone.utc),
+            )
+            self.assertTrue(safe_path.is_file())
+            for unsafe_integer in (
+                MIN_JSON_SAFE_INTEGER - 1,
+                MAX_JSON_SAFE_INTEGER + 1,
+            ):
+                with self.subTest(unsafe_integer=unsafe_integer), self.assertRaises(
+                    InputValidationError
+                ):
+                    ImportResult(
+                        records=(),
+                        rejected_rows=(),
+                        raw_canonical={"nested": [{"unsafe": unsafe_integer}]},
+                        view="trending_games",
+                    )
 
     def test_duplicate_appids_reject_every_occurrence_and_preserve_other_order(self) -> None:
         rows = [

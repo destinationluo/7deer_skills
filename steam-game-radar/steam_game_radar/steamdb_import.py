@@ -18,7 +18,9 @@ from typing import Callable, Mapping, Sequence
 
 from .errors import InputValidationError
 from .schemas import (
+    MAX_JSON_SAFE_INTEGER,
     MAX_STEAM_APPID,
+    MIN_JSON_SAFE_INTEGER,
     GameRecord,
     MetricObservation,
     RejectedRow,
@@ -120,12 +122,20 @@ def parse_number(value: object) -> int | float | None:
     if isinstance(value, bool):
         raise InputValidationError("number must not be boolean")
     if isinstance(value, int):
-        if value < 0:
-            raise InputValidationError("number must not be negative")
+        if value < 0 or value > MAX_JSON_SAFE_INTEGER:
+            raise InputValidationError(
+                "number must be a non-negative JSON-safe value"
+            )
         return value
     if isinstance(value, float):
-        if not math.isfinite(value) or value < 0:
-            raise InputValidationError("number must be finite and non-negative")
+        if (
+            not math.isfinite(value)
+            or value < 0
+            or value > MAX_JSON_SAFE_INTEGER
+        ):
+            raise InputValidationError(
+                "number must be finite, non-negative, and JSON-safe"
+            )
         return int(value) if value.is_integer() else value
     if not isinstance(value, str):
         raise InputValidationError("number has an unsupported type")
@@ -151,8 +161,14 @@ def parse_number(value: object) -> int | float | None:
                 )
     except (DecimalException, ValueError, OverflowError) as error:
         raise InputValidationError("number has an invalid format") from error
-    if not parsed.is_finite() or parsed < 0:
-        raise InputValidationError("number must be finite and non-negative")
+    if (
+        not parsed.is_finite()
+        or parsed < 0
+        or parsed > MAX_JSON_SAFE_INTEGER
+    ):
+        raise InputValidationError(
+            "number must be finite, non-negative, and JSON-safe"
+        )
     if parsed == parsed.to_integral_value():
         return _decimal_to_integer(parsed, "number")
     try:
@@ -638,6 +654,7 @@ def _parse_json(
         parsed = json.loads(
             text,
             parse_constant=_reject_json_constant,
+            parse_float=_parse_json_float,
             parse_int=_parse_json_integer,
             object_pairs_hook=_json_object,
         )
@@ -685,7 +702,19 @@ def _reject_json_constant(value: str) -> object:
 
 
 def _parse_json_integer(value: str) -> int:
-    return _decimal_text_to_integer(value, "JSON integer")
+    return _json_safe_integer(
+        _decimal_text_to_integer(value, "JSON integer")
+    )
+
+
+def _parse_json_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except (ValueError, OverflowError) as error:
+        raise InputValidationError("JSON floats must be finite") from error
+    if not math.isfinite(parsed):
+        raise InputValidationError("JSON floats must be finite")
+    return parsed
 
 
 def _decimal_text_to_integer(value: str, field: str) -> int:
@@ -709,6 +738,14 @@ def _steam_appid(value: int) -> int:
     if value < 1 or value > MAX_STEAM_APPID:
         raise InputValidationError(
             f"AppID must be from 1 through {MAX_STEAM_APPID}"
+        )
+    return value
+
+
+def _json_safe_integer(value: int) -> int:
+    if value < MIN_JSON_SAFE_INTEGER or value > MAX_JSON_SAFE_INTEGER:
+        raise InputValidationError(
+            "JSON integer is outside the persisted safe range"
         )
     return value
 
@@ -746,8 +783,10 @@ def _copy_json(
         raise InputValidationError("JSON nesting is too deep")
     if active_containers is None:
         active_containers = set()
-    if value is None or isinstance(value, (bool, int)):
+    if value is None or isinstance(value, bool):
         return value
+    if isinstance(value, int):
+        return _json_safe_integer(value)
     if isinstance(value, str):
         try:
             value.encode("utf-8")
