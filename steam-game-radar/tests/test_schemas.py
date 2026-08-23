@@ -10,6 +10,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
 from steam_game_radar.errors import InputValidationError
+from steam_game_radar import MAX_STEAM_APPID
 from steam_game_radar.schemas import (
     GameRecord,
     MetricObservation,
@@ -88,6 +89,32 @@ class SchemaTests(unittest.TestCase):
         }
         self.assertEqual(WarningRecord.from_dict(warning).to_dict(), warning)
         self.assertEqual(RejectedRow.from_dict(rejected).to_dict(), rejected)
+        max_warning = {
+            "code": "max_appid",
+            "message": "maximum AppID",
+            "appid": MAX_STEAM_APPID,
+        }
+        max_rejected = {
+            "row_number": 5,
+            "code": "max_appid",
+            "message": "maximum AppID",
+            "appid": MAX_STEAM_APPID,
+        }
+        max_warning_record = WarningRecord.from_dict(max_warning)
+        max_rejected_record = RejectedRow.from_dict(max_rejected)
+        self.assertEqual(max_warning_record.to_dict(), max_warning)
+        self.assertEqual(max_rejected_record.to_dict(), max_rejected)
+        self.assertIsInstance(json.dumps(max_warning_record.to_dict()), str)
+        self.assertIsInstance(json.dumps(max_rejected_record.to_dict()), str)
+        for optional_appid in (True, MAX_STEAM_APPID + 1):
+            with self.subTest(
+                record="warning", optional_appid=optional_appid
+            ), self.assertRaises(InputValidationError):
+                WarningRecord("invalid_appid", "invalid AppID", optional_appid)
+            with self.subTest(
+                record="rejected", optional_appid=optional_appid
+            ), self.assertRaises(InputValidationError):
+                RejectedRow(6, "invalid_appid", "invalid AppID", optional_appid)
 
         caller_metrics = {"current_players": MetricObservation.from_dict(self.metric_dict())}
         caller_extra = {"tags": ["FPS"], "nested": {"label": "before"}}
@@ -128,7 +155,17 @@ class SchemaTests(unittest.TestCase):
                 GameRecord.from_dict(unsupported)
 
     def test_positive_appid(self) -> None:
-        for appid in (0, -1, True, "730"):
+        self.assertEqual(MAX_STEAM_APPID, 4_294_967_295)
+        maximum = self.game_dict()
+        maximum["appid"] = MAX_STEAM_APPID
+        maximum["store_url"] = (
+            f"https://store.steampowered.com/app/{MAX_STEAM_APPID}"
+        )
+        maximum_record = GameRecord.from_dict(maximum)
+        self.assertEqual(maximum_record.appid, MAX_STEAM_APPID)
+        self.assertIsInstance(json.dumps(maximum_record.to_dict()), str)
+
+        for appid in (0, -1, True, "730", MAX_STEAM_APPID + 1):
             value = self.game_dict()
             value["appid"] = appid
             with self.subTest(appid=appid), self.assertRaises(InputValidationError):

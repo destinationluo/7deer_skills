@@ -83,6 +83,8 @@ It exposes `from_mapping(value: Mapping[str, object], project_root: Path | None 
 
 Both expose `to_dict()` and `from_dict()` with strict validation. Also define frozen `WarningRecord(code: str, message: str, appid: int | None)` and `RejectedRow(row_number: int, code: str, message: str, appid: int | None)` with JSON conversion.
 
+All required and optional AppIDs use Steam's `AppId_t` uint32 domain: integer values from `1` through `4_294_967_295`; booleans and out-of-range integers are rejected.
+
 - [ ] **Step 7: Run the green tests**
 
 Run: `python3 -m unittest steam-game-radar/tests/test_config.py steam-game-radar/tests/test_schemas.py`

@@ -264,6 +264,8 @@ Provenance is stored per value, not per record:
 
 Required fields are `schema_version`, `appid`, `name`, `release_status`, `store_url`, and `metrics`. Allowed release states are `released`, `unreleased`, and `unknown`. Unknown values are omitted; they are never stored as zero or an empty date.
 
+AppID values in normalized records, manual imports, warnings, and rejections follow Steam's [`AppId_t` unsigned 32-bit contract](https://partner.steamgames.com/doc/api/steam_api?l=english): `1 <= appid <= 4_294_967_295`; booleans are not AppIDs.
+
 ### Analyzed Candidate
 
 ```json

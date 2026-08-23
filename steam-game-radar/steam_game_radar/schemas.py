@@ -20,6 +20,8 @@ SourceKind = Literal[
 ]
 ReleaseStatus = Literal["released", "unreleased", "unknown"]
 
+MAX_STEAM_APPID = 4_294_967_295
+
 _SOURCE_KINDS = {"steam_official", "steamdb_manual_import", "seo_enrichment"}
 _RELEASE_STATUSES = {"released", "unreleased", "unknown"}
 _UTC_TIMESTAMP = re.compile(
@@ -267,8 +269,15 @@ def _non_empty_string(value: object, name: str) -> str:
 
 
 def _positive_appid(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise InputValidationError("appid must be a positive integer")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+        or value > MAX_STEAM_APPID
+    ):
+        raise InputValidationError(
+            f"appid must be an integer from 1 through {MAX_STEAM_APPID}"
+        )
     return value
 
 
