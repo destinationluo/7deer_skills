@@ -15,7 +15,14 @@ import unicodedata
 from .config import RadarConfig
 from .errors import InputValidationError, ProviderUnavailableError
 from .http_client import JsonHttpClient
-from .schemas import MAX_STEAM_APPID, GameRecord, MetricObservation, WarningRecord
+from .schemas import (
+    MAX_JSON_SAFE_INTEGER,
+    MAX_STEAM_APPID,
+    MIN_JSON_SAFE_INTEGER,
+    GameRecord,
+    MetricObservation,
+    WarningRecord,
+)
 
 
 STEAM_MOST_PLAYED_RANK_SOURCE_ID = "steam_most_played_rank"
@@ -826,7 +833,13 @@ def _immutable_raw(value: object) -> Mapping[str, object]:
 
 
 def _freeze_raw_json(value: object) -> object:
-    if value is None or isinstance(value, (str, bool, int)):
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        if value < MIN_JSON_SAFE_INTEGER or value > MAX_JSON_SAFE_INTEGER:
+            raise InputValidationError(
+                "raw integers must be within the JSON-safe range"
+            )
         return value
     if isinstance(value, float):
         if not math.isfinite(value):

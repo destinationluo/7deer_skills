@@ -21,7 +21,12 @@ from steam_game_radar.official_provider import (
     build_unreleased_candidates,
     collect_official,
 )
-from steam_game_radar.schemas import MetricObservation, WarningRecord
+from steam_game_radar.schemas import (
+    MAX_JSON_SAFE_INTEGER,
+    MIN_JSON_SAFE_INTEGER,
+    MetricObservation,
+    WarningRecord,
+)
 
 
 OBSERVED_AT = "2026-08-24T03:00:00Z"
@@ -716,7 +721,15 @@ class OfficialCollectionTests(unittest.TestCase):
         )
 
     def test_result_and_public_collection_inputs_are_validated_and_immutable(self) -> None:
-        raw: dict[str, object] = {"payload": {"items": [1]}}
+        raw: dict[str, object] = {
+            "payload": {
+                "items": [1],
+                "minimum": MIN_JSON_SAFE_INTEGER,
+                "maximum": MAX_JSON_SAFE_INTEGER,
+                "flag": True,
+                "ratio": 1.5,
+            }
+        }
         capabilities = {
             "most_played": True,
             "featured_categories": True,
@@ -737,10 +750,19 @@ class OfficialCollectionTests(unittest.TestCase):
         self.assertEqual(result.raw["payload"]["items"], (1,))
         first_export = result.raw_to_dict()
         second_export = result.raw_to_dict()
-        self.assertEqual(first_export, {"payload": {"items": [1]}})
+        expected_raw = {
+            "payload": {
+                "items": [1],
+                "minimum": MIN_JSON_SAFE_INTEGER,
+                "maximum": MAX_JSON_SAFE_INTEGER,
+                "flag": True,
+                "ratio": 1.5,
+            }
+        }
+        self.assertEqual(first_export, expected_raw)
         first_export["payload"]["items"].append(99)
         self.assertEqual(result.raw["payload"]["items"], (1,))
-        self.assertEqual(second_export, {"payload": {"items": [1]}})
+        self.assertEqual(second_export, expected_raw)
         self.assertIsNot(first_export, second_export)
         self.assertIsNot(first_export["payload"], second_export["payload"])
         with tempfile.TemporaryDirectory() as directory:
@@ -753,7 +775,7 @@ class OfficialCollectionTests(unittest.TestCase):
             )
             self.assertEqual(
                 json.loads(persisted.read_text(encoding="utf-8")),
-                {"payload": {"items": [1]}},
+                expected_raw,
             )
         self.assertIsInstance(result.released, tuple)
         self.assertIsInstance(result.warnings, tuple)
@@ -761,6 +783,21 @@ class OfficialCollectionTests(unittest.TestCase):
             result.capabilities["most_played"] = False
         with self.assertRaises(InputValidationError):
             CollectionResult((), (), {"most_played": True}, (), {})
+        invalid_raw_values = (
+            {"nested": [MAX_JSON_SAFE_INTEGER + 1]},
+            {"nested": {"minimum": MIN_JSON_SAFE_INTEGER - 1}},
+        )
+        for invalid_raw in invalid_raw_values:
+            with self.subTest(invalid_raw=invalid_raw), self.assertRaises(
+                InputValidationError
+            ):
+                CollectionResult(
+                    released=(),
+                    unreleased=(),
+                    capabilities={name: True for name in capabilities},
+                    warnings=(),
+                    raw=invalid_raw,
+                )
         with self.assertRaises(InputValidationError):
             collect_official(object(), RadarConfig(), OBSERVED_AT)
         with self.assertRaises(InputValidationError):
