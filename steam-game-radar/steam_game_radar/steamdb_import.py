@@ -5,10 +5,11 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 import io
 import json
 import math
+import os
 from pathlib import Path
 import re
 import stat
@@ -20,6 +21,8 @@ from .schemas import GameRecord, MetricObservation, RejectedRow
 
 
 _MAX_INPUT_BYTES = 5 * 1024 * 1024
+_MAX_JSON_DEPTH = 256
+_MAX_NUMBER_DIGITS = 64
 _ALLOWED_VIEWS = {
     "trending_games",
     "wishlist_activity",
@@ -90,16 +93,19 @@ class ImportResult:
             raise InputValidationError("rejected_rows must contain RejectedRow values")
         object.__setattr__(self, "records", records)
         object.__setattr__(self, "rejected_rows", rejected_rows)
-        object.__setattr__(
-            self,
-            "raw_canonical",
-            _freeze_json(self.raw_canonical),
-        )
+        try:
+            frozen_raw = _freeze_json(self.raw_canonical)
+        except RecursionError as error:
+            raise InputValidationError("JSON nesting is too deep") from error
+        object.__setattr__(self, "raw_canonical", frozen_raw)
 
     def raw_to_dict(self) -> object:
         """Return a fresh JSON-native export for raw artifact persistence."""
 
-        return _thaw_json(self.raw_canonical)
+        try:
+            return _thaw_json(self.raw_canonical)
+        except RecursionError as error:
+            raise InputValidationError("JSON nesting is too deep") from error
 
 
 def parse_number(value: object) -> int | float | None:
@@ -127,13 +133,19 @@ def parse_number(value: object) -> int | float | None:
     if match is None:
         raise InputValidationError("number has an invalid format")
     number_text = match.group("number").replace(",", "")
+    if sum(character.isdigit() for character in number_text) > _MAX_NUMBER_DIGITS:
+        raise InputValidationError("number has too many digits")
     try:
-        parsed = Decimal(number_text)
+        with localcontext() as context:
+            context.prec = _MAX_NUMBER_DIGITS + 6
+            parsed = Decimal(number_text)
+            suffix = match.group("suffix")
+            if suffix is not None:
+                parsed *= Decimal(
+                    1_000 if suffix.lower() == "k" else 1_000_000
+                )
     except InvalidOperation as error:
         raise InputValidationError("number has an invalid format") from error
-    suffix = match.group("suffix")
-    if suffix is not None:
-        parsed *= Decimal(1_000 if suffix.lower() == "k" else 1_000_000)
     if not parsed.is_finite() or parsed < 0:
         raise InputValidationError("number must be finite and non-negative")
     if parsed == parsed.to_integral_value():
@@ -187,7 +199,6 @@ def extract_appid(row: Mapping[str, object]) -> int:
     appids = [_parse_appid_value(value) for _, value in appid_values]
     urls = [_parse_url(value) for _, value in url_values]
     _require_one_canonical_value(appids, "appid")
-    _require_one_canonical_value([url for url, _ in urls], "url")
 
     url_appids: list[int] = []
     for _, identifiers in urls:
@@ -212,6 +223,19 @@ def import_steamdb(
     observed_at: str,
 ) -> ImportResult:
     """Import a local SteamDB CSV or JSON export without network access."""
+
+    try:
+        return _import_steamdb(path, view, observed_at)
+    except RecursionError as error:
+        raise InputValidationError("JSON nesting is too deep") from error
+
+
+def _import_steamdb(
+    path: Path,
+    view: str | None,
+    observed_at: str,
+) -> ImportResult:
+    """Implementation boundary kept behind recursion normalization."""
 
     selected_view = _optional_view(view)
     _validate_observed_at(observed_at)
@@ -292,6 +316,7 @@ def _record_from_row(
     observed_at: str,
 ) -> GameRecord:
     appid = extract_appid(row)
+    _validate_reserved_view(row, view)
     name = _canonical_alias(
         row,
         "name",
@@ -336,6 +361,7 @@ def _record_from_row(
         key: value
         for key, value in row.items()
         if key.strip().casefold() not in _KNOWN_ALIASES
+        and key.strip().casefold() != "steamdb_view"
     }
     extra["steamdb_view"] = view
     return GameRecord(
@@ -423,7 +449,13 @@ def _parse_appid_value(value: object) -> int:
     elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
         parsed = int(value)
     elif isinstance(value, str) and re.fullmatch(r"\+?[0-9]+", value.strip(), re.ASCII):
-        parsed = int(value.strip().lstrip("+"))
+        digits = value.strip().lstrip("+")
+        if len(digits) > _MAX_NUMBER_DIGITS:
+            raise InputValidationError("AppID has too many digits")
+        try:
+            parsed = int(digits)
+        except (ValueError, OverflowError) as error:
+            raise InputValidationError("AppID must be a positive integer") from error
     else:
         raise InputValidationError("AppID must be a positive integer")
     if parsed <= 0:
@@ -435,13 +467,21 @@ def _parse_url(value: object) -> tuple[str, list[int]]:
     if not isinstance(value, str) or not value.strip():
         raise InputValidationError("URL must be a non-empty string")
     normalized = value.strip()
-    identifiers = [int(match) for match in _APP_PATH.findall(normalized)]
+    identifiers: list[int] = []
+    for matched_digits in _APP_PATH.findall(normalized):
+        if len(matched_digits) > _MAX_NUMBER_DIGITS:
+            raise InputValidationError("URL AppID has too many digits")
+        try:
+            identifiers.append(int(matched_digits))
+        except (ValueError, OverflowError) as error:
+            raise InputValidationError("URL AppID must be an integer") from error
     if any(appid <= 0 for appid in identifiers):
         raise InputValidationError("URL AppID must be positive")
     return normalized, identifiers
 
 
 def _parse_rank(value: object) -> int | None:
+    _reject_percent_syntax(value, "rank")
     parsed = parse_number(value)
     if parsed is None:
         return None
@@ -451,6 +491,7 @@ def _parse_rank(value: object) -> int | None:
 
 
 def _parse_count(value: object) -> int | None:
+    _reject_percent_syntax(value, "count")
     parsed = parse_number(value)
     if parsed is None:
         return None
@@ -460,10 +501,31 @@ def _parse_count(value: object) -> int | None:
 
 
 def _parse_rating(value: object) -> int | float | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        without_percent = stripped[:-1] if stripped.endswith("%") else stripped
+        if without_percent.lower().endswith(("k", "m")):
+            raise InputValidationError("rating_percent must not use K/M suffixes")
     parsed = parse_number(value)
     if parsed is not None and parsed > 100:
         raise InputValidationError("rating_percent must be between 0 and 100")
     return parsed
+
+
+def _reject_percent_syntax(value: object, field: str) -> None:
+    if isinstance(value, str) and value.strip().endswith("%"):
+        raise InputValidationError(f"{field} must not use percentage syntax")
+
+
+def _validate_reserved_view(row: Mapping[str, object], view: str) -> None:
+    values = [
+        value
+        for key, value in row.items()
+        if key.strip().casefold() == "steamdb_view"
+    ]
+    for value in values:
+        if not isinstance(value, str) or value.strip() != view:
+            raise InputValidationError("steamdb_view metadata conflicts with import view")
 
 
 def _is_missing(value: object) -> bool:
@@ -492,18 +554,61 @@ def _validate_observed_at(observed_at: str) -> None:
 
 def _read_local_text(path: Path) -> str:
     try:
-        status = path.lstat()
-        if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
-            raise InputValidationError("input must be a regular non-symlink file")
-        if status.st_size > _MAX_INPUT_BYTES:
-            raise InputValidationError("input exceeds the 5 MiB limit")
-        raw = path.read_bytes()
-        if len(raw) > _MAX_INPUT_BYTES:
-            raise InputValidationError("input exceeds the 5 MiB limit")
-        return raw.decode("utf-8", errors="strict")
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        before_open = None
+        if not nofollow:
+            before_open = path.lstat()
+            if stat.S_ISLNK(before_open.st_mode) or not stat.S_ISREG(
+                before_open.st_mode
+            ):
+                raise InputValidationError(
+                    "input must be a regular non-symlink file"
+                )
+
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= nofollow
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise InputValidationError(
+                    "input must be a regular non-symlink file"
+                )
+            if before_open is not None and (
+                before_open.st_dev != opened.st_dev
+                or before_open.st_ino != opened.st_ino
+            ):
+                raise InputValidationError("input changed while being opened")
+            if before_open is not None:
+                after_open = path.lstat()
+                if (
+                    stat.S_ISLNK(after_open.st_mode)
+                    or not stat.S_ISREG(after_open.st_mode)
+                    or after_open.st_dev != opened.st_dev
+                    or after_open.st_ino != opened.st_ino
+                ):
+                    raise InputValidationError("input changed while being opened")
+            if opened.st_size > _MAX_INPUT_BYTES:
+                raise InputValidationError("input exceeds the 5 MiB limit")
+
+            raw = bytearray()
+            while len(raw) <= _MAX_INPUT_BYTES:
+                remaining = _MAX_INPUT_BYTES + 1 - len(raw)
+                chunk = os.read(descriptor, min(65_536, remaining))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            if len(raw) > _MAX_INPUT_BYTES:
+                raise InputValidationError("input exceeds the 5 MiB limit")
+            return bytes(raw).decode("utf-8-sig", errors="strict")
+        finally:
+            os.close(descriptor)
     except InputValidationError:
         raise
-    except (OSError, UnicodeError) as error:
+    except (OSError, UnicodeError, ValueError) as error:
         raise InputValidationError("unable to read strict UTF-8 input") from error
 
 
@@ -603,7 +708,16 @@ def _normalize_row_mapping(row: Mapping[str, object]) -> dict[str, object]:
     return normalized
 
 
-def _copy_json(value: object) -> object:
+def _copy_json(
+    value: object,
+    *,
+    depth: int = 0,
+    active_containers: set[int] | None = None,
+) -> object:
+    if depth > _MAX_JSON_DEPTH:
+        raise InputValidationError("JSON nesting is too deep")
+    if active_containers is None:
+        active_containers = set()
     if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, str):
@@ -617,37 +731,78 @@ def _copy_json(value: object) -> object:
             raise InputValidationError("JSON numbers must be finite")
         return value
     if isinstance(value, list):
-        return [_copy_json(item) for item in value]
+        identity = _enter_json_container(value, active_containers)
+        try:
+            return [
+                _copy_json(
+                    item,
+                    depth=depth + 1,
+                    active_containers=active_containers,
+                )
+                for item in value
+            ]
+        finally:
+            active_containers.remove(identity)
     if isinstance(value, Mapping):
-        copied: dict[str, object] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise InputValidationError("JSON mapping keys must be strings")
-            try:
-                key.encode("utf-8")
-            except UnicodeError as error:
-                raise InputValidationError(
-                    "JSON mapping keys must be valid UTF-8"
-                ) from error
-            copied[key] = _copy_json(item)
-        return copied
+        identity = _enter_json_container(value, active_containers)
+        try:
+            copied: dict[str, object] = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise InputValidationError("JSON mapping keys must be strings")
+                try:
+                    key.encode("utf-8")
+                except UnicodeError as error:
+                    raise InputValidationError(
+                        "JSON mapping keys must be valid UTF-8"
+                    ) from error
+                copied[key] = _copy_json(
+                    item,
+                    depth=depth + 1,
+                    active_containers=active_containers,
+                )
+            return copied
+        finally:
+            active_containers.remove(identity)
     raise InputValidationError("value must contain only JSON-native data")
 
 
 def _freeze_json(value: object) -> object:
     copied = _copy_json(value)
-    if isinstance(copied, dict):
+    return _freeze_copied_json(copied)
+
+
+def _freeze_copied_json(value: object, depth: int = 0) -> object:
+    if depth > _MAX_JSON_DEPTH:
+        raise InputValidationError("JSON nesting is too deep")
+    if isinstance(value, dict):
         return MappingProxyType(
-            {key: _freeze_json(item) for key, item in copied.items()}
+            {
+                key: _freeze_copied_json(item, depth + 1)
+                for key, item in value.items()
+            }
         )
-    if isinstance(copied, list):
-        return tuple(_freeze_json(item) for item in copied)
-    return copied
+    if isinstance(value, list):
+        return tuple(_freeze_copied_json(item, depth + 1) for item in value)
+    return value
 
 
-def _thaw_json(value: object) -> object:
+def _enter_json_container(value: object, active_containers: set[int]) -> int:
+    identity = id(value)
+    if identity in active_containers:
+        raise InputValidationError("JSON values must not contain cycles")
+    active_containers.add(identity)
+    return identity
+
+
+def _thaw_json(value: object, depth: int = 0) -> object:
+    if depth > _MAX_JSON_DEPTH:
+        raise InputValidationError("JSON nesting is too deep")
     if isinstance(value, Mapping):
-        return {key: _thaw_json(item) for key, item in value.items()}
+        return {
+            key: _thaw_json(item, depth + 1)
+            for key, item in value.items()
+        }
     if isinstance(value, tuple):
-        return [_thaw_json(item) for item in value]
+        return [_thaw_json(item, depth + 1) for item in value]
     return value

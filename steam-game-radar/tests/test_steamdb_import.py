@@ -4,6 +4,7 @@ import ast
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -18,6 +19,7 @@ from steam_game_radar.artifacts import persist_raw
 from steam_game_radar.config import RadarConfig
 from steam_game_radar.errors import InputValidationError
 from steam_game_radar.steamdb_import import (
+    ImportResult,
     extract_appid,
     import_steamdb,
     parse_number,
@@ -50,6 +52,7 @@ class SteamDBImportTests(unittest.TestCase):
             "1.25K": 1250,
             "2m": 2_000_000,
             "9007199254740993": 9007199254740993,
+            "9" * 64 + "M": int("9" * 64) * 1_000_000,
             "87.5%": 87.5,
             "+1.2K%": 1200,
         }
@@ -70,6 +73,7 @@ class SteamDBImportTests(unittest.TestCase):
             "++1",
             "1,23",
             "1,,000",
+            "9" * 65,
             "1e3",
             "K",
             "1KM",
@@ -107,12 +111,23 @@ class SteamDBImportTests(unittest.TestCase):
             ),
             789,
         )
+        self.assertEqual(
+            extract_appid(
+                {
+                    "url": "https://steamdb.info/app/321/",
+                    "app_url": "https://steamdb.info/app/321/charts/?week=1",
+                }
+            ),
+            321,
+        )
         for row in (
             {"name": "Name only"},
             {"appid": True},
             {"appid": "1", "app_id": "2"},
             {"appid": "1", "url": "https://steamdb.info/app/2/"},
+            {"url": "https://steamdb.info/app/1/", "app_url": "https://steamdb.info/app/2/charts/"},
             {"url": "https://steamdb.info/apps/1/"},
+            {"url": "https://steamdb.info/app/" + "9" * 65 + "/"},
         ):
             with self.subTest(row=row), self.assertRaises(InputValidationError):
                 extract_appid(row)
@@ -198,9 +213,20 @@ class SteamDBImportTests(unittest.TestCase):
             with self.assertRaises(InputValidationError):
                 import_steamdb(path, None, OBSERVED_AT)
             result = import_steamdb(path, "trending_games", OBSERVED_AT)
+            bom_path = Path(directory) / "bom.json"
+            bom_path.write_bytes(
+                b"\xef\xbb\xbf"
+                + json.dumps(rows, ensure_ascii=False).encode("utf-8")
+            )
+            bom_result = import_steamdb(
+                bom_path,
+                "trending_games",
+                OBSERVED_AT,
+            )
         self.assertEqual(result.records[0].release_status, "released")
         self.assertEqual(result.records[0].metrics["rank"].value, 3)
         self.assertEqual(result.records[0].metrics["current_players"].value, 4000)
+        self.assertEqual(bom_result.records[0].appid, 11)
 
     def test_recent_releases_requires_date_and_players_and_normalizes_date(self) -> None:
         rows = [
@@ -260,6 +286,18 @@ class SteamDBImportTests(unittest.TestCase):
             with self.assertRaises(InputValidationError):
                 import_steamdb(valid, None, OBSERVED_AT)
             self.assertEqual(len(import_steamdb(valid, "trending_games", OBSERVED_AT).records), 1)
+            bom_csv = Path(directory) / "bom.csv"
+            bom_csv.write_bytes(
+                b"\xef\xbb\xbfappid,name,rank\n2,BOM Game,2\n"
+            )
+            self.assertEqual(
+                import_steamdb(
+                    bom_csv,
+                    "trending_games",
+                    OBSERVED_AT,
+                ).records[0].appid,
+                2,
+            )
             for name, content in (
                 ("empty.csv", ""),
                 ("broken.csv", 'appid,name,rank\n1,"unterminated,1\n'),
@@ -274,14 +312,37 @@ class SteamDBImportTests(unittest.TestCase):
             root = Path(directory)
             too_large = root / "large.json"
             too_large.write_bytes(b" " * (5 * 1024 * 1024 + 1))
+            exact_limit = root / "exact.json"
+            exact_limit.write_bytes(b"[]" + b" " * (5 * 1024 * 1024 - 2))
+            self.assertEqual(
+                import_steamdb(
+                    exact_limit,
+                    "trending_games",
+                    OBSERVED_AT,
+                ).records,
+                (),
+            )
             target = self._write(directory, "target.json", [])
             symlink = root / "link.json"
             symlink.symlink_to(target)
             folder = root / "folder.json"
             folder.mkdir()
+            fifo = root / "pipe.json"
+            if hasattr(os, "mkfifo"):
+                os.mkfifo(fifo)
             invalid_utf8 = root / "utf8.json"
             invalid_utf8.write_bytes(b"\xff")
-            for path in (too_large, symlink, folder, invalid_utf8):
+            unsafe_paths = [
+                too_large,
+                symlink,
+                folder,
+                invalid_utf8,
+                root / "missing.json",
+                root / "nul\0.json",
+            ]
+            if fifo.exists():
+                unsafe_paths.append(fifo)
+            for path in unsafe_paths:
                 with self.subTest(path=path), self.assertRaises(InputValidationError):
                     import_steamdb(path, "trending_games", OBSERVED_AT)
 
@@ -300,6 +361,27 @@ class SteamDBImportTests(unittest.TestCase):
             ):
                 with self.subTest(path=path, observed_at=observed_at), self.assertRaises(InputValidationError):
                     import_steamdb(path, "trending_games", observed_at)
+
+            deep_value = "{\"x\":" * 600 + "0" + "}" * 600
+            deep = Path(directory) / "deep.json"
+            deep.write_text(
+                '[{"appid":1,"name":"Deep","rank":1,"Meta":'
+                + deep_value
+                + "}]",
+                encoding="utf-8",
+            )
+            with self.assertRaises(InputValidationError):
+                import_steamdb(deep, "trending_games", OBSERVED_AT)
+
+            cyclic: dict[str, object] = {}
+            cyclic["self"] = cyclic
+            with self.assertRaises(InputValidationError):
+                ImportResult(
+                    records=(),
+                    rejected_rows=(),
+                    raw_canonical=cyclic,
+                    view="trending_games",
+                )
 
     def test_duplicate_appids_reject_every_occurrence_and_preserve_other_order(self) -> None:
         rows = [
@@ -367,6 +449,55 @@ class SteamDBImportTests(unittest.TestCase):
                 (4, "steamdb_row_invalid", 13),
             ],
         )
+
+        reserved_cases = (
+            ({"appid": 20, "name": "Reserved", "rank": 1, " steamdb_view ": " trending_games "}, True),
+            ({"appid": 24, "name": "Repeated", "rank": 1, "steamdb_view": "trending_games", "STEAMDB_VIEW": " trending_games "}, True),
+            ({"appid": 21, "name": "Wrong", "rank": 1, "steamdb_view": "recent_releases"}, False),
+            ({"appid": 22, "name": "Typed", "rank": 1, "steamdb_view": 1}, False),
+            ({"appid": 23, "name": "Conflict", "rank": 1, "steamdb_view": "trending_games", "STEAMDB_VIEW": "wishlist_activity"}, False),
+        )
+        numeric_syntax_cases = (
+            {"appid": 30, "name": "Percent rank", "rank": "1%"},
+            {"appid": 31, "name": "Percent count", "online": "10%"},
+            {"appid": 32, "name": "Suffixed rating", "rank": 1, "rating": "0.1K%"},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for index, (row, accepted) in enumerate(reserved_cases):
+                with self.subTest(reserved=row, accepted=accepted):
+                    reserved_result = import_steamdb(
+                        self._write(directory, f"reserved-{index}.json", [row]),
+                        "trending_games",
+                        OBSERVED_AT,
+                    )
+                    if accepted:
+                        self.assertEqual(len(reserved_result.records), 1)
+                        self.assertEqual(
+                            dict(reserved_result.records[0].source_extra),
+                            {"steamdb_view": "trending_games"},
+                        )
+                    else:
+                        self.assertEqual(reserved_result.records, ())
+                        self.assertEqual(
+                            reserved_result.rejected_rows[0].code,
+                            "steamdb_row_invalid",
+                        )
+                    raw_row = reserved_result.raw_to_dict()["rows"][0]
+                    for key, value in row.items():
+                        if key.strip().casefold() == "steamdb_view":
+                            self.assertEqual(raw_row[key.strip()], value)
+            for index, row in enumerate(numeric_syntax_cases):
+                with self.subTest(numeric_syntax=row):
+                    syntax_result = import_steamdb(
+                        self._write(directory, f"syntax-{index}.json", [row]),
+                        "trending_games",
+                        OBSERVED_AT,
+                    )
+                    self.assertEqual(syntax_result.records, ())
+                    self.assertEqual(
+                        syntax_result.rejected_rows[0].code,
+                        "steamdb_row_invalid",
+                    )
 
     def test_import_module_has_no_network_or_automated_steamdb_dependency(self) -> None:
         module_path = PROJECT_DIR / "steam_game_radar" / "steamdb_import.py"
