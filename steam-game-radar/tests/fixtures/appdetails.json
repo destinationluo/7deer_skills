@@ -1,0 +1,75 @@
+{
+  "730": {
+    "success": true,
+    "data": {
+      "type": "game",
+      "name": "Counter-Strike 2",
+      "steam_appid": 730,
+      "release_date": {
+        "coming_soon": false,
+        "date": "21 Aug, 2012"
+      },
+      "genres": [
+        {"id": "1", "description": "Action"},
+        {"id": "37", "description": "Free to Play"}
+      ],
+      "recommendations": {"total": 4512345}
+    }
+  },
+  "3000001": {
+    "success": true,
+    "data": {
+      "type": "game",
+      "name": "Project Aurora",
+      "steam_appid": 3000001,
+      "release_date": {
+        "coming_soon": true,
+        "date": "Aug 20, 2026"
+      },
+      "genres": [
+        {"id": "25", "description": "Adventure"},
+        {"id": "3", "description": "RPG"}
+      ]
+    }
+  },
+  "2715900": {
+    "success": true,
+    "data": {
+      "type": "dlc",
+      "name": "Example Expansion DLC",
+      "steam_appid": 2715900,
+      "release_date": {"coming_soon": false, "date": "2026-06-12"}
+    }
+  },
+  "3000002": {
+    "success": true,
+    "data": {
+      "type": "demo",
+      "name": "Example Game Demo",
+      "steam_appid": 3000002,
+      "release_date": {"coming_soon": false, "date": ""}
+    }
+  },
+  "3000003": {
+    "success": true,
+    "data": {
+      "type": "software",
+      "name": "Creator Toolkit",
+      "steam_appid": 3000003
+    }
+  },
+  "3000004": {
+    "success": true,
+    "data": {
+      "type": "unclassified",
+      "name": "Unclassified Steam App",
+      "steam_appid": 3000004,
+      "release_date": {"coming_soon": true, "date": "2026-08-20"},
+      "genres": [
+        {"id": "99", "description": "Experimental"},
+        {"id": "100"},
+        "invalid optional genre"
+      ]
+    }
+  }
+}

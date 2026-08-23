@@ -1,0 +1,67 @@
+{
+  "top_sellers": {
+    "id": "cat_topsellers",
+    "name": "Top Sellers",
+    "items": [
+      {
+        "id": 730,
+        "type": 0,
+        "name": "Counter-Strike 2",
+        "discounted": false,
+        "final_price": 0,
+        "currency": "USD",
+        "large_capsule_image": "https://cdn.cloudflare.steamstatic.com/steam/apps/730/capsule_616x353.jpg"
+      },
+      {
+        "id": 2715900,
+        "type": 1,
+        "name": "Example Expansion DLC",
+        "discounted": true,
+        "discount_percent": 20,
+        "original_price": 1999,
+        "final_price": 1599,
+        "currency": "USD"
+      }
+    ]
+  },
+  "new_releases": {
+    "id": "cat_newreleases",
+    "name": "New Releases",
+    "items": [
+      {
+        "id": 730,
+        "type": 0,
+        "name": "Counter-Strike 2",
+        "final_price": 0,
+        "currency": "USD"
+      },
+      {
+        "id": 3000002,
+        "type": 0,
+        "name": "Example Game Demo"
+      }
+    ]
+  },
+  "coming_soon": {
+    "id": "cat_comingsoon",
+    "name": "Coming Soon",
+    "items": [
+      {
+        "id": 3000001,
+        "type": 0,
+        "name": "Project Aurora",
+        "large_capsule_image": "https://cdn.cloudflare.steamstatic.com/steam/apps/3000001/capsule_616x353.jpg"
+      },
+      {
+        "id": 3000003,
+        "type": 6,
+        "name": "Creator Toolkit"
+      },
+      {
+        "id": 3000004,
+        "type": 99,
+        "name": "Unclassified Steam App"
+      }
+    ]
+  }
+}
