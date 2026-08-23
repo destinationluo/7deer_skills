@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import Decimal, DecimalException, localcontext
 import io
 import json
 import math
@@ -22,7 +22,6 @@ from .schemas import GameRecord, MetricObservation, RejectedRow
 
 _MAX_INPUT_BYTES = 5 * 1024 * 1024
 _MAX_JSON_DEPTH = 256
-_MAX_NUMBER_DIGITS = 64
 _ALLOWED_VIEWS = {
     "trending_games",
     "wishlist_activity",
@@ -71,6 +70,26 @@ _MONTHS = {
     "Dec": 12,
 }
 _APP_PATH = re.compile(r"/app/([0-9]+)(?=/|[?#]|$)", flags=re.ASCII)
+
+
+class _CanonicalAppID(int):
+    """An int whose decimal formatting is independent of runtime digit caps."""
+
+    def __new__(cls, value: int) -> "_CanonicalAppID":
+        instance = int.__new__(cls, value)
+        instance._decimal_text = _integer_to_decimal_text(value)
+        return instance
+
+    def __str__(self) -> str:
+        return self._decimal_text
+
+    def __repr__(self) -> str:
+        return self._decimal_text
+
+    def __format__(self, format_spec: str) -> str:
+        if format_spec in {"", "d"}:
+            return self._decimal_text
+        return int.__format__(self, format_spec)
 
 
 @dataclass(frozen=True)
@@ -133,24 +152,28 @@ def parse_number(value: object) -> int | float | None:
     if match is None:
         raise InputValidationError("number has an invalid format")
     number_text = match.group("number").replace(",", "")
-    if sum(character.isdigit() for character in number_text) > _MAX_NUMBER_DIGITS:
-        raise InputValidationError("number has too many digits")
+    digit_count = sum(character.isdigit() for character in number_text)
     try:
         with localcontext() as context:
-            context.prec = _MAX_NUMBER_DIGITS + 6
+            context.prec = max(1, digit_count + 6)
+            context.Emax = max(context.Emax, digit_count + 6)
+            context.Emin = min(context.Emin, -(digit_count + 6))
             parsed = Decimal(number_text)
             suffix = match.group("suffix")
             if suffix is not None:
                 parsed *= Decimal(
                     1_000 if suffix.lower() == "k" else 1_000_000
                 )
-    except InvalidOperation as error:
+    except (DecimalException, ValueError, OverflowError) as error:
         raise InputValidationError("number has an invalid format") from error
     if not parsed.is_finite() or parsed < 0:
         raise InputValidationError("number must be finite and non-negative")
     if parsed == parsed.to_integral_value():
-        return int(parsed)
-    as_float = float(parsed)
+        return _decimal_to_integer(parsed, "number")
+    try:
+        as_float = float(parsed)
+    except (ValueError, OverflowError) as error:
+        raise InputValidationError("number must be finite and non-negative") from error
     if not math.isfinite(as_float):
         raise InputValidationError("number must be finite and non-negative")
     return as_float
@@ -316,6 +339,7 @@ def _record_from_row(
     observed_at: str,
 ) -> GameRecord:
     appid = extract_appid(row)
+    record_appid = _CanonicalAppID(appid)
     _validate_reserved_view(row, view)
     name = _canonical_alias(
         row,
@@ -366,14 +390,18 @@ def _record_from_row(
     extra["steamdb_view"] = view
     return GameRecord(
         schema_version=1,
-        appid=appid,
+        appid=record_appid,
         name=name,
         release_status=(
             "released"
             if view in {"trending_games", "recent_releases"}
             else "unreleased"
         ),
-        store_url=f"https://store.steampowered.com/app/{appid}/",
+        store_url=(
+            "https://store.steampowered.com/app/"
+            + _integer_to_decimal_text(appid)
+            + "/"
+        ),
         metrics=observations,
         source_extra=extra,
     )
@@ -450,12 +478,7 @@ def _parse_appid_value(value: object) -> int:
         parsed = int(value)
     elif isinstance(value, str) and re.fullmatch(r"\+?[0-9]+", value.strip(), re.ASCII):
         digits = value.strip().lstrip("+")
-        if len(digits) > _MAX_NUMBER_DIGITS:
-            raise InputValidationError("AppID has too many digits")
-        try:
-            parsed = int(digits)
-        except (ValueError, OverflowError) as error:
-            raise InputValidationError("AppID must be a positive integer") from error
+        parsed = _decimal_text_to_integer(digits, "AppID")
     else:
         raise InputValidationError("AppID must be a positive integer")
     if parsed <= 0:
@@ -469,12 +492,9 @@ def _parse_url(value: object) -> tuple[str, list[int]]:
     normalized = value.strip()
     identifiers: list[int] = []
     for matched_digits in _APP_PATH.findall(normalized):
-        if len(matched_digits) > _MAX_NUMBER_DIGITS:
-            raise InputValidationError("URL AppID has too many digits")
-        try:
-            identifiers.append(int(matched_digits))
-        except (ValueError, OverflowError) as error:
-            raise InputValidationError("URL AppID must be an integer") from error
+        identifiers.append(
+            _decimal_text_to_integer(matched_digits, "URL AppID")
+        )
     if any(appid <= 0 for appid in identifiers):
         raise InputValidationError("URL AppID must be positive")
     return normalized, identifiers
@@ -640,6 +660,7 @@ def _parse_json(
         parsed = json.loads(
             text,
             parse_constant=_reject_json_constant,
+            parse_int=_parse_json_integer,
             object_pairs_hook=_json_object,
         )
     except InputValidationError:
@@ -683,6 +704,34 @@ def _parse_json(
 def _reject_json_constant(value: str) -> object:
     del value
     raise InputValidationError("JSON numbers must be finite")
+
+
+def _parse_json_integer(value: str) -> int:
+    return _decimal_text_to_integer(value, "JSON integer")
+
+
+def _decimal_text_to_integer(value: str, field: str) -> int:
+    try:
+        parsed = Decimal(value)
+    except (DecimalException, ValueError, OverflowError) as error:
+        raise InputValidationError(f"{field} must be an integer") from error
+    return _decimal_to_integer(parsed, field)
+
+
+def _decimal_to_integer(value: Decimal, field: str) -> int:
+    if not value.is_finite() or value != value.to_integral_value():
+        raise InputValidationError(f"{field} must be an integer")
+    try:
+        return int(value)
+    except (ValueError, OverflowError) as error:
+        raise InputValidationError(f"{field} must be an integer") from error
+
+
+def _integer_to_decimal_text(value: int) -> str:
+    try:
+        return format(Decimal(value), "f")
+    except (DecimalException, ValueError, OverflowError) as error:
+        raise InputValidationError("AppID must be an integer") from error
 
 
 def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

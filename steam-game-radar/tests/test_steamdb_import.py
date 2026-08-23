@@ -52,13 +52,14 @@ class SteamDBImportTests(unittest.TestCase):
             "1.25K": 1250,
             "2m": 2_000_000,
             "9007199254740993": 9007199254740993,
-            "9" * 64 + "M": int("9" * 64) * 1_000_000,
             "87.5%": 87.5,
             "+1.2K%": 1200,
         }
         for value, expected in cases.items():
             with self.subTest(value=value):
                 self.assertEqual(parse_number(value), expected)
+        large_digits = "9" * 5_000
+        self.assertEqual(parse_number(large_digits), 10**5_000 - 1)
 
     def test_parse_number_rejects_negative_nonfinite_bool_and_malformed_values(self) -> None:
         invalid = (
@@ -73,7 +74,6 @@ class SteamDBImportTests(unittest.TestCase):
             "++1",
             "1,23",
             "1,,000",
-            "9" * 65,
             "1e3",
             "K",
             "1KM",
@@ -120,6 +120,16 @@ class SteamDBImportTests(unittest.TestCase):
             ),
             321,
         )
+        large_digits = "9" * 5_000
+        large_appid = 10**5_000 - 1
+        self.assertEqual(extract_appid({"appid": large_appid}), large_appid)
+        self.assertEqual(extract_appid({"app_id": large_digits}), large_appid)
+        self.assertEqual(
+            extract_appid(
+                {"url": "https://steamdb.info/app/" + large_digits + "/"}
+            ),
+            large_appid,
+        )
         for row in (
             {"name": "Name only"},
             {"appid": True},
@@ -127,7 +137,6 @@ class SteamDBImportTests(unittest.TestCase):
             {"appid": "1", "url": "https://steamdb.info/app/2/"},
             {"url": "https://steamdb.info/app/1/", "app_url": "https://steamdb.info/app/2/charts/"},
             {"url": "https://steamdb.info/apps/1/"},
-            {"url": "https://steamdb.info/app/" + "9" * 65 + "/"},
         ):
             with self.subTest(row=row), self.assertRaises(InputValidationError):
                 extract_appid(row)
@@ -223,10 +232,28 @@ class SteamDBImportTests(unittest.TestCase):
                 "trending_games",
                 OBSERVED_AT,
             )
+            large_digits = "9" * 5_000
+            large_json = Path(directory) / "large-appid.json"
+            large_json.write_text(
+                '[{"appid":'
+                + large_digits
+                + ',"name":"Large JSON","rank":1}]',
+                encoding="utf-8",
+            )
+            large_result = import_steamdb(
+                large_json,
+                "trending_games",
+                OBSERVED_AT,
+            )
         self.assertEqual(result.records[0].release_status, "released")
         self.assertEqual(result.records[0].metrics["rank"].value, 3)
         self.assertEqual(result.records[0].metrics["current_players"].value, 4000)
         self.assertEqual(bom_result.records[0].appid, 11)
+        self.assertEqual(large_result.records[0].appid, 10**5_000 - 1)
+        self.assertEqual(
+            large_result.records[0].store_url,
+            "https://store.steampowered.com/app/" + large_digits + "/",
+        )
 
     def test_recent_releases_requires_date_and_players_and_normalizes_date(self) -> None:
         rows = [
@@ -297,6 +324,22 @@ class SteamDBImportTests(unittest.TestCase):
                     OBSERVED_AT,
                 ).records[0].appid,
                 2,
+            )
+            large_digits = "9" * 5_000
+            large_csv = Path(directory) / "large.csv"
+            large_csv.write_text(
+                "app_id,name,rank\n" + large_digits + ",Large CSV,1\n",
+                encoding="utf-8",
+            )
+            large_csv_result = import_steamdb(
+                large_csv,
+                "trending_games",
+                OBSERVED_AT,
+            )
+            self.assertEqual(large_csv_result.records[0].appid, 10**5_000 - 1)
+            self.assertEqual(
+                large_csv_result.records[0].store_url,
+                "https://store.steampowered.com/app/" + large_digits + "/",
             )
             for name, content in (
                 ("empty.csv", ""),
