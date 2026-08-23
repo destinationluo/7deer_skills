@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import stat
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from typing import Any, Optional
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -24,6 +26,71 @@ from steam_game_radar.run_lock import RunLock
 
 NOW = datetime(2026, 8, 24, 3, 0, 0, 987654, tzinfo=timezone.utc)
 RUN_ID = "20260824T030000Z-a1b2c3d4"
+SAFE_TEMP_DIR = str(Path(tempfile.gettempdir()).resolve())
+
+
+class _PausingRunLock(RunLock):
+    def __init__(self, *args: Any, stale_read: Any, resume: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._stale_read_event = stale_read
+        self._resume_event = resume
+
+    def _collision_is_removable(self, *args: Any, **kwargs: Any) -> bool:
+        removable = super()._collision_is_removable(*args, **kwargs)
+        if removable:
+            self._stale_read_event.set()
+            if not self._resume_event.wait(10):
+                raise RuntimeError("timed out waiting to resume stale recovery")
+        return removable
+
+
+class _GateSignalingRunLock(RunLock):
+    def __init__(self, *args: Any, gate_attempt: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._gate_attempt_event = gate_attempt
+
+    def _acquire_gate(self, parent_descriptor: int) -> int:
+        self._gate_attempt_event.set()
+        return super()._acquire_gate(parent_descriptor)
+
+
+def _run_lock_process(
+    path_text: str,
+    run_id: str,
+    role: str,
+    stale_read: Any,
+    resume: Any,
+    gate_attempt: Any,
+    owner_release: Any,
+    results: Any,
+) -> None:
+    arguments = {
+        "path": Path(path_text),
+        "run_id": run_id,
+        "now": lambda: NOW,
+        "hostname": lambda: "worker-1",
+        "pid_alive": lambda _pid: False,
+    }
+    if role == "b":
+        lock = _PausingRunLock(
+            **arguments,
+            stale_read=stale_read,
+            resume=resume,
+        )
+    else:
+        lock = _GateSignalingRunLock(
+            **arguments,
+            gate_attempt=gate_attempt,
+        )
+    try:
+        with lock:
+            results.put((role, "entered"))
+            if role == "b" and not owner_release.wait(10):
+                raise RuntimeError("timed out holding recovered lock")
+    except RunBusyError:
+        results.put((role, "busy"))
+    except Exception as exc:
+        results.put((role, f"error:{type(exc).__name__}:{exc}"))
 
 
 class RunLockTests(unittest.TestCase):
@@ -67,7 +134,7 @@ class RunLockTests(unittest.TestCase):
         return payload
 
     def test_payload_fields_permissions_and_constructor_callback_validation(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             path = Path(directory) / "nested" / "radar.lock"
             with mock.patch("steam_game_radar.run_lock.os.getpid", return_value=123):
                 lock = self._lock(path, host="  worker-1  ")
@@ -84,6 +151,69 @@ class RunLockTests(unittest.TestCase):
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
             self.assertFalse(path.exists())
+            gate = path.parent / ".steam-radar-run-lock.gate"
+            self.assertTrue(gate.exists())
+            self.assertEqual(stat.S_IMODE(gate.stat().st_mode), 0o600)
+
+            checked = Path(directory) / "checked"
+            checked.mkdir()
+            parked = Path(directory) / "checked-opened"
+            redirect_target = Path(directory) / "redirect-target"
+            redirect_target.mkdir()
+            swapped_path = checked / "nested" / "radar.lock"
+            real_open = os.open
+            swapped = False
+
+            def swap_ancestor_after_open(
+                file: object,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: Optional[int] = None,
+            ) -> int:
+                nonlocal swapped
+                descriptor = real_open(file, flags, mode, dir_fd=dir_fd)
+                if file == "checked" and not swapped:
+                    swapped = True
+                    checked.rename(parked)
+                    checked.symlink_to(redirect_target, target_is_directory=True)
+                return descriptor
+
+            swapped_lock = self._lock(swapped_path)
+            with mock.patch(
+                "steam_game_radar.run_lock.os.open",
+                side_effect=swap_ancestor_after_open,
+            ):
+                swapped_lock.__enter__()
+            self.assertTrue(swapped)
+            self.assertTrue((parked / "nested" / "radar.lock").exists())
+            self.assertFalse((redirect_target / "nested").exists())
+            checked.unlink()
+            parked.rename(checked)
+            self.assertFalse(swapped_lock.__exit__(None, None, None))
+            self.assertFalse(swapped_path.exists())
+            self.assertTrue(
+                (checked / "nested" / ".steam-radar-run-lock.gate").exists()
+            )
+
+            original_working_directory = Path.cwd()
+            try:
+                os.chdir(directory)
+                relative_path = Path("relative/nested/radar.lock")
+                with self._lock(relative_path):
+                    self.assertTrue(relative_path.exists())
+                self.assertFalse(relative_path.exists())
+                self.assertTrue(
+                    Path("relative/nested/.steam-radar-run-lock.gate").exists()
+                )
+            finally:
+                os.chdir(original_working_directory)
+
+            for unsafe_path in (Path("../radar.lock"), Path("safe/../radar.lock")):
+                with self.subTest(unsafe_path=unsafe_path), self.assertRaises(
+                    InputValidationError
+                ):
+                    self._lock(unsafe_path)
             invalid_run_ids = (
                 "",
                 "20260824T030000Z-A1B2C3D4",
@@ -141,7 +271,7 @@ class RunLockTests(unittest.TestCase):
                         pass
 
     def test_exclusive_collision_and_conservative_existing_lock_handling(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             root = Path(directory)
             path = root / "radar.lock"
             first = self._lock(path)
@@ -185,12 +315,17 @@ class RunLockTests(unittest.TestCase):
                 self._lock(future).__enter__()
 
     def test_context_manager_cleanup_missing_lock_and_double_exit_are_harmless(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             path = Path(directory) / "radar.lock"
             lock = self._lock(path)
             returned = lock.__enter__()
             self.assertIs(returned, lock)
             self.assertTrue(path.exists())
+            outer_payload = path.read_bytes()
+            with self.assertRaises(RunBusyError):
+                lock.__enter__()
+            self.assertTrue(path.exists())
+            self.assertEqual(path.read_bytes(), outer_payload)
             self.assertFalse(lock.__exit__(None, None, None))
             self.assertFalse(path.exists())
             self.assertFalse(lock.__exit__(None, None, None))
@@ -202,7 +337,7 @@ class RunLockTests(unittest.TestCase):
             self.assertFalse(path.exists())
 
     def test_cleanup_on_body_exception_does_not_suppress_or_mask_it(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             path = Path(directory) / "radar.lock"
             with self.assertRaisesRegex(ValueError, "body failed"):
                 with self._lock(path):
@@ -241,12 +376,23 @@ class RunLockTests(unittest.TestCase):
             self.assertEqual(len(quarantines), 1)
 
             quarantines[0].unlink()
+            real_fchmod = os.fchmod
+            fchmod_calls = 0
+
+            def fail_canonical_fchmod(descriptor: int, mode: int) -> None:
+                nonlocal fchmod_calls
+                fchmod_calls += 1
+                if fchmod_calls == 2:
+                    raise OSError("mode failed")
+                real_fchmod(descriptor, mode)
+
             with mock.patch(
                 "steam_game_radar.run_lock.os.fchmod",
-                side_effect=OSError("mode failed"),
+                side_effect=fail_canonical_fchmod,
             ), self.assertRaises(PersistenceError):
                 self._lock(path).__enter__()
             self.assertFalse(path.exists())
+            self.assertEqual(fchmod_calls, 2)
 
             real_rename = os.rename
             before_move = Path(directory) / "cleanup-before-move.lock"
@@ -313,7 +459,7 @@ class RunLockTests(unittest.TestCase):
             self.assertEqual(after_move.stat().st_ino, replacement_after_inode[0])
 
     def test_same_host_live_pid_remains_blocking_after_two_hours(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             path = Path(directory) / "radar.lock"
             original = self._write_lock(path)
             for age in (timedelta(hours=2, seconds=1), timedelta(days=30)):
@@ -343,7 +489,7 @@ class RunLockTests(unittest.TestCase):
                     ).__enter__()
 
     def test_same_host_dead_stale_lock_is_reacquired_but_boundary_or_changed_lock_is_not_removed(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             root = Path(directory)
             acquired_at = datetime(2026, 8, 24, 0, 0, tzinfo=timezone.utc)
             for seconds, stale in ((2 * 60 * 60, False), (2 * 60 * 60 + 1, True)):
@@ -449,6 +595,88 @@ class RunLockTests(unittest.TestCase):
             self.assertEqual(json.loads(after_move.read_text()), replacement_after)
             self.assertEqual(after_move.stat().st_ino, replacement_after_inode[0])
 
+            if "fork" not in multiprocessing.get_all_start_methods():
+                self.skipTest("requires multiprocessing fork and fcntl")
+            process_path = root / "multiprocess.lock"
+            self._write_lock(process_path)
+            context = multiprocessing.get_context("fork")
+            stale_read = context.Event()
+            resume = context.Event()
+            owner_release = context.Event()
+            b_gate_attempt = context.Event()
+            c_gate_attempt = context.Event()
+            d_gate_attempt = context.Event()
+            results = context.Queue()
+            processes = [
+                context.Process(
+                    target=_run_lock_process,
+                    args=(
+                        str(process_path),
+                        "20260824T030010Z-0000000b",
+                        "b",
+                        stale_read,
+                        resume,
+                        b_gate_attempt,
+                        owner_release,
+                        results,
+                    ),
+                ),
+                context.Process(
+                    target=_run_lock_process,
+                    args=(
+                        str(process_path),
+                        "20260824T030011Z-0000000c",
+                        "c",
+                        stale_read,
+                        resume,
+                        c_gate_attempt,
+                        owner_release,
+                        results,
+                    ),
+                ),
+                context.Process(
+                    target=_run_lock_process,
+                    args=(
+                        str(process_path),
+                        "20260824T030012Z-0000000d",
+                        "d",
+                        stale_read,
+                        resume,
+                        d_gate_attempt,
+                        owner_release,
+                        results,
+                    ),
+                ),
+            ]
+            try:
+                processes[0].start()
+                self.assertTrue(stale_read.wait(5))
+                processes[1].start()
+                processes[2].start()
+                self.assertTrue(c_gate_attempt.wait(5))
+                self.assertTrue(d_gate_attempt.wait(5))
+                resume.set()
+                outcomes = [results.get(timeout=10) for _ in range(3)]
+                self.assertEqual(
+                    sorted(outcomes),
+                    [("b", "entered"), ("c", "busy"), ("d", "busy")],
+                )
+            finally:
+                resume.set()
+                owner_release.set()
+                for process in processes:
+                    process.join(timeout=5)
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(timeout=5)
+                results.close()
+                results.join_thread()
+            self.assertTrue(all(process.exitcode == 0 for process in processes))
+            self.assertFalse(process_path.exists())
+            self.assertTrue(
+                (root / ".steam-radar-run-lock.gate").exists()
+            )
+
             owned = root / "owned.lock"
             lock = self._lock(owned)
             lock.__enter__()
@@ -460,7 +688,7 @@ class RunLockTests(unittest.TestCase):
             self.assertEqual(json.loads(owned.read_text()), new_owner)
 
     def test_foreign_host_lock_remains_blocking_regardless_of_age(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             path = Path(directory) / "radar.lock"
             original = self._write_lock(
                 path,

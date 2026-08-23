@@ -1,9 +1,15 @@
-"""Exclusive, conservatively recoverable process lock for radar runs."""
+"""Exclusive, conservatively recoverable process lock for radar runs.
+
+A permanent mode-0600 sidecar gate serializes short lock-management operations.
+The gate is never removed: ``flock`` is crash-released while the canonical JSON
+lock continues to represent ownership of the user critical section.
+"""
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -20,6 +26,7 @@ _LOCK_FIELDS = {"pid", "run_id", "host", "acquired_at"}
 _MAX_LOCK_BYTES = 64 * 1024
 _STALE_AFTER = timedelta(hours=2)
 _MAX_ACQUIRE_ATTEMPTS = 4
+_GATE_NAME = ".steam-radar-run-lock.gate"
 
 
 class _MissingLock(Exception):
@@ -153,29 +160,6 @@ def _validate_existing_payload(value: object) -> LockPayload:
     return value
 
 
-def _ensure_directory_without_symlinks(path: Path) -> None:
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        parent = path.parent
-        if parent != path:
-            _ensure_directory_without_symlinks(parent)
-        try:
-            path.mkdir(mode=0o700)
-        except FileExistsError:
-            pass
-        except OSError as exc:
-            raise PersistenceError(f"cannot create lock directory: {path}") from exc
-        try:
-            metadata = path.lstat()
-        except OSError as exc:
-            raise PersistenceError(f"cannot inspect lock directory: {path}") from exc
-    except OSError as exc:
-        raise PersistenceError(f"cannot inspect lock directory: {path}") from exc
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise PersistenceError(f"lock parent is not a real directory: {path}")
-
-
 class RunLock:
     """Own an exclusive JSON lock file for the lifetime of a context."""
 
@@ -191,6 +175,8 @@ class RunLock:
             raise InputValidationError("path must be a pathlib.Path")
         if not path.name or path.name in {".", ".."}:
             raise InputValidationError("path must identify a lock file")
+        if ".." in path.parts:
+            raise InputValidationError("lock path must not traverse parent directories")
         self.path = path
         self.run_id = _validate_run_id(run_id)
         callbacks = (("now", now), ("hostname", hostname), ("pid_alive", pid_alive))
@@ -221,22 +207,130 @@ class RunLock:
         return now_utc, host, pid
 
     def _open_parent(self) -> int:
-        _ensure_directory_without_symlinks(self.path.parent)
         flags = os.O_RDONLY
         flags |= getattr(os, "O_DIRECTORY", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         flags |= getattr(os, "O_CLOEXEC", 0)
         try:
-            descriptor = os.open(self.path.parent, flags)
+            if self.path.is_absolute():
+                descriptor = os.open(os.path.sep, flags)
+                components = self.path.parent.parts[1:]
+            else:
+                descriptor = os.open(".", flags)
+                components = self.path.parent.parts
         except OSError as exc:
-            raise PersistenceError("cannot securely open lock parent") from exc
+            raise PersistenceError("cannot open trusted lock-path root") from exc
+
         try:
+            for component in components:
+                if component in {"", "."}:
+                    continue
+                if component == "..":
+                    raise InputValidationError(
+                        "lock path must not traverse parent directories"
+                    )
+                try:
+                    next_descriptor = os.open(
+                        component,
+                        flags,
+                        dir_fd=descriptor,
+                    )
+                except FileNotFoundError:
+                    try:
+                        os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                    except FileExistsError:
+                        pass
+                    except OSError as exc:
+                        raise PersistenceError(
+                            f"cannot create lock directory component: {component}"
+                        ) from exc
+                    try:
+                        next_descriptor = os.open(
+                            component,
+                            flags,
+                            dir_fd=descriptor,
+                        )
+                    except OSError as exc:
+                        raise PersistenceError(
+                            f"cannot securely open lock directory: {component}"
+                        ) from exc
+                except OSError as exc:
+                    raise PersistenceError(
+                        f"cannot securely open lock directory: {component}"
+                    ) from exc
+                try:
+                    if not stat.S_ISDIR(os.fstat(next_descriptor).st_mode):
+                        raise PersistenceError(
+                            f"lock path component is not a directory: {component}"
+                        )
+                except Exception:
+                    try:
+                        os.close(next_descriptor)
+                    except OSError:
+                        pass
+                    raise
+                os.close(descriptor)
+                descriptor = next_descriptor
             if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
                 raise PersistenceError("lock parent is not a directory")
-        except Exception:
-            os.close(descriptor)
-            raise
+        except Exception as exc:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            if isinstance(exc, PersistenceError):
+                raise
+            raise PersistenceError("cannot securely traverse lock parent") from exc
         return descriptor
+
+    def _acquire_gate(self, parent_descriptor: int) -> int:
+        flags = os.O_CREAT | os.O_RDWR
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        try:
+            descriptor = os.open(
+                _GATE_NAME,
+                flags,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+        except OSError as exc:
+            raise PersistenceError("cannot securely open run-lock gate") from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise PersistenceError("run-lock gate is not a regular file")
+            os.fchmod(descriptor, 0o600)
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    break
+                except InterruptedError:
+                    continue
+                except OSError as exc:
+                    raise PersistenceError("cannot acquire run-lock gate") from exc
+            return descriptor
+        except Exception as exc:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            if isinstance(exc, PersistenceError):
+                raise
+            raise PersistenceError("cannot prepare run-lock gate") from exc
+
+    def _release_gate(self, descriptor: int) -> None:
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
     def _read_named(
         self,
@@ -570,7 +664,7 @@ class RunLock:
 
     def __enter__(self) -> "RunLock":
         if self._acquired:
-            return self
+            raise RunBusyError("this RunLock instance is already acquired")
         now_utc, host, pid = self._callback_context()
         payload: LockPayload = {
             "pid": pid,
@@ -580,7 +674,9 @@ class RunLock:
         }
         self._encode_payload(payload)
         parent_descriptor = self._open_parent()
+        gate_descriptor: Optional[int] = None
         try:
+            gate_descriptor = self._acquire_gate(parent_descriptor)
             removed_stale_lock = False
             for _attempt in range(_MAX_ACQUIRE_ATTEMPTS):
                 identity = self._write_new(parent_descriptor, payload)
@@ -616,6 +712,8 @@ class RunLock:
                 removed_stale_lock = True
             raise RunBusyError("run lock was contended during acquisition")
         finally:
+            if gate_descriptor is not None:
+                self._release_gate(gate_descriptor)
             try:
                 os.close(parent_descriptor)
             except OSError:
@@ -638,7 +736,14 @@ class RunLock:
             if exc_type is None:
                 raise
             return False
+        gate_descriptor: Optional[int] = None
         try:
+            try:
+                gate_descriptor = self._acquire_gate(parent_descriptor)
+            except PersistenceError:
+                if exc_type is None:
+                    raise
+                return False
             try:
                 current, current_identity = self._read_existing(parent_descriptor)
             except (_MissingLock, _UnsafeExistingLock):
@@ -658,6 +763,8 @@ class RunLock:
                     ) from removal_error
             return False
         finally:
+            if gate_descriptor is not None:
+                self._release_gate(gate_descriptor)
             try:
                 os.close(parent_descriptor)
             except OSError:
