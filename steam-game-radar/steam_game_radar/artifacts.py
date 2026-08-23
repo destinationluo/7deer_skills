@@ -16,6 +16,7 @@ from typing import Sequence
 
 from .config import RadarConfig
 from .errors import InputValidationError, PersistenceError
+from .schemas import MAX_JSON_SAFE_INTEGER, MIN_JSON_SAFE_INTEGER
 
 
 _REDACTED = "[REDACTED]"
@@ -200,7 +201,13 @@ def _validate_json_native(
 ) -> None:
     if active_containers is None:
         active_containers = set()
-    if value is None or isinstance(value, (bool, str, int)):
+    if value is None or isinstance(value, (bool, str)):
+        return
+    if isinstance(value, int):
+        if value < MIN_JSON_SAFE_INTEGER or value > MAX_JSON_SAFE_INTEGER:
+            raise InputValidationError(
+                "artifact integers must be within the JSON-safe range"
+            )
         return
     if isinstance(value, float):
         if math.isfinite(value):

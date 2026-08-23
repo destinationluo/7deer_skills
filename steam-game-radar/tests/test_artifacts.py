@@ -23,6 +23,10 @@ from steam_game_radar.artifacts import (
 )
 from steam_game_radar.config import RadarConfig
 from steam_game_radar.errors import InputValidationError, PersistenceError
+from steam_game_radar.schemas import (
+    MAX_JSON_SAFE_INTEGER,
+    MIN_JSON_SAFE_INTEGER,
+)
 
 
 class ArtifactTests(unittest.TestCase):
@@ -88,6 +92,36 @@ class ArtifactTests(unittest.TestCase):
                     datetime.now(timezone.utc),
                 )
             self.assertFalse(expansion_data.exists())
+
+            unsafe_integer_data = Path(directory) / "unsafe-integers"
+            unsafe_integer_config = RadarConfig(data_dir=unsafe_integer_data)
+            unsafe_values = (
+                {"nested": [MAX_JSON_SAFE_INTEGER + 1]},
+                {"nested": {"minimum": MIN_JSON_SAFE_INTEGER - 1}},
+            )
+            for unsafe_value in unsafe_values:
+                with self.subTest(
+                    redact_unsafe_integer=unsafe_value
+                ), self.assertRaises(InputValidationError):
+                    redact(unsafe_value)
+                with self.subTest(
+                    atomic_unsafe_integer=unsafe_value
+                ), self.assertRaises(InputValidationError):
+                    atomic_write_json(
+                        unsafe_integer_data / "artifact.json",
+                        unsafe_value,
+                    )
+                with self.subTest(
+                    persist_unsafe_integer=unsafe_value
+                ), self.assertRaises(InputValidationError):
+                    persist_raw(
+                        unsafe_integer_config,
+                        "20260824T030405Z-1234abcd",
+                        "steam_store",
+                        unsafe_value,
+                        datetime.now(timezone.utc),
+                    )
+            self.assertFalse(unsafe_integer_data.exists())
 
             cyclic_list: list[object] = []
             cyclic_list.append(cyclic_list)
@@ -213,14 +247,28 @@ class ArtifactTests(unittest.TestCase):
                 config,
                 "20260824T030405Z-1234abcd",
                 "steam_store",
-                {"safe": 1, "api_key": "hidden"},
+                {
+                    "safe": 1,
+                    "api_key": "hidden",
+                    "minimum": MIN_JSON_SAFE_INTEGER,
+                    "maximum": MAX_JSON_SAFE_INTEGER,
+                    "flag": True,
+                    "ratio": 1.25,
+                },
                 now,
             )
 
             self.assertEqual(result, expected)
             self.assertEqual(
                 json.loads(expected.read_text(encoding="utf-8")),
-                {"api_key": "[REDACTED]", "safe": 1},
+                {
+                    "api_key": "[REDACTED]",
+                    "flag": True,
+                    "maximum": MAX_JSON_SAFE_INTEGER,
+                    "minimum": MIN_JSON_SAFE_INTEGER,
+                    "ratio": 1.25,
+                    "safe": 1,
+                },
             )
             for invalid_run_id in (
                 "20260824T030405Z-1234ABCd",

@@ -23,6 +23,10 @@ from steam_game_radar.http_client import (
     NoRedirectHandler,
     validate_steam_url,
 )
+from steam_game_radar.schemas import (
+    MAX_JSON_SAFE_INTEGER,
+    MIN_JSON_SAFE_INTEGER,
+)
 
 
 USER_AGENT = (
@@ -309,6 +313,10 @@ class HttpClientTests(unittest.TestCase):
             (FakeResponse(b"Infinity"), 1024),
             (FakeResponse(b"-Infinity"), 1024),
             (FakeResponse(deeply_nested_json), len(deeply_nested_json) + 1),
+            (FakeResponse(str(MAX_JSON_SAFE_INTEGER + 1).encode("ascii")), 1024),
+            (FakeResponse(str(MIN_JSON_SAFE_INTEGER - 1).encode("ascii")), 1024),
+            (FakeResponse(b"9" * 256), 1024),
+            (FakeResponse(b"1e400"), 1024),
         )
         for response, max_bytes in cases:
             with self.subTest(body=response.body, max_bytes=max_bytes):
@@ -317,11 +325,13 @@ class HttpClientTests(unittest.TestCase):
                 )
                 client = client_for(opener, max_retries=3, max_bytes=max_bytes)
 
-                with self.assertRaises(ProviderUnavailableError):
+                with self.assertRaises(ProviderUnavailableError) as captured:
                     client.get_json(url)
 
                 self.assertEqual(len(opener.calls), 1)
                 self.assertTrue(response.closed)
+                self.assertNotIn("999999999999", str(captured.exception))
+                self.assertNotIn("1e400", str(captured.exception))
 
         incomplete_read = http.client.IncompleteRead(
             b'partial secret body',
@@ -339,7 +349,14 @@ class HttpClientTests(unittest.TestCase):
         self.assertNotIn("partial secret body", str(captured.exception))
 
     def test_json_response_is_parsed_from_utf8(self) -> None:
-        payload = {"name": "游戏", "rank": [1, 2]}
+        payload = {
+            "name": "游戏",
+            "rank": [1, 2],
+            "minimum": MIN_JSON_SAFE_INTEGER,
+            "maximum": MAX_JSON_SAFE_INTEGER,
+            "ratio": 1.25,
+            "flag": True,
+        }
         response = FakeResponse(
             json.dumps(payload, ensure_ascii=False).encode("utf-8")
         )

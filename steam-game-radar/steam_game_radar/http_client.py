@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import socket
 import time
 from typing import Callable
@@ -13,6 +14,7 @@ import urllib.request
 
 from .config import RadarConfig
 from .errors import InputValidationError, ProviderUnavailableError
+from .schemas import MAX_JSON_SAFE_INTEGER, MIN_JSON_SAFE_INTEGER
 
 
 ALLOWED_HOSTS = frozenset(
@@ -172,7 +174,12 @@ class JsonHttpClient:
                     "Steam provider response is not valid UTF-8"
                 ) from error
             try:
-                return json.loads(text, parse_constant=_reject_json_constant)
+                return json.loads(
+                    text,
+                    parse_int=_parse_json_integer,
+                    parse_float=_parse_json_float,
+                    parse_constant=_reject_json_constant,
+                )
             except (json.JSONDecodeError, ValueError, RecursionError) as error:
                 raise ProviderUnavailableError(
                     "Steam provider response is not valid JSON"
@@ -186,6 +193,26 @@ def _url_error_is_timeout(error: urllib.error.URLError) -> bool:
 def _reject_json_constant(value: str) -> None:
     del value
     raise ValueError("non-standard JSON constant")
+
+
+def _parse_json_integer(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise ValueError("invalid provider integer") from None
+    if parsed < MIN_JSON_SAFE_INTEGER or parsed > MAX_JSON_SAFE_INTEGER:
+        raise ValueError("provider integer is outside the JSON-safe range")
+    return parsed
+
+
+def _parse_json_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except (OverflowError, ValueError):
+        raise ValueError("invalid provider float") from None
+    if not math.isfinite(parsed):
+        raise ValueError("provider float must be finite")
+    return parsed
 
 
 def _close_quietly(value: object) -> None:
