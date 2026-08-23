@@ -20,6 +20,7 @@ from steam_game_radar.official_provider import (
     parse_most_played,
 )
 from steam_game_radar.errors import InputValidationError
+from steam_game_radar.schemas import MAX_STEAM_APPID
 
 
 OBSERVED_AT = "2026-08-24T03:00:00Z"
@@ -139,15 +140,34 @@ class MostPlayedParserTests(unittest.TestCase):
                     source_ranks={},
                     source_names=invalid_names,
                 )
+        maximum = DiscoveryCandidate(
+            appid=MAX_STEAM_APPID,
+            priority=(0, 1, MAX_STEAM_APPID),
+            source_ranks={},
+            source_names=("most_played",),
+        )
+        self.assertEqual(maximum.appid, MAX_STEAM_APPID)
+        with self.assertRaises(InputValidationError):
+            DiscoveryCandidate(
+                appid=MAX_STEAM_APPID + 1,
+                priority=(0, 1, MAX_STEAM_APPID + 1),
+                source_ranks={},
+                source_names=("most_played",),
+            )
 
     def test_most_played_missing_optional_fields_remain_absent(self) -> None:
         result = parse_most_played(
-            {"response": {"ranks": [{"rank": 3, "appid": 440}]}},
+            {
+                "response": {
+                    "ranks": [{"rank": 3, "appid": MAX_STEAM_APPID}]
+                }
+            },
             OBSERVED_AT,
         )
 
         self.assertEqual(result.warnings, ())
         self.assertEqual(len(result.value), 1)
+        self.assertEqual(result.value[0].appid, MAX_STEAM_APPID)
         self.assertEqual(
             {
                 name: value.to_dict()
@@ -171,6 +191,13 @@ class MostPlayedParserTests(unittest.TestCase):
                     "ranks": [
                         {"rank": 1, "appid": 730},
                         {"rank": True, "appid": 570},
+                    ]
+                }
+            },
+            {
+                "response": {
+                    "ranks": [
+                        {"rank": 1, "appid": MAX_STEAM_APPID + 1}
                     ]
                 }
             },
@@ -302,6 +329,16 @@ class FeaturedParserTests(unittest.TestCase):
             {name: tuple(rows) for name, rows in result.value.items()},
             {"top_sellers": (), "new_releases": (), "coming_soon": ()},
         )
+        maximum = parse_featured(
+            {
+                "top_sellers": {"items": [{"id": MAX_STEAM_APPID}]},
+                "new_releases": {},
+                "coming_soon": {},
+            },
+            OBSERVED_AT,
+        )
+        self.assertEqual(maximum.warnings, ())
+        self.assertEqual(maximum.value["top_sellers"][0].appid, MAX_STEAM_APPID)
 
     def test_featured_malformed_capability_is_all_or_nothing(self) -> None:
         payloads = (
@@ -313,6 +350,13 @@ class FeaturedParserTests(unittest.TestCase):
             },
             {
                 "top_sellers": {"items": "not-a-list"},
+                "new_releases": {},
+                "coming_soon": {},
+            },
+            {
+                "top_sellers": {
+                    "items": [{"id": MAX_STEAM_APPID + 1}]
+                },
                 "new_releases": {},
                 "coming_soon": {},
             },
@@ -427,6 +471,41 @@ class AppDetailsParserTests(unittest.TestCase):
         result = parse_appdetails(730, payload, OBSERVED_AT)
         payload["730"]["data"]["genres"][0]["description"] = "Changed Again"
         self.assertEqual(result.value.genres, ("Changed", "Free to Play"))
+        maximum_payload = {
+            str(MAX_STEAM_APPID): {
+                "success": True,
+                "data": {
+                    "steam_appid": MAX_STEAM_APPID,
+                    "name": "Maximum AppID Game",
+                    "type": "game",
+                },
+            }
+        }
+        maximum = parse_appdetails(
+            MAX_STEAM_APPID, maximum_payload, OBSERVED_AT
+        )
+        self.assertEqual(maximum.warnings, ())
+        self.assertEqual(maximum.value.appid, MAX_STEAM_APPID)
+        maximum_identity = AppIdentity(
+            appid=MAX_STEAM_APPID,
+            name="Maximum AppID Game",
+            app_type="game",
+            release_status="unknown",
+            release_date=None,
+            genres=(),
+            observed_at=OBSERVED_AT,
+        )
+        self.assertEqual(maximum_identity.appid, MAX_STEAM_APPID)
+        with self.assertRaises(InputValidationError):
+            AppIdentity(
+                appid=MAX_STEAM_APPID + 1,
+                name="Out-of-range game",
+                app_type="game",
+                release_status="unknown",
+                release_date=None,
+                genres=(),
+                observed_at=OBSERVED_AT,
+            )
 
     def test_appdetails_missing_optional_fields_remain_absent(self) -> None:
         payload = {
@@ -614,6 +693,48 @@ class AppDetailsParserTests(unittest.TestCase):
         )
         self.assertIsNone(invalid_time.value)
         self.assertEqual(invalid_time.warnings[0].code, "steam_appdetails_malformed")
+        oversized_payload = {
+            str(MAX_STEAM_APPID + 1): {
+                "success": True,
+                "data": {
+                    "steam_appid": MAX_STEAM_APPID + 1,
+                    "name": "Out-of-range game",
+                    "type": "game",
+                },
+            }
+        }
+        oversized = parse_appdetails(
+            MAX_STEAM_APPID + 1,
+            oversized_payload,
+            OBSERVED_AT,
+        )
+        self.assertIsNone(oversized.value)
+        self.assertEqual(
+            [warning.to_dict() for warning in oversized.warnings],
+            [
+                {
+                    "code": "steam_appdetails_malformed",
+                    "message": "Steam app-details response is malformed.",
+                    "appid": None,
+                }
+            ],
+        )
+        oversized_data = parse_appdetails(
+            MAX_STEAM_APPID,
+            {
+                str(MAX_STEAM_APPID): {
+                    "success": True,
+                    "data": {
+                        "steam_appid": MAX_STEAM_APPID + 1,
+                        "name": "Out-of-range game",
+                        "type": "game",
+                    },
+                }
+            },
+            OBSERVED_AT,
+        )
+        self.assertIsNone(oversized_data.value)
+        self.assertEqual(oversized_data.warnings[0].appid, MAX_STEAM_APPID)
 
 
 class CurrentPlayersParserTests(unittest.TestCase):
@@ -627,6 +748,16 @@ class CurrentPlayersParserTests(unittest.TestCase):
         self.assertEqual(result.warnings, ())
         self.assertEqual(
             result.value.to_dict(),
+            observation_dict(1_287_345, "steam_current_players"),
+        )
+        maximum = parse_current_players(
+            MAX_STEAM_APPID,
+            load_fixture("current_players.json"),
+            OBSERVED_AT,
+        )
+        self.assertEqual(maximum.warnings, ())
+        self.assertEqual(
+            maximum.value.to_dict(),
             observation_dict(1_287_345, "steam_current_players"),
         )
 
@@ -667,6 +798,22 @@ class CurrentPlayersParserTests(unittest.TestCase):
         self.assertIsNone(invalid_time.value)
         self.assertEqual(
             invalid_time.warnings[0].code, "steam_current_players_malformed"
+        )
+        oversized = parse_current_players(
+            MAX_STEAM_APPID + 1,
+            load_fixture("current_players.json"),
+            OBSERVED_AT,
+        )
+        self.assertIsNone(oversized.value)
+        self.assertEqual(
+            [warning.to_dict() for warning in oversized.warnings],
+            [
+                {
+                    "code": "steam_current_players_malformed",
+                    "message": "Steam current-players response is malformed.",
+                    "appid": None,
+                }
+            ],
         )
 
 

@@ -15,7 +15,7 @@ import unicodedata
 from .config import RadarConfig
 from .errors import InputValidationError, ProviderUnavailableError
 from .http_client import JsonHttpClient
-from .schemas import GameRecord, MetricObservation, WarningRecord
+from .schemas import MAX_STEAM_APPID, GameRecord, MetricObservation, WarningRecord
 
 
 STEAM_MOST_PLAYED_RANK_SOURCE_ID = "steam_most_played_rank"
@@ -192,7 +192,7 @@ class DiscoveryCandidate:
     source_names: Sequence[str]
 
     def __post_init__(self) -> None:
-        _positive_integer(self.appid)
+        _steam_appid(self.appid)
         if (
             not isinstance(self.priority, tuple)
             or len(self.priority) != 3
@@ -236,7 +236,7 @@ class AppIdentity:
     observed_at: str
 
     def __post_init__(self) -> None:
-        _positive_integer(self.appid)
+        _steam_appid(self.appid)
         _non_empty_string(self.name)
         _non_empty_string(self.app_type)
         if self.release_status not in _RELEASE_STATUSES:
@@ -446,7 +446,7 @@ def _collect_appdetails(
     released: list[GameRecord] = []
     unreleased: list[GameRecord] = []
     for candidate_value in candidates:
-        appid = candidate_value.appid
+        appid = _steam_appid(candidate_value.appid)
         url = APPDETAILS_URL.format(
             appid=appid,
             country=config.country,
@@ -506,7 +506,8 @@ def _collect_current_players(
         if position >= request_limit:
             enriched.append(record)
             continue
-        url = CURRENT_PLAYERS_URL.format(appid=record.appid)
+        appid = _steam_appid(record.appid)
+        url = CURRENT_PLAYERS_URL.format(appid=appid)
         try:
             payload = client.get_json(url)
         except ProviderUnavailableError:
@@ -515,13 +516,13 @@ def _collect_current_players(
                 WarningRecord(
                     code="steam_current_players_unavailable",
                     message="Steam current-player data is unavailable.",
-                    appid=record.appid,
+                    appid=appid,
                 )
             )
             enriched.append(record)
             continue
-        raw[f"current_players_{record.appid}"] = payload
-        parsed = parse_current_players(record.appid, payload, observed_at)
+        raw[f"current_players_{appid}"] = payload
+        parsed = parse_current_players(appid, payload, observed_at)
         warnings.extend(parsed.warnings)
         if parsed.warnings:
             capabilities["current_players"] = False
@@ -552,6 +553,7 @@ def _game_record(
     candidate_value: DiscoveryCandidate,
     identity: AppIdentity,
 ) -> GameRecord:
+    appid = _steam_appid(identity.appid)
     metrics = dict(candidate_value.source_ranks)
     if identity.release_date is not None:
         metrics["release_date"] = MetricObservation(
@@ -562,10 +564,10 @@ def _game_record(
         )
     return GameRecord(
         schema_version=1,
-        appid=identity.appid,
+        appid=appid,
         name=identity.name,
         release_status=cast(str, identity.release_status),
-        store_url=f"https://store.steampowered.com/app/{identity.appid}/",
+        store_url=f"https://store.steampowered.com/app/{appid}/",
         metrics=metrics,
         source_extra={
             "app_type": identity.app_type,
@@ -867,7 +869,7 @@ def parse_most_played(
         candidates: list[DiscoveryCandidate] = []
         for raw_row in ranks:
             row = _required_mapping(raw_row)
-            appid = _positive_integer(row.get("appid"))
+            appid = _steam_appid(row.get("appid"))
             rank = _positive_integer(row.get("rank"))
             metrics = {
                 "most_played_rank": _observation(
@@ -933,7 +935,7 @@ def parse_featured(
             candidates: list[DiscoveryCandidate] = []
             for rank, raw_item in enumerate(items, start=1):
                 item = _required_mapping(raw_item)
-                appid = _positive_integer(item.get("id"))
+                appid = _steam_appid(item.get("id"))
                 candidates.append(
                     DiscoveryCandidate(
                         appid=appid,
@@ -960,14 +962,14 @@ def parse_appdetails(
     """Parse exactly one requested AppID from the app-details response."""
 
     try:
-        requested_appid = _positive_integer(appid)
+        requested_appid = _steam_appid(appid)
         _validate_observed_at(observed_at)
         root = _required_mapping(payload)
         entry = _required_mapping(root.get(str(requested_appid)))
         if entry.get("success") is not True:
             raise _MalformedPayload
         data = _required_mapping(entry.get("data"))
-        if _positive_integer(data.get("steam_appid")) != requested_appid:
+        if _steam_appid(data.get("steam_appid")) != requested_appid:
             raise _MalformedPayload
         name = _non_empty_string(data.get("name"))
         app_type = _non_empty_string(data.get("type"))
@@ -1017,7 +1019,7 @@ def parse_current_players(
     """Parse one current-player observation, preserving a missing count."""
 
     try:
-        requested_appid = _positive_integer(appid)
+        requested_appid = _steam_appid(appid)
         _validate_observed_at(observed_at)
         root = _required_mapping(payload)
         response = _required_mapping(root.get("response"))
@@ -1176,6 +1178,19 @@ def _positive_integer(value: object) -> int:
     return value
 
 
+def _steam_appid(value: object) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+        or value > MAX_STEAM_APPID
+    ):
+        raise InputValidationError(
+            f"appid must be an integer from 1 through {MAX_STEAM_APPID}"
+        )
+    return value
+
+
 def _nonnegative_integer(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise _MalformedPayload
@@ -1189,7 +1204,12 @@ def _non_empty_string(value: object) -> str:
 
 
 def _warning_appid(value: object) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+        or value > MAX_STEAM_APPID
+    ):
         return None
     return value
 
