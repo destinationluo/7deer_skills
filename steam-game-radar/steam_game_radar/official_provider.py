@@ -1,10 +1,11 @@
-"""Pure parsers for the official Steam discovery and app endpoints."""
+"""Pure Steam parsers plus deterministic official collection and normalization."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
+import json
 import math
 import re
 from types import MappingProxyType
@@ -68,6 +69,12 @@ _CAPABILITY_NAMES = (
     "featured_categories",
     "appdetails",
     "current_players",
+)
+_DISCOVERY_SOURCE_ORDER = (
+    "most_played",
+    "top_sellers",
+    "new_releases",
+    "coming_soon",
 )
 _APP_TYPE_EXCLUSIONS = {
     "dlc": (
@@ -263,6 +270,14 @@ class CollectionResult:
         object.__setattr__(self, "capabilities", capabilities)
         object.__setattr__(self, "warnings", warnings)
         object.__setattr__(self, "raw", raw)
+
+    def raw_to_dict(self) -> dict[str, object]:
+        """Return a fresh JSON-native copy suitable for artifact persistence."""
+
+        return {
+            key: _thaw_raw_json(payload)
+            for key, payload in self.raw.items()
+        }
 
 
 def build_released_candidates(
@@ -609,7 +624,12 @@ def _merge_candidate_rows(
             ordered_appids.append(row.appid)
         ranks = cast(dict[str, MetricObservation], state["source_ranks"])
         for name, observation in row.source_ranks.items():
-            ranks.setdefault(name, observation)
+            existing = ranks.get(name)
+            ranks[name] = (
+                observation
+                if existing is None
+                else _select_observation(name, existing, observation)
+            )
         names = cast(list[str], state["source_names"])
         for name in row.source_names:
             if name not in names:
@@ -618,13 +638,98 @@ def _merge_candidate_rows(
         DiscoveryCandidate(
             appid=appid,
             priority=cast(tuple[int, int, int], candidates[appid]["priority"]),
-            source_ranks=cast(
-                dict[str, MetricObservation],
-                candidates[appid]["source_ranks"],
+            source_ranks=_ordered_source_ranks(candidates[appid]),
+            source_names=_ordered_source_names(
+                cast(list[str], candidates[appid]["source_names"])
             ),
-            source_names=cast(list[str], candidates[appid]["source_names"]),
         )
         for appid in ordered_appids
+    )
+
+
+def _ordered_source_ranks(
+    candidate_state: Mapping[str, object],
+) -> Mapping[str, MetricObservation]:
+    ranks = cast(dict[str, MetricObservation], candidate_state["source_ranks"])
+    return {name: ranks[name] for name in sorted(ranks)}
+
+
+def _select_observation(
+    metric_name: str,
+    first: MetricObservation,
+    second: MetricObservation,
+) -> MetricObservation:
+    if first == second:
+        return first
+    observations = (first, second)
+    numeric = tuple(
+        (observation, _numeric_observation_value(observation))
+        for observation in observations
+    )
+    valid_numeric = tuple(
+        (observation, value)
+        for observation, value in numeric
+        if value is not None
+    )
+    if metric_name.endswith("_rank") and valid_numeric:
+        best_value = min(value for _, value in valid_numeric)
+        finalists = tuple(
+            observation
+            for observation, value in valid_numeric
+            if value == best_value
+        )
+        return min(finalists, key=_canonical_observation)
+    if _is_player_count_metric(metric_name) and valid_numeric:
+        best_value = max(value for _, value in valid_numeric)
+        finalists = tuple(
+            observation
+            for observation, value in valid_numeric
+            if value == best_value
+        )
+        return min(finalists, key=_canonical_observation)
+    return min(observations, key=_canonical_observation)
+
+
+def _numeric_observation_value(
+    observation: MetricObservation,
+) -> int | float | None:
+    value = observation.value
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _is_player_count_metric(metric_name: str) -> bool:
+    return (
+        metric_name in {"peak_players", "current_players", "player_count"}
+        or metric_name.endswith("_players")
+        or metric_name.endswith("_player_count")
+    )
+
+
+def _canonical_observation(observation: MetricObservation) -> str:
+    return json.dumps(
+        observation.to_dict(),
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _ordered_source_names(names: Sequence[str]) -> tuple[str, ...]:
+    known_positions = {
+        name: position for position, name in enumerate(_DISCOVERY_SOURCE_ORDER)
+    }
+    return tuple(
+        sorted(
+            set(names),
+            key=lambda name: (
+                known_positions.get(name, len(known_positions)),
+                "" if name in known_positions else name,
+            ),
+        )
     )
 
 
@@ -735,6 +840,17 @@ def _freeze_raw_json(value: object) -> object:
     if _is_sequence(value):
         return tuple(_freeze_raw_json(item) for item in cast(Sequence[object], value))
     raise InputValidationError("raw values must be JSON-compatible")
+
+
+def _thaw_raw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            key: _thaw_raw_json(nested)
+            for key, nested in value.items()
+        }
+    if isinstance(value, tuple):
+        return [_thaw_raw_json(item) for item in value]
+    return value
 
 
 def parse_most_played(

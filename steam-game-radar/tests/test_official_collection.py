@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
+from steam_game_radar.artifacts import persist_raw
 from steam_game_radar.config import RadarConfig
 from steam_game_radar.errors import InputValidationError, ProviderUnavailableError
 from steam_game_radar.official_provider import (
@@ -222,27 +226,74 @@ class OfficialCollectionTests(unittest.TestCase):
             build_unreleased_candidates({"coming_soon": "invalid"}, 1)
 
     def test_candidate_union_dedupes_merges_observations_then_applies_cap(self) -> None:
-        first = candidate(10, "most_played", 2, 0)
-        top_duplicate = candidate(10, "top_seller", 1, 1)
-        new_duplicate = candidate(10, "new_release", 3, 2)
+        identical = metric(7, "steam_shared")
+        first = DiscoveryCandidate(
+            appid=10,
+            priority=(0, 2, 10),
+            source_ranks={
+                "most_played_rank": metric(5, "rank-zulu"),
+                "peak_players": metric(100, "peak-zulu"),
+                "custom_signal": metric(8, "zulu"),
+                "shared_metric": identical,
+            },
+            source_names=("zeta", "coming_soon"),
+        )
+        reversed_first = DiscoveryCandidate(
+            appid=10,
+            priority=(0, 2, 10),
+            source_ranks={
+                "most_played_rank": metric(3, "rank-alpha"),
+                "peak_players": metric(200, "peak-alpha"),
+                "custom_signal": metric(9, "alpha"),
+                "shared_metric": identical,
+            },
+            source_names=("most_played", "alpha"),
+        )
+        top_duplicate = DiscoveryCandidate(
+            appid=10,
+            priority=(1, 1, 10),
+            source_ranks={"top_seller_rank": metric(1, "steam_top_seller_rank")},
+            source_names=("top_sellers",),
+        )
+        new_duplicate = DiscoveryCandidate(
+            appid=10,
+            priority=(2, 3, 10),
+            source_ranks={"new_release_rank": metric(3, "steam_new_release_rank")},
+            source_names=("new_releases",),
+        )
         featured = {
             "top_sellers": (candidate(11, "top_seller", 2, 1), top_duplicate),
             "new_releases": (candidate(12, "new_release", 1, 2), new_duplicate),
             "coming_soon": (),
         }
 
-        rows = build_released_candidates((first,), featured, 2)
+        rows = build_released_candidates((first, reversed_first), featured, 2)
+        reversed_rows = build_released_candidates(
+            (reversed_first, first),
+            featured,
+            2,
+        )
 
+        self.assertEqual(rows, reversed_rows)
         self.assertEqual([row.appid for row in rows], [10, 11])
         self.assertEqual(rows[0].priority, first.priority)
         self.assertEqual(
             rows[0].source_names,
-            ("most_played", "top_seller", "new_release"),
+            (
+                "most_played",
+                "top_sellers",
+                "new_releases",
+                "coming_soon",
+                "alpha",
+                "zeta",
+            ),
         )
-        self.assertEqual(
-            list(rows[0].source_ranks),
-            ["most_played_rank", "top_seller_rank", "new_release_rank"],
-        )
+        self.assertEqual(rows[0].source_ranks["most_played_rank"].value, 3)
+        self.assertEqual(rows[0].source_ranks["most_played_rank"].source_id, "rank-alpha")
+        self.assertEqual(rows[0].source_ranks["peak_players"].value, 200)
+        self.assertEqual(rows[0].source_ranks["peak_players"].source_id, "peak-alpha")
+        self.assertEqual(rows[0].source_ranks["custom_signal"].source_id, "alpha")
+        self.assertIs(rows[0].source_ranks["shared_metric"], identical)
         self.assertEqual(rows[0].source_ranks["top_seller_rank"].value, 1)
         with self.assertRaises(TypeError):
             rows[0].source_ranks["extra"] = metric(1, "extra")
@@ -684,6 +735,26 @@ class OfficialCollectionTests(unittest.TestCase):
 
         self.assertEqual(result.capabilities["most_played"], True)
         self.assertEqual(result.raw["payload"]["items"], (1,))
+        first_export = result.raw_to_dict()
+        second_export = result.raw_to_dict()
+        self.assertEqual(first_export, {"payload": {"items": [1]}})
+        first_export["payload"]["items"].append(99)
+        self.assertEqual(result.raw["payload"]["items"], (1,))
+        self.assertEqual(second_export, {"payload": {"items": [1]}})
+        self.assertIsNot(first_export, second_export)
+        self.assertIsNot(first_export["payload"], second_export["payload"])
+        with tempfile.TemporaryDirectory() as directory:
+            persisted = persist_raw(
+                RadarConfig(data_dir=Path(directory)),
+                "20260824T030405Z-1234abcd",
+                "steam_official",
+                result.raw_to_dict(),
+                datetime(2026, 8, 24, 3, 4, 5, tzinfo=timezone.utc),
+            )
+            self.assertEqual(
+                json.loads(persisted.read_text(encoding="utf-8")),
+                {"payload": {"items": [1]}},
+            )
         self.assertIsInstance(result.released, tuple)
         self.assertIsInstance(result.warnings, tuple)
         with self.assertRaises(TypeError):
