@@ -56,11 +56,15 @@ steam-game-radar/
 │   └── steam_radar.py
 ├── steam_game_radar/
 │   ├── __init__.py
+│   ├── errors.py
 │   ├── config.py
+│   ├── artifacts.py
 │   ├── http_client.py
 │   ├── official_provider.py
 │   ├── steamdb_import.py
+│   ├── run_lock.py
 │   ├── snapshot.py
+│   ├── merge.py
 │   ├── trend.py
 │   ├── score.py
 │   ├── enrichment.py
@@ -74,14 +78,23 @@ steam-game-radar/
 │   └── report-template.md
 └── tests/
     ├── fixtures/
-    ├── test_official_provider.py
+    ├── test_config.py
+    ├── test_schemas.py
+    ├── test_artifacts.py
+    ├── test_http_client.py
+    ├── test_official_parsers.py
+    ├── test_official_collection.py
     ├── test_steamdb_import.py
+    ├── test_run_lock.py
     ├── test_snapshot.py
+    ├── test_merge.py
     ├── test_trend.py
-    ├── test_score.py
     ├── test_enrichment.py
+    ├── test_score.py
     ├── test_report.py
-    └── test_cli.py
+    ├── test_cli.py
+    ├── test_skill_docs.py
+    └── test_live_official_provider.py
 ```
 
 Only `scripts/steam_radar.py` is executable. Package modules expose small, pure interfaces and do not parse command-line arguments.
