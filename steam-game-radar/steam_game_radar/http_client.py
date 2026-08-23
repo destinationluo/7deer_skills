@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import time
@@ -128,6 +129,10 @@ class JsonHttpClient:
                 raise ProviderUnavailableError(
                     "Steam provider request failed"
                 ) from error
+            except http.client.HTTPException as error:
+                raise ProviderUnavailableError(
+                    "Steam provider response could not be read"
+                ) from error
             self._sleep(2**attempt)
 
         raise AssertionError("unreachable retry state")
@@ -168,7 +173,7 @@ class JsonHttpClient:
                 ) from error
             try:
                 return json.loads(text, parse_constant=_reject_json_constant)
-            except (json.JSONDecodeError, ValueError) as error:
+            except (json.JSONDecodeError, ValueError, RecursionError) as error:
                 raise ProviderUnavailableError(
                     "Steam provider response is not valid JSON"
                 ) from error

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import json
 import math
 import os
@@ -23,6 +25,16 @@ _PROVIDER_ID = re.compile(
     r"[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?",
     flags=re.ASCII,
 )
+
+
+@dataclass(frozen=True)
+class _WriteConfinement:
+    raw_root: Path
+    resolved_raw_root: Path
+    raw_identity: tuple[int, int]
+    destination_parent: Path
+    resolved_destination_parent: Path
+    parent_identity: tuple[int, int]
 
 
 def redact(value: object) -> object:
@@ -54,9 +66,20 @@ def atomic_write_json(path: Path, value: object) -> None:
 
     destination = Path(path)
     serialized = _serialize_json(value)
+    _atomic_write_serialized(destination, serialized)
+
+
+def _atomic_write_serialized(
+    destination: Path,
+    serialized: str,
+    confinement: _WriteConfinement | None = None,
+) -> None:
     temporary_path: Path | None = None
     try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        if confinement is None:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            _validate_write_confinement(confinement)
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -69,7 +92,14 @@ def atomic_write_json(path: Path, value: object) -> None:
             temporary.write(serialized)
             temporary.flush()
             os.fsync(temporary.fileno())
+        if confinement is not None:
+            _validate_write_confinement(confinement)
         os.replace(temporary_path, destination)
+        if confinement is not None:
+            _validate_write_confinement(confinement)
+        _fsync_parent_directory(destination.parent)
+    except PersistenceError:
+        raise
     except OSError as error:
         raise PersistenceError("unable to persist JSON artifact safely") from error
     finally:
@@ -96,8 +126,9 @@ def persist_raw(
     if len(original) > config.raw_max_bytes_per_provider:
         raise InputValidationError("raw provider artifact exceeds configured size")
 
-    path = config.data_dir / "raw" / run_id / f"{provider_id}.json"
-    atomic_write_json(path, redact(value))
+    serialized_redacted = _serialize_json(redact(value))
+    path, confinement = _prepare_raw_destination(config, run_id, provider_id)
+    _atomic_write_serialized(path, serialized_redacted, confinement)
     return path
 
 
@@ -139,8 +170,8 @@ def _is_sensitive_key(key: str) -> bool:
 
 
 def _serialize_json(value: object) -> str:
-    _validate_json_native(value)
     try:
+        _validate_json_native(value)
         serialized = json.dumps(
             value,
             allow_nan=False,
@@ -150,6 +181,8 @@ def _serialize_json(value: object) -> str:
         )
         serialized.encode("utf-8")
         return serialized
+    except InputValidationError:
+        raise
     except (TypeError, ValueError, UnicodeError, RecursionError) as error:
         raise InputValidationError("artifact must contain valid JSON values") from error
 
@@ -209,6 +242,115 @@ def _validate_run_id(run_id: str) -> None:
 def _validate_provider_id(provider_id: str) -> None:
     if not isinstance(provider_id, str) or _PROVIDER_ID.fullmatch(provider_id) is None:
         raise InputValidationError("invalid provider_id")
+
+
+def _prepare_raw_destination(
+    config: RadarConfig,
+    run_id: str,
+    provider_id: str,
+) -> tuple[Path, _WriteConfinement]:
+    data_dir = Path(config.data_dir)
+    raw_root = data_dir / "raw"
+    destination_parent = raw_root / run_id
+    try:
+        _ensure_real_directory(data_dir, parents=True)
+        _ensure_real_directory(raw_root)
+        _ensure_real_directory(destination_parent)
+        confinement = _capture_write_confinement(
+            raw_root,
+            destination_parent,
+        )
+    except PersistenceError:
+        raise
+    except OSError as error:
+        raise PersistenceError("unsafe raw artifact destination") from error
+    return destination_parent / f"{provider_id}.json", confinement
+
+
+def _ensure_real_directory(path: Path, *, parents: bool = False) -> None:
+    try:
+        status = path.lstat()
+    except FileNotFoundError:
+        path.mkdir(parents=parents, exist_ok=False)
+        status = path.lstat()
+    if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
+        raise PersistenceError("raw artifact path contains an unsafe directory")
+
+
+def _capture_write_confinement(
+    raw_root: Path,
+    destination_parent: Path,
+) -> _WriteConfinement:
+    raw_status = _real_directory_status(raw_root)
+    parent_status = _real_directory_status(destination_parent)
+    resolved_raw_root = raw_root.resolve(strict=True)
+    resolved_parent = destination_parent.resolve(strict=True)
+    if not _is_relative_to(resolved_parent, resolved_raw_root):
+        raise PersistenceError("raw artifact destination escapes raw root")
+    return _WriteConfinement(
+        raw_root=raw_root,
+        resolved_raw_root=resolved_raw_root,
+        raw_identity=(raw_status.st_dev, raw_status.st_ino),
+        destination_parent=destination_parent,
+        resolved_destination_parent=resolved_parent,
+        parent_identity=(parent_status.st_dev, parent_status.st_ino),
+    )
+
+
+def _validate_write_confinement(confinement: _WriteConfinement) -> None:
+    try:
+        raw_status = _real_directory_status(confinement.raw_root)
+        parent_status = _real_directory_status(confinement.destination_parent)
+        resolved_raw_root = confinement.raw_root.resolve(strict=True)
+        resolved_parent = confinement.destination_parent.resolve(strict=True)
+    except PersistenceError:
+        raise
+    except OSError as error:
+        raise PersistenceError("unsafe raw artifact destination") from error
+
+    if (
+        (raw_status.st_dev, raw_status.st_ino) != confinement.raw_identity
+        or (parent_status.st_dev, parent_status.st_ino)
+        != confinement.parent_identity
+        or resolved_raw_root != confinement.resolved_raw_root
+        or resolved_parent != confinement.resolved_destination_parent
+        or not _is_relative_to(resolved_parent, resolved_raw_root)
+    ):
+        raise PersistenceError("raw artifact destination changed during write")
+
+
+def _real_directory_status(path: Path) -> os.stat_result:
+    status = path.lstat()
+    if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
+        raise PersistenceError("raw artifact path contains an unsafe directory")
+    return status
+
+
+def _fsync_parent_directory(parent: Path) -> None:
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    unsupported_errors = {
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    }
+    try:
+        descriptor = os.open(parent, flags)
+    except OSError as error:
+        if error.errno in unsupported_errors:
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            if error.errno not in unsupported_errors:
+                raise
+    finally:
+        os.close(descriptor)
 
 
 def _prune_candidates(

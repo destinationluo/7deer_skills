@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 from typing import Callable, Iterator
@@ -92,6 +93,26 @@ class ArtifactTests(unittest.TestCase):
                         cyclic_value,
                         datetime.now(timezone.utc),
                     )
+
+            deeply_nested: list[object] = []
+            cursor = deeply_nested
+            for _ in range(sys.getrecursionlimit() + 100):
+                child: list[object] = []
+                cursor.append(child)
+                cursor = child
+            with self.assertRaises(InputValidationError):
+                atomic_write_json(
+                    Path(directory) / "deeply-nested.json",
+                    deeply_nested,
+                )
+            with self.assertRaises(InputValidationError):
+                persist_raw(
+                    config,
+                    "20260824T030405Z-1234abcd",
+                    "steam_store",
+                    deeply_nested,
+                    datetime.now(timezone.utc),
+                )
             with self.assertRaises(InputValidationError):
                 persist_raw(
                     config,
@@ -107,15 +128,26 @@ class ArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "artifact.json"
             real_replace = os.replace
+            real_fsync = os.fsync
             replacements: list[tuple[Path, Path]] = []
+            fsynced_file_types: list[int] = []
 
             def recording_replace(source: object, target: object) -> None:
                 replacements.append((Path(source), Path(target)))
                 real_replace(source, target)
 
+            def recording_fsync(file_descriptor: int) -> None:
+                fsynced_file_types.append(
+                    stat.S_IFMT(os.fstat(file_descriptor).st_mode)
+                )
+                real_fsync(file_descriptor)
+
             with mock.patch(
                 "steam_game_radar.artifacts.os.replace",
                 side_effect=recording_replace,
+            ), mock.patch(
+                "steam_game_radar.artifacts.os.fsync",
+                side_effect=recording_fsync,
             ):
                 atomic_write_json(path, {"z": 2, "a": "游戏"})
 
@@ -125,6 +157,9 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(source.parent, path.parent)
             self.assertEqual(target, path)
             self.assertFalse(source.exists())
+            if os.name == "posix":
+                self.assertIn(stat.S_IFREG, fsynced_file_types)
+                self.assertIn(stat.S_IFDIR, fsynced_file_types)
 
     def test_persist_raw_validates_provider_filename(self) -> None:
         invalid_provider_ids = (
@@ -183,6 +218,44 @@ class ArtifactTests(unittest.TestCase):
                     InputValidationError
                 ):
                     persist_raw(config, invalid_run_id, "steam_store", {}, now)
+
+            outside_raw = root / "outside-raw"
+            outside_raw.mkdir()
+            raw_link_data = root / "raw-link-data"
+            raw_link_data.mkdir()
+            (raw_link_data / "raw").symlink_to(
+                outside_raw,
+                target_is_directory=True,
+            )
+            with self.assertRaises(PersistenceError):
+                persist_raw(
+                    RadarConfig(data_dir=raw_link_data),
+                    "20260824T030405Z-abcdef12",
+                    "steam_store",
+                    {"safe": True},
+                    now,
+                )
+            self.assertEqual(list(outside_raw.iterdir()), [])
+
+            run_link_data = root / "run-link-data"
+            safe_raw = run_link_data / "raw"
+            safe_raw.mkdir(parents=True)
+            outside_run = root / "outside-run"
+            outside_run.mkdir()
+            run_id = "20260824T030405Z-fedcba98"
+            (safe_raw / run_id).symlink_to(
+                outside_run,
+                target_is_directory=True,
+            )
+            with self.assertRaises(PersistenceError):
+                persist_raw(
+                    RadarConfig(data_dir=run_link_data),
+                    run_id,
+                    "steam_store",
+                    {"safe": True},
+                    now,
+                )
+            self.assertEqual(list(outside_run.iterdir()), [])
 
     def test_prune_raw_removes_only_files_strictly_older_than_retention(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

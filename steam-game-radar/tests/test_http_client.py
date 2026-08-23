@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from email.message import Message
+import http.client
 import io
 import json
 from pathlib import Path
@@ -68,6 +69,16 @@ class FakeResponse:
 
     def __exit__(self, *args: object) -> None:
         self.close()
+
+
+class ReadErrorResponse(FakeResponse):
+    def __init__(self, error: BaseException) -> None:
+        super().__init__(b"")
+        self.error = error
+
+    def read(self, amount: int = -1) -> bytes:
+        del amount
+        raise self.error
 
 
 class FakeOpener:
@@ -286,6 +297,10 @@ class HttpClientTests(unittest.TestCase):
 
     def test_response_size_utf8_and_json_errors_are_terminal(self) -> None:
         url = "https://api.steampowered.com/example"
+        nesting_depth = sys.getrecursionlimit() + 100
+        deeply_nested_json = (
+            b"[" * nesting_depth + b"0" + b"]" * nesting_depth
+        )
         cases = (
             (FakeResponse(b"123456"), 5),
             (FakeResponse(b'"\xff"'), 1024),
@@ -293,6 +308,7 @@ class HttpClientTests(unittest.TestCase):
             (FakeResponse(b"NaN"), 1024),
             (FakeResponse(b"Infinity"), 1024),
             (FakeResponse(b"-Infinity"), 1024),
+            (FakeResponse(deeply_nested_json), len(deeply_nested_json) + 1),
         )
         for response, max_bytes in cases:
             with self.subTest(body=response.body, max_bytes=max_bytes):
@@ -306,6 +322,21 @@ class HttpClientTests(unittest.TestCase):
 
                 self.assertEqual(len(opener.calls), 1)
                 self.assertTrue(response.closed)
+
+        incomplete_read = http.client.IncompleteRead(
+            b'partial secret body',
+            100,
+        )
+        response = ReadErrorResponse(incomplete_read)
+        opener = FakeOpener(
+            [response, FakeResponse(b'{"unexpected":true}')]
+        )
+        client = client_for(opener, max_retries=3)
+        with self.assertRaises(ProviderUnavailableError) as captured:
+            client.get_json(url)
+        self.assertEqual(len(opener.calls), 1)
+        self.assertTrue(response.closed)
+        self.assertNotIn("partial secret body", str(captured.exception))
 
     def test_json_response_is_parsed_from_utf8(self) -> None:
         payload = {"name": "游戏", "rank": [1, 2]}
