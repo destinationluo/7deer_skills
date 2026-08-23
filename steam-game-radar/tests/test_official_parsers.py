@@ -523,6 +523,61 @@ class AppDetailsParserTests(unittest.TestCase):
         genres.append("Free to Play")
         self.assertEqual(isolated.genres, ("Action",))
 
+        shape_drift_values = (
+            "20 Aug, 2026",
+            42,
+            False,
+            ["20 Aug, 2026"],
+        )
+        for release_date_value in shape_drift_values:
+            with self.subTest(release_date_value=release_date_value):
+                drift_payload = {
+                    "440": {
+                        "success": True,
+                        "data": {
+                            "steam_appid": 440,
+                            "name": "Team Fortress 2",
+                            "type": "game",
+                            "release_date": release_date_value,
+                        },
+                    }
+                }
+                drift = parse_appdetails(440, drift_payload, OBSERVED_AT)
+                self.assertEqual(drift.value.release_status, "unknown")
+                self.assertIsNone(drift.value.release_date)
+                self.assertEqual(
+                    [warning.to_dict() for warning in drift.warnings],
+                    [
+                        {
+                            "code": "steam_appdetails_release_date_unparsed",
+                            "message": (
+                                "Steam app-details release date could not be "
+                                "normalized."
+                            ),
+                            "appid": 440,
+                        }
+                    ],
+                )
+
+        empty_release_date_values = (None, "", "   ", [], (), {})
+        for release_date_value in empty_release_date_values:
+            with self.subTest(empty_release_date_value=release_date_value):
+                empty_payload = {
+                    "440": {
+                        "success": True,
+                        "data": {
+                            "steam_appid": 440,
+                            "name": "Team Fortress 2",
+                            "type": "game",
+                            "release_date": release_date_value,
+                        },
+                    }
+                }
+                empty = parse_appdetails(440, empty_payload, OBSERVED_AT)
+                self.assertEqual(empty.value.release_status, "unknown")
+                self.assertIsNone(empty.value.release_date)
+                self.assertEqual(empty.warnings, ())
+
     def test_appdetails_malformed_capability_returns_no_identity(self) -> None:
         payloads = (
             {},

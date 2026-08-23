@@ -392,7 +392,7 @@ def parse_current_players(
 
 def _parse_release_date(value: object) -> tuple[str, str | None, bool]:
     if not isinstance(value, Mapping):
-        return "unknown", None, False
+        return "unknown", None, _has_nonempty_date(value)
     coming_soon = value.get("coming_soon")
     if not isinstance(coming_soon, bool):
         return "unknown", None, _has_nonempty_date(value.get("date"))
@@ -460,6 +460,8 @@ def _has_nonempty_date(value: object) -> bool:
         return False
     if isinstance(value, str):
         return bool(value.strip())
+    if isinstance(value, (bytes, bytearray, Mapping, Sequence)):
+        return len(value) > 0
     return True
 
 
