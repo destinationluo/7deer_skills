@@ -10,7 +10,11 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
 from steam_game_radar.errors import InputValidationError
-from steam_game_radar import MAX_STEAM_APPID
+from steam_game_radar import (
+    MAX_JSON_SAFE_INTEGER,
+    MAX_STEAM_APPID,
+    MIN_JSON_SAFE_INTEGER,
+)
 from steam_game_radar.schemas import (
     GameRecord,
     MetricObservation,
@@ -73,6 +77,39 @@ class SchemaTests(unittest.TestCase):
         with self.assertRaises(InputValidationError):
             MetricObservation.from_dict(tuple_value)
 
+        safe_value = {
+            "bounds": [
+                MIN_JSON_SAFE_INTEGER,
+                {"maximum": MAX_JSON_SAFE_INTEGER, "flag": True},
+            ]
+        }
+        safe_metric = MetricObservation(
+            value=safe_value,
+            source_id="json-safe-bounds",
+            source_kind="steam_official",
+            observed_at="2026-08-24T03:00:00Z",
+        )
+        self.assertEqual(safe_metric.to_dict()["value"], safe_value)
+        self.assertEqual(
+            json.loads(json.dumps(safe_metric.to_dict()))["value"],
+            safe_value,
+        )
+        for unsafe_value in (
+            {"nested": [MAX_JSON_SAFE_INTEGER + 1]},
+            [{"nested": {"minimum": MIN_JSON_SAFE_INTEGER - 1}}],
+        ):
+            with self.subTest(unsafe_value=unsafe_value), self.assertRaises(
+                InputValidationError
+            ):
+                MetricObservation(
+                    value=unsafe_value,
+                    source_id="unsafe-integer",
+                    source_kind="steam_official",
+                    observed_at="2026-08-24T03:00:00Z",
+                )
+        self.assertEqual(MAX_JSON_SAFE_INTEGER, 9_007_199_254_740_991)
+        self.assertEqual(MIN_JSON_SAFE_INTEGER, -9_007_199_254_740_991)
+
     def test_game_round_trip(self) -> None:
         expected = self.game_dict()
         game = GameRecord.from_dict(expected)
@@ -106,6 +143,18 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(max_rejected_record.to_dict(), max_rejected)
         self.assertIsInstance(json.dumps(max_warning_record.to_dict()), str)
         self.assertIsInstance(json.dumps(max_rejected_record.to_dict()), str)
+        max_row_record = RejectedRow(
+            MAX_JSON_SAFE_INTEGER,
+            "max_row",
+            "maximum portable row number",
+        )
+        self.assertIsInstance(json.dumps(max_row_record.to_dict()), str)
+        with self.assertRaises(InputValidationError):
+            RejectedRow(
+                MAX_JSON_SAFE_INTEGER + 1,
+                "invalid_row",
+                "row number is not portable",
+            )
         for optional_appid in (True, MAX_STEAM_APPID + 1):
             with self.subTest(
                 record="warning", optional_appid=optional_appid
@@ -139,6 +188,43 @@ class SchemaTests(unittest.TestCase):
             isolated.metrics["followers"] = MetricObservation.from_dict(
                 self.metric_dict()
             )
+
+        safe_extra = {
+            "bounds": [
+                MIN_JSON_SAFE_INTEGER,
+                {"maximum": MAX_JSON_SAFE_INTEGER, "flag": False},
+            ]
+        }
+        safe_game = GameRecord(
+            schema_version=1,
+            appid=730,
+            name="Counter-Strike 2",
+            release_status="released",
+            store_url="https://store.steampowered.com/app/730",
+            metrics={},
+            source_extra=safe_extra,
+        )
+        self.assertEqual(safe_game.to_dict()["source_extra"], safe_extra)
+        self.assertEqual(
+            json.loads(json.dumps(safe_game.to_dict()))["source_extra"],
+            safe_extra,
+        )
+        for unsafe_extra in (
+            {"nested": [MAX_JSON_SAFE_INTEGER + 1]},
+            {"nested": [{"minimum": MIN_JSON_SAFE_INTEGER - 1}]},
+        ):
+            with self.subTest(unsafe_extra=unsafe_extra), self.assertRaises(
+                InputValidationError
+            ):
+                GameRecord(
+                    schema_version=1,
+                    appid=730,
+                    name="Counter-Strike 2",
+                    release_status="released",
+                    store_url="https://store.steampowered.com/app/730",
+                    metrics={},
+                    source_extra=unsafe_extra,
+                )
 
     def test_required_schema_version(self) -> None:
         missing = self.game_dict()

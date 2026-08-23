@@ -85,6 +85,8 @@ Both expose `to_dict()` and `from_dict()` with strict validation. Also define fr
 
 All required and optional AppIDs use Steam's `AppId_t` uint32 domain: integer values from `1` through `4_294_967_295`; booleans and out-of-range integers are rejected.
 
+Strict JSON validation accepts other persisted integers only from `-9_007_199_254_740_991` through `9_007_199_254_740_991` (`-(2**53 - 1)` through `2**53 - 1`), recursively including metric values and `source_extra`, so JSON/JavaScript consumers preserve them exactly. Booleans remain valid booleans rather than integers. AppID validation continues to use its separate, narrower uint32 domain.
+
 - [ ] **Step 7: Run the green tests**
 
 Run: `python3 -m unittest steam-game-radar/tests/test_config.py steam-game-radar/tests/test_schemas.py`

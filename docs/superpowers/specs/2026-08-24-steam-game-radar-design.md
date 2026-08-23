@@ -266,6 +266,8 @@ Required fields are `schema_version`, `appid`, `name`, `release_status`, `store_
 
 AppID values in normalized records, manual imports, warnings, and rejections follow Steam's [`AppId_t` unsigned 32-bit contract](https://partner.steamgames.com/doc/api/steam_api?l=english): `1 <= appid <= 4_294_967_295`; booleans are not AppIDs.
 
+All other persisted JSON integers, including values nested in metric observations or `source_extra` and rejection row numbers, must stay within `-9_007_199_254_740_991` through `9_007_199_254_740_991` (`-(2**53 - 1)` through `2**53 - 1`). This portable JSON integer range preserves exact values in downstream JavaScript consumers; booleans remain JSON booleans and are not validated as integers. The narrower AppID uint32 contract remains separate.
+
 ### Analyzed Candidate
 
 ```json

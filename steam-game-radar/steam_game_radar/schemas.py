@@ -20,6 +20,8 @@ SourceKind = Literal[
 ]
 ReleaseStatus = Literal["released", "unreleased", "unknown"]
 
+MAX_JSON_SAFE_INTEGER = 9_007_199_254_740_991
+MIN_JSON_SAFE_INTEGER = -9_007_199_254_740_991
 MAX_STEAM_APPID = 4_294_967_295
 
 _SOURCE_KINDS = {"steam_official", "steamdb_manual_import", "seo_enrichment"}
@@ -214,8 +216,10 @@ class RejectedRow:
     def __post_init__(self) -> None:
         if isinstance(self.row_number, bool) or not isinstance(self.row_number, int):
             raise InputValidationError("row_number must be a positive integer")
-        if self.row_number <= 0:
-            raise InputValidationError("row_number must be a positive integer")
+        if self.row_number <= 0 or self.row_number > MAX_JSON_SAFE_INTEGER:
+            raise InputValidationError(
+                "row_number must be a positive JSON-safe integer"
+            )
         _non_empty_string(self.code, "code")
         _non_empty_string(self.message, "message")
         _optional_appid(self.appid)
@@ -330,7 +334,14 @@ def _store_url(value: object, appid: int) -> str:
 
 
 def _freeze_json(value: object, name: str) -> object:
-    if value is None or isinstance(value, (str, bool, int)):
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        if value < MIN_JSON_SAFE_INTEGER or value > MAX_JSON_SAFE_INTEGER:
+            raise InputValidationError(
+                f"{name} integers must be from {MIN_JSON_SAFE_INTEGER} "
+                f"through {MAX_JSON_SAFE_INTEGER}"
+            )
         return value
     if isinstance(value, float):
         if not math.isfinite(value):
