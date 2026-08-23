@@ -218,8 +218,16 @@ class RunLockTests(unittest.TestCase):
                 self.assertFalse(
                     lock.__exit__(ValueError, ValueError("body failed"), None)
                 )
-            self.assertTrue(path.exists())
-            path.unlink()
+            quarantines = list(Path(directory).glob(".steam-radar-lock-*.quarantine"))
+            self.assertFalse(path.exists())
+            self.assertEqual(len(quarantines), 1)
+            self.assertEqual(json.loads(quarantines[0].read_text()), {
+                "pid": os.getpid(),
+                "run_id": RUN_ID,
+                "host": "worker-1",
+                "acquired_at": "2026-08-24T03:00:00Z",
+            })
+            quarantines[0].unlink()
 
             lock = self._lock(path)
             lock.__enter__()
@@ -228,15 +236,81 @@ class RunLockTests(unittest.TestCase):
                 side_effect=OSError("cleanup failed"),
             ), self.assertRaises(PersistenceError):
                 lock.__exit__(None, None, None)
-            self.assertTrue(path.exists())
+            quarantines = list(Path(directory).glob(".steam-radar-lock-*.quarantine"))
+            self.assertFalse(path.exists())
+            self.assertEqual(len(quarantines), 1)
 
-            path.unlink()
+            quarantines[0].unlink()
             with mock.patch(
                 "steam_game_radar.run_lock.os.fchmod",
                 side_effect=OSError("mode failed"),
             ), self.assertRaises(PersistenceError):
                 self._lock(path).__enter__()
             self.assertFalse(path.exists())
+
+            real_rename = os.rename
+            before_move = Path(directory) / "cleanup-before-move.lock"
+            lock = self._lock(before_move)
+            lock.__enter__()
+            replacement_before = {
+                "pid": 333_333,
+                "run_id": "20260824T030001Z-feedface",
+                "host": "worker-2",
+                "acquired_at": "2026-08-24T03:00:01Z",
+            }
+            replacement_before_inode: list[int] = []
+
+            def replace_before_cleanup_move(
+                source: object,
+                destination: object,
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                before_move.unlink()
+                before_move.write_text(
+                    json.dumps(replacement_before), encoding="utf-8"
+                )
+                replacement_before_inode.append(before_move.stat().st_ino)
+                real_rename(source, destination, *args, **kwargs)
+
+            with mock.patch(
+                "steam_game_radar.run_lock.os.rename",
+                side_effect=replace_before_cleanup_move,
+            ), self.assertRaises(PersistenceError):
+                lock.__exit__(None, None, None)
+            self.assertEqual(json.loads(before_move.read_text()), replacement_before)
+            self.assertEqual(before_move.stat().st_ino, replacement_before_inode[0])
+
+            after_move = Path(directory) / "cleanup-after-move.lock"
+            lock = self._lock(after_move)
+            lock.__enter__()
+            replacement_after = {
+                "pid": 444_444,
+                "run_id": "20260824T030002Z-cafebabe",
+                "host": "worker-2",
+                "acquired_at": "2026-08-24T03:00:02Z",
+            }
+            replacement_after_inode: list[int] = []
+
+            def replace_after_cleanup_move(
+                source: object,
+                destination: object,
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                real_rename(source, destination, *args, **kwargs)
+                after_move.write_text(
+                    json.dumps(replacement_after), encoding="utf-8"
+                )
+                replacement_after_inode.append(after_move.stat().st_ino)
+
+            with mock.patch(
+                "steam_game_radar.run_lock.os.rename",
+                side_effect=replace_after_cleanup_move,
+            ):
+                self.assertFalse(lock.__exit__(None, None, None))
+            self.assertEqual(json.loads(after_move.read_text()), replacement_after)
+            self.assertEqual(after_move.stat().st_ino, replacement_after_inode[0])
 
     def test_same_host_live_pid_remains_blocking_after_two_hours(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -312,6 +386,68 @@ class RunLockTests(unittest.TestCase):
             with self.assertRaises(RunBusyError):
                 lock.__enter__()
             self.assertEqual(json.loads(changed.read_text()), replacement)
+
+            real_rename = os.rename
+            before_move = root / "stale-before-move.lock"
+            self._write_lock(before_move)
+            replacement_before = {
+                "pid": 555_555,
+                "run_id": "20260824T030003Z-abcdef12",
+                "host": "worker-2",
+                "acquired_at": "2026-08-24T03:00:03Z",
+            }
+            replacement_before_inode: list[int] = []
+
+            def replace_before_stale_move(
+                source: object,
+                destination: object,
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                before_move.unlink()
+                before_move.write_text(
+                    json.dumps(replacement_before), encoding="utf-8"
+                )
+                replacement_before_inode.append(before_move.stat().st_ino)
+                real_rename(source, destination, *args, **kwargs)
+
+            with mock.patch(
+                "steam_game_radar.run_lock.os.rename",
+                side_effect=replace_before_stale_move,
+            ), self.assertRaises(RunBusyError):
+                self._lock(before_move).__enter__()
+            self.assertEqual(json.loads(before_move.read_text()), replacement_before)
+            self.assertEqual(before_move.stat().st_ino, replacement_before_inode[0])
+
+            after_move = root / "stale-after-move.lock"
+            self._write_lock(after_move)
+            replacement_after = {
+                "pid": 666_666,
+                "run_id": "20260824T030004Z-1234abcd",
+                "host": "worker-1",
+                "acquired_at": "2026-08-23T00:00:00Z",
+            }
+            replacement_after_inode: list[int] = []
+
+            def replace_after_stale_move(
+                source: object,
+                destination: object,
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                real_rename(source, destination, *args, **kwargs)
+                after_move.write_text(
+                    json.dumps(replacement_after), encoding="utf-8"
+                )
+                replacement_after_inode.append(after_move.stat().st_ino)
+
+            with mock.patch(
+                "steam_game_radar.run_lock.os.rename",
+                side_effect=replace_after_stale_move,
+            ), self.assertRaises(RunBusyError):
+                self._lock(after_move).__enter__()
+            self.assertEqual(json.loads(after_move.read_text()), replacement_after)
+            self.assertEqual(after_move.stat().st_ino, replacement_after_inode[0])
 
             owned = root / "owned.lock"
             lock = self._lock(owned)

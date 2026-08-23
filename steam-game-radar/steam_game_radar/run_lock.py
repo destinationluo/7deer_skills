@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 from typing import Callable, Dict, Optional, Tuple
 
@@ -27,6 +28,10 @@ class _MissingLock(Exception):
 
 class _UnsafeExistingLock(Exception):
     """Internal signal that an existing lock must be left untouched."""
+
+
+class _QuarantineFailure(Exception):
+    """Internal signal that atomic ownership removal was not provable."""
 
 
 LockPayload = Dict[str, object]
@@ -233,14 +238,16 @@ class RunLock:
             raise
         return descriptor
 
-    def _read_existing(
-        self, parent_descriptor: int
+    def _read_named(
+        self,
+        parent_descriptor: int,
+        name: str,
     ) -> tuple[LockPayload, LockIdentity]:
         flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         flags |= getattr(os, "O_CLOEXEC", 0)
         try:
-            descriptor = os.open(self.path.name, flags, dir_fd=parent_descriptor)
+            descriptor = os.open(name, flags, dir_fd=parent_descriptor)
         except FileNotFoundError as exc:
             raise _MissingLock from exc
         except OSError as exc:
@@ -277,10 +284,19 @@ class RunLock:
             except OSError:
                 pass
 
-    def _path_identity(self, parent_descriptor: int) -> LockIdentity:
+    def _read_existing(
+        self, parent_descriptor: int
+    ) -> tuple[LockPayload, LockIdentity]:
+        return self._read_named(parent_descriptor, self.path.name)
+
+    def _named_identity(
+        self,
+        parent_descriptor: int,
+        name: str,
+    ) -> LockIdentity:
         try:
             metadata = os.stat(
-                self.path.name,
+                name,
                 dir_fd=parent_descriptor,
                 follow_symlinks=False,
             )
@@ -292,6 +308,160 @@ class RunLock:
             raise _UnsafeExistingLock
         return _identity(metadata)
 
+    def _fsync_parent(self, parent_descriptor: int) -> None:
+        try:
+            os.fsync(parent_descriptor)
+        except OSError as exc:
+            raise _QuarantineFailure("cannot sync lock directory") from exc
+
+    def _unused_quarantine_name(self, parent_descriptor: int) -> str:
+        for _attempt in range(_MAX_ACQUIRE_ATTEMPTS):
+            token = secrets.token_hex(16)
+            if re.fullmatch(r"[0-9a-f]{32}", token) is None:
+                raise _QuarantineFailure("invalid quarantine token")
+            name = f".steam-radar-lock-{token}.quarantine"
+            try:
+                os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return name
+            except OSError as exc:
+                raise _QuarantineFailure(
+                    "cannot inspect quarantine path"
+                ) from exc
+        raise _QuarantineFailure("cannot allocate quarantine path")
+
+    def _restore_quarantine(
+        self,
+        parent_descriptor: int,
+        quarantine_name: str,
+    ) -> None:
+        try:
+            os.link(
+                quarantine_name,
+                self.path.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise _QuarantineFailure(
+                "cannot safely restore unexpected quarantined lock"
+            ) from exc
+        try:
+            os.unlink(quarantine_name, dir_fd=parent_descriptor)
+        except OSError as exc:
+            raise _QuarantineFailure(
+                "restored lock has an extra quarantine link"
+            ) from exc
+        self._fsync_parent(parent_descriptor)
+
+    def _atomic_remove_expected(
+        self,
+        parent_descriptor: int,
+        payload: LockPayload,
+        identity: LockIdentity,
+    ) -> bool:
+        quarantine_name = self._unused_quarantine_name(parent_descriptor)
+        try:
+            os.rename(
+                self.path.name,
+                quarantine_name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise _QuarantineFailure("cannot atomically quarantine lock") from exc
+
+        try:
+            moved_payload, moved_identity = self._read_named(
+                parent_descriptor,
+                quarantine_name,
+            )
+        except (_MissingLock, _UnsafeExistingLock) as exc:
+            try:
+                self._restore_quarantine(parent_descriptor, quarantine_name)
+            except _QuarantineFailure as restore_error:
+                raise _QuarantineFailure(
+                    "cannot verify or restore quarantined lock"
+                ) from restore_error
+            raise _QuarantineFailure("quarantined lock could not be verified") from exc
+
+        if moved_identity != identity or moved_payload != payload:
+            try:
+                self._restore_quarantine(parent_descriptor, quarantine_name)
+            except _QuarantineFailure as exc:
+                raise _QuarantineFailure(
+                    "unexpected quarantined lock could not be restored"
+                ) from exc
+            raise _QuarantineFailure(
+                "lock ownership changed before atomic quarantine"
+            )
+
+        try:
+            os.unlink(quarantine_name, dir_fd=parent_descriptor)
+        except OSError as exc:
+            raise _QuarantineFailure(
+                "cannot delete verified quarantined lock"
+            ) from exc
+        self._fsync_parent(parent_descriptor)
+        return True
+
+    def _atomic_remove_created_inode(
+        self,
+        parent_descriptor: int,
+        identity: LockIdentity,
+    ) -> bool:
+        """Remove a partially written lock only if its open-file inode moved."""
+        quarantine_name = self._unused_quarantine_name(parent_descriptor)
+        try:
+            os.rename(
+                self.path.name,
+                quarantine_name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise _QuarantineFailure(
+                "cannot quarantine partially created lock"
+            ) from exc
+        try:
+            moved_identity = self._named_identity(
+                parent_descriptor,
+                quarantine_name,
+            )
+        except (_MissingLock, _UnsafeExistingLock) as exc:
+            try:
+                self._restore_quarantine(parent_descriptor, quarantine_name)
+            except _QuarantineFailure as restore_error:
+                raise _QuarantineFailure(
+                    "cannot inspect or restore partial lock"
+                ) from restore_error
+            raise _QuarantineFailure("partial lock could not be inspected") from exc
+        if moved_identity[:2] != identity[:2]:
+            try:
+                self._restore_quarantine(parent_descriptor, quarantine_name)
+            except _QuarantineFailure as exc:
+                raise _QuarantineFailure(
+                    "replacement lock could not be restored"
+                ) from exc
+            raise _QuarantineFailure("partial lock inode was replaced")
+        try:
+            os.unlink(quarantine_name, dir_fd=parent_descriptor)
+        except OSError as exc:
+            raise _QuarantineFailure(
+                "cannot delete quarantined partial lock"
+            ) from exc
+        self._fsync_parent(parent_descriptor)
+        return True
+
     def _remove_stale(
         self,
         parent_descriptor: int,
@@ -299,19 +469,15 @@ class RunLock:
         identity: LockIdentity,
     ) -> bool:
         try:
-            if self._path_identity(parent_descriptor) != identity:
-                return False
-            verified_payload, verified_identity = self._read_existing(parent_descriptor)
-            if verified_identity != identity or verified_payload != payload:
-                return False
-            if self._path_identity(parent_descriptor) != identity:
-                return False
-            os.unlink(self.path.name, dir_fd=parent_descriptor)
-            return True
-        except (_MissingLock, _UnsafeExistingLock):
-            return False
-        except OSError as exc:
-            raise PersistenceError("cannot remove verified stale run lock") from exc
+            return self._atomic_remove_expected(
+                parent_descriptor,
+                payload,
+                identity,
+            )
+        except _QuarantineFailure as exc:
+            raise RunBusyError(
+                "stale run lock could not be removed safely"
+            ) from exc
 
     def _collision_is_removable(
         self,
@@ -374,9 +540,11 @@ class RunLock:
         except (OSError, TypeError, ValueError, UnicodeError) as exc:
             if created_identity is not None:
                 try:
-                    if self._path_identity(parent_descriptor)[:2] == created_identity[:2]:
-                        os.unlink(self.path.name, dir_fd=parent_descriptor)
-                except (_MissingLock, _UnsafeExistingLock, OSError):
+                    self._atomic_remove_created_inode(
+                        parent_descriptor,
+                        created_identity,
+                    )
+                except _QuarantineFailure:
                     pass
             raise PersistenceError("cannot persist run lock") from exc
         finally:
@@ -413,6 +581,7 @@ class RunLock:
         self._encode_payload(payload)
         parent_descriptor = self._open_parent()
         try:
+            removed_stale_lock = False
             for _attempt in range(_MAX_ACQUIRE_ATTEMPTS):
                 identity = self._write_new(parent_descriptor, payload)
                 if identity is not None:
@@ -420,6 +589,10 @@ class RunLock:
                     self._created_identity = identity
                     self._acquired = True
                     return self
+                if removed_stale_lock:
+                    raise RunBusyError(
+                        "a new owner raced stale-lock recovery"
+                    )
                 try:
                     existing, existing_identity = self._read_existing(
                         parent_descriptor
@@ -440,6 +613,7 @@ class RunLock:
                     existing_identity,
                 ):
                     raise RunBusyError("run lock changed while checking staleness")
+                removed_stale_lock = True
             raise RunBusyError("run lock was contended during acquisition")
         finally:
             try:
@@ -472,14 +646,16 @@ class RunLock:
             if current != payload or current_identity[:2] != identity[:2]:
                 return False
             try:
-                if self._path_identity(parent_descriptor)[:2] != identity[:2]:
-                    return False
-                os.unlink(self.path.name, dir_fd=parent_descriptor)
-            except (_MissingLock, _UnsafeExistingLock):
-                return False
-            except OSError as unlink_error:
+                self._atomic_remove_expected(
+                    parent_descriptor,
+                    payload,
+                    current_identity,
+                )
+            except _QuarantineFailure as removal_error:
                 if exc_type is None:
-                    raise PersistenceError("cannot release owned run lock") from unlink_error
+                    raise PersistenceError(
+                        "cannot release owned run lock atomically"
+                    ) from removal_error
             return False
         finally:
             try:
