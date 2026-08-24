@@ -11,13 +11,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import errno
+import fcntl
+import html
 import json
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import stat
+import sys
 from typing import Literal, Mapping, Sequence, cast
+from urllib.parse import quote
 
 from .artifacts import _serialize_json, _validate_run_id
 from .config import RadarConfig
@@ -81,6 +86,9 @@ _CANDIDATE_FIELDS = {
 }
 _MAX_REPORT_BYTES = 64 * 1024 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
+_PUBLICATION_GATE = ".steam-radar-report-publication.gate"
+_MARKDOWN_PUNCTUATION = frozenset("\\`*_{}[]()#+-.!|>")
+_BACKTICK_RUN = re.compile(r"`+")
 
 
 @dataclass(frozen=True)
@@ -89,6 +97,14 @@ class _StagedFile:
     descriptor: int
     inode: tuple[int, int]
     size: int
+
+
+@dataclass(frozen=True)
+class _ReportDirectory:
+    descriptor: int
+    parent_descriptor: int
+    name: str
+    inode: tuple[int, int]
 
 
 def build_report(
@@ -146,7 +162,7 @@ def _build_report(
     if len(appids) != len(set(appids)):
         raise InputValidationError("report candidates must use unique AppIDs")
 
-    return {
+    report = {
         "report_schema_version": 1,
         "run_id": run_id,
         "phase": parsed_phase,
@@ -165,6 +181,8 @@ def _build_report(
         "warnings": _canonical_warnings(warnings),
         "rejected_rows": _canonical_rejections(rejected_rows),
     }
+    _serialize_json(report)
+    return report
 
 
 def render_markdown(report: Mapping[str, object]) -> str:
@@ -194,7 +212,10 @@ def render_markdown(report: Mapping[str, object]) -> str:
     run_warnings = cast(list[Mapping[str, object]], canonical["warnings"])
     if run_warnings:
         for warning in run_warnings:
-            lines.append(f"- `{warning['code']}`: {warning['message']}")
+            lines.append(
+                f"- {_markdown_code(cast(str, warning['code']))}: "
+                f"{_markdown_text(cast(str, warning['message']))}"
+            )
     else:
         lines.append("- None")
     lines.extend(["", "## Rejected rows", ""])
@@ -202,8 +223,9 @@ def render_markdown(report: Mapping[str, object]) -> str:
     if rejections:
         for rejected in rejections:
             lines.append(
-                f"- Row {rejected['row_number']} `{rejected['code']}`: "
-                f"{rejected['message']}"
+                f"- Row {rejected['row_number']} "
+                f"{_markdown_code(cast(str, rejected['code']))}: "
+                f"{_markdown_text(cast(str, rejected['message']))}"
             )
     else:
         lines.append("- None")
@@ -251,29 +273,38 @@ def persist_report(
     json_name = f"{run_id}.{phase}.json"
     markdown_name = f"{run_id}.{phase}.md"
     report_root = Path(config.report_dir)
-    directory_descriptor = _open_report_directory(report_root)
+    report_directory = _open_report_directory(report_root)
+    publication_gate: int | None = None
     try:
+        publication_gate = _acquire_publication_gate(report_directory)
         _persist_immutable_pair(
-            directory_descriptor,
+            report_directory.descriptor,
             json_name,
             serialized_json,
             markdown_name,
             serialized_markdown,
         )
-        existing = _load_latest_pair(directory_descriptor)
+        _validate_report_directory_binding(report_directory)
+        existing = _load_latest_pair(report_directory.descriptor)
         if should_publish_latest(canonical, existing):
             _update_latest_pair(
-                directory_descriptor,
+                report_directory.descriptor,
                 serialized_json,
                 serialized_markdown,
                 existing is not None,
             )
+        _validate_report_directory_binding(report_directory)
+        _release_publication_gate(publication_gate)
+        publication_gate = None
+        _validate_report_directory_binding(report_directory)
     except (InputValidationError, PersistenceError):
         raise
     except OSError as error:
         raise PersistenceError("unable to persist report pair safely") from error
     finally:
-        _close_descriptor(directory_descriptor)
+        if publication_gate is not None:
+            _release_publication_gate(publication_gate)
+        _close_report_directory(report_directory)
     return report_root / json_name, report_root / markdown_name
 
 
@@ -370,7 +401,7 @@ def _canonical_report_unchecked(
     rejected = _rejections_from_json(report["rejected_rows"])
     if report["rejected_rows"] != rejected:
         raise InputValidationError("report rejections are not canonical")
-    return {
+    canonical = {
         "report_schema_version": 1,
         "run_id": run_id,
         "phase": phase,
@@ -383,6 +414,8 @@ def _canonical_report_unchecked(
         "warnings": warnings,
         "rejected_rows": rejected,
     }
+    _serialize_json(canonical)
+    return canonical
 
 
 def _canonical_candidate_array(
@@ -611,9 +644,10 @@ def _render_candidate_pool(
     for index, candidate in enumerate(candidates, start=1):
         lines.extend(
             [
-                f"### {index}. {candidate['name']} (AppID {candidate['appid']})",
+                f"### {index}. {_markdown_text(cast(str, candidate['name']))} "
+                f"(AppID {candidate['appid']})",
                 "",
-                f"- Store: {candidate['store_url']}",
+                f"- Store: {_markdown_url(cast(str, candidate['store_url']))}",
                 f"- Confidence: {candidate['confidence']}",
                 f"- Action: {candidate['action']}",
                 "- Scores: "
@@ -634,9 +668,10 @@ def _render_candidate_pool(
                     allow_nan=False,
                 )
                 lines.append(
-                    f"  - `{name}`: {value_text} "
-                    f"(`{observation['source_id']}`, {observation['source_kind']}, "
-                    f"{observation['observed_at']})"
+                    f"  - {_markdown_code(name)}: {_markdown_code(value_text)} "
+                    f"({_markdown_code(cast(str, observation['source_id']))}, "
+                    f"{_markdown_code(cast(str, observation['source_kind']))}, "
+                    f"{_markdown_code(cast(str, observation['observed_at']))})"
                 )
         else:
             lines.append("  - None")
@@ -646,19 +681,29 @@ def _render_candidate_pool(
         lines.append("- Evidence:")
         if evidence:
             for item in evidence:
-                lines.append(f"  - {item['source']}: {item['url']}")
+                lines.append(
+                    f"  - {_markdown_text(cast(str, item['source']))}: "
+                    f"{_markdown_url(cast(str, item['url']))}"
+                )
         else:
             lines.append("  - None")
         content = cast(list[str], candidate["recommended_content_types"])
         lines.append(
             "- Recommended content types: "
-            + (", ".join(content) if content else "None")
+            + (
+                ", ".join(_markdown_code(item) for item in content)
+                if content
+                else "None"
+            )
         )
         candidate_warnings = cast(list[Mapping[str, object]], candidate["warnings"])
         lines.append("- Warnings:")
         if candidate_warnings:
             for warning in candidate_warnings:
-                lines.append(f"  - `{warning['code']}`: {warning['message']}")
+                lines.append(
+                    f"  - {_markdown_code(cast(str, warning['code']))}: "
+                    f"{_markdown_text(cast(str, warning['message']))}"
+                )
         else:
             lines.append("  - None")
         lines.append("")
@@ -669,13 +714,61 @@ def _render_mapping(lines: list[str], label: str, value: object) -> None:
     lines.append(f"- {label}:")
     if mapping:
         for key, item in mapping.items():
-            lines.append(f"  - `{key}`: {_display(item)}")
+            lines.append(f"  - {_markdown_code(key)}: {_display(item)}")
     else:
         lines.append("  - None")
 
 
 def _display(value: object) -> str:
     return "N/A" if value is None else str(value)
+
+
+def _markdown_text(value: str) -> str:
+    cleaned = _markdown_visible_text(value)
+    escaped_html = html.escape(cleaned, quote=False)
+    return "".join(
+        f"\\{character}" if character in _MARKDOWN_PUNCTUATION else character
+        for character in escaped_html
+    )
+
+
+def _markdown_code(value: str) -> str:
+    cleaned = html.escape(_markdown_visible_text(value), quote=False)
+    maximum_run = max(
+        (len(match.group(0)) for match in _BACKTICK_RUN.finditer(cleaned)),
+        default=0,
+    )
+    delimiter = "`" * (maximum_run + 1)
+    if cleaned.startswith(("`", " ")) or cleaned.endswith(("`", " ")):
+        cleaned = f" {cleaned} "
+    return f"{delimiter}{cleaned}{delimiter}"
+
+
+def _markdown_url(value: str) -> str:
+    encoded = quote(
+        _markdown_visible_text(value),
+        safe="/:?#[]@!$&'*+,;=%~-._",
+    )
+    return f"<{html.escape(encoded, quote=True)}>"
+
+
+def _markdown_visible_text(value: str) -> str:
+    result: list[str] = []
+    for character in value:
+        codepoint = ord(character)
+        if character == "\n":
+            result.append("\\n")
+        elif character == "\r":
+            result.append("\\r")
+        elif character == "\t":
+            result.append("\\t")
+        elif codepoint < 32 or codepoint == 127:
+            result.append(f"\\u{codepoint:04x}")
+        elif codepoint in {0x85, 0x2028, 0x2029}:
+            result.append(f"\\u{codepoint:04x}")
+        else:
+            result.append(character)
+    return "".join(result)
 
 
 def _require_owned_lock(lock: RunLock, run_id: str) -> None:
@@ -697,13 +790,15 @@ def _require_owned_lock(lock: RunLock, run_id: str) -> None:
         raise PersistenceError("RunLock ownership state is incomplete")
     try:
         current, current_identity = lock._read_existing(parent_descriptor)
+    except RuntimeError:
+        raise
     except Exception as error:
         raise PersistenceError("owned RunLock cannot be verified") from error
     if current != payload or current_identity[:2] != created_identity[:2]:
         raise PersistenceError("RunLock ownership changed before report persistence")
 
 
-def _open_report_directory(path: Path) -> int:
+def _open_report_directory(path: Path) -> _ReportDirectory:
     if ".." in path.parts:
         raise InputValidationError("report path must not traverse parent directories")
     try:
@@ -715,13 +810,18 @@ def _open_report_directory(path: Path) -> int:
             components = path.parts
     except OSError as error:
         raise PersistenceError("unable to open trusted report-path root") from error
+    report_descriptor: int | None = None
     try:
-        meaningful = tuple(component for component in components if component not in {"", "."})
-        for index, component in enumerate(meaningful):
+        meaningful = tuple(
+            component for component in components if component not in {"", "."}
+        )
+        if not meaningful:
+            raise InputValidationError("report path must name a child directory")
+        for component in meaningful[:-1]:
             next_descriptor = _open_report_child(
                 descriptor,
                 component,
-                require_owner=index == len(meaningful) - 1,
+                require_owner=False,
             )
             old_descriptor = descriptor
             try:
@@ -731,18 +831,37 @@ def _open_report_directory(path: Path) -> int:
                 descriptor = -1
                 raise PersistenceError("unable to close traversed report directory") from error
             descriptor = next_descriptor
-        _validate_directory(
-            os.fstat(descriptor),
+        report_name = meaningful[-1]
+        report_descriptor = _open_report_child(
+            descriptor,
+            report_name,
             require_owner=True,
-            exact_mode=None,
         )
-        return descriptor
+        opened = os.fstat(report_descriptor)
+        named = os.stat(
+            report_name,
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+        _validate_directory(opened, require_owner=True, exact_mode=None)
+        _validate_directory(named, require_owner=True, exact_mode=None)
+        if _inode(opened) != _inode(named):
+            raise PersistenceError("report directory binding changed during open")
+        return _ReportDirectory(
+            descriptor=report_descriptor,
+            parent_descriptor=descriptor,
+            name=report_name,
+            inode=_inode(opened),
+        )
     except Exception as error:
-        if descriptor >= 0:
-            _close_descriptor(descriptor)
+        if report_descriptor is not None:
+            _close_descriptor(report_descriptor)
+        _close_descriptor(descriptor)
         if isinstance(error, (InputValidationError, PersistenceError)):
             raise
-        raise PersistenceError("unable to securely traverse report path") from error
+        if isinstance(error, OSError):
+            raise PersistenceError("unable to securely traverse report path") from error
+        raise
 
 
 def _open_report_child(
@@ -821,6 +940,135 @@ def _validate_directory(
         raise PersistenceError("new report directory must use mode 0700")
     if require_owner and hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
         raise PersistenceError("report directory has an unexpected owner")
+    if require_owner and stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise PersistenceError("report directory must not be group/world-writable")
+
+
+def _validate_report_directory_binding(directory: _ReportDirectory) -> None:
+    try:
+        opened = os.fstat(directory.descriptor)
+        parent = os.fstat(directory.parent_descriptor)
+        named = os.stat(
+            directory.name,
+            dir_fd=directory.parent_descriptor,
+            follow_symlinks=False,
+        )
+        _validate_directory(parent, require_owner=False, exact_mode=None)
+        _validate_directory(opened, require_owner=True, exact_mode=None)
+        _validate_directory(named, require_owner=True, exact_mode=None)
+    except PersistenceError:
+        raise
+    except OSError as error:
+        raise PersistenceError("unable to validate report directory binding") from error
+    if _inode(opened) != directory.inode or _inode(named) != directory.inode:
+        raise PersistenceError("report directory name or identity changed")
+
+
+def _close_report_directory(directory: _ReportDirectory) -> None:
+    _close_descriptor(directory.descriptor)
+    _close_descriptor(directory.parent_descriptor)
+
+
+def _acquire_publication_gate(directory: _ReportDirectory) -> int:
+    _validate_report_directory_binding(directory)
+    flags = os.O_RDWR
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    created = False
+    try:
+        descriptor = os.open(
+            _PUBLICATION_GATE,
+            flags | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=directory.descriptor,
+        )
+    except OSError as error:
+        if error.errno != errno.EEXIST:
+            raise PersistenceError("unable to create report publication gate") from error
+        try:
+            descriptor = os.open(
+                _PUBLICATION_GATE,
+                flags,
+                dir_fd=directory.descriptor,
+            )
+        except OSError as open_error:
+            raise PersistenceError(
+                "unable to open report publication gate"
+            ) from open_error
+    else:
+        created = True
+    try:
+        opened = os.fstat(descriptor)
+        _validate_publication_gate(opened, exact_mode=not created)
+        named = os.stat(
+            _PUBLICATION_GATE,
+            dir_fd=directory.descriptor,
+            follow_symlinks=False,
+        )
+        _validate_publication_gate(named, exact_mode=not created)
+        if _inode(opened) != _inode(named):
+            raise PersistenceError("report publication gate changed during open")
+        if created:
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            os.fsync(directory.descriptor)
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                break
+            except InterruptedError:
+                continue
+            except OSError as error:
+                raise PersistenceError(
+                    "unable to lock report publication gate"
+                ) from error
+        locked = os.fstat(descriptor)
+        locked_named = os.stat(
+            _PUBLICATION_GATE,
+            dir_fd=directory.descriptor,
+            follow_symlinks=False,
+        )
+        _validate_publication_gate(locked, exact_mode=True)
+        _validate_publication_gate(locked_named, exact_mode=True)
+        if _inode(locked) != _inode(locked_named):
+            raise PersistenceError("report publication gate changed before lock")
+        _validate_report_directory_binding(directory)
+        return descriptor
+    except Exception:
+        _close_descriptor(descriptor)
+        raise
+
+
+def _validate_publication_gate(
+    metadata: os.stat_result,
+    *,
+    exact_mode: bool,
+) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise PersistenceError("report publication gate is not a regular file")
+    if metadata.st_nlink != 1:
+        raise PersistenceError("report publication gate must have exactly one link")
+    if metadata.st_size != 0:
+        raise PersistenceError("report publication gate must be empty")
+    if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+        raise PersistenceError("report publication gate has an unexpected owner")
+    mode = stat.S_IMODE(metadata.st_mode)
+    if exact_mode:
+        if mode != 0o600:
+            raise PersistenceError("report publication gate must use mode 0600")
+    elif mode & ~0o600:
+        raise PersistenceError("new report publication gate has unsafe permissions")
+
+
+def _release_publication_gate(descriptor: int) -> None:
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+    finally:
+        _close_descriptor(descriptor)
 
 
 def _persist_immutable_pair(
@@ -838,7 +1086,7 @@ def _persist_immutable_pair(
     json_stage = _create_staged_file(directory_descriptor, ".json.tmp", json_data)
     markdown_stage: _StagedFile | None = None
     published: list[tuple[str, tuple[int, int]]] = []
-    error: BaseException | None = None
+    completed = False
     try:
         markdown_stage = _create_staged_file(
             directory_descriptor,
@@ -862,33 +1110,38 @@ def _persist_immutable_pair(
             len(markdown_data),
         )
         os.fsync(directory_descriptor)
-    except BaseException as caught:
-        error = caught
-        expected_names = [(json_name, json_stage.inode)]
-        if markdown_stage is not None:
-            expected_names.append((markdown_name, markdown_stage.inode))
-        reconciliation_error = _reconcile_published_names(
-            directory_descriptor,
-            published,
-            expected_names,
-        )
-        rollback_error = _rollback_new_names(directory_descriptor, published)
-        if reconciliation_error is not None or rollback_error is not None:
-            error = reconciliation_error or rollback_error
+        completed = True
+    except OSError as error:
+        raise PersistenceError("unable to publish immutable report pair") from error
     finally:
+        active_error = sys.exc_info()[1]
+        recovery_error: PersistenceError | None = None
+        if not completed:
+            expected_names = [(json_name, json_stage.inode)]
+            if markdown_stage is not None:
+                expected_names.append((markdown_name, markdown_stage.inode))
+            recovery_error = _reconcile_published_names(
+                directory_descriptor,
+                published,
+                expected_names,
+            )
+            rollback_error = _rollback_names_and_sync(
+                directory_descriptor,
+                published,
+            )
+            recovery_error = recovery_error or rollback_error
         cleanup_errors = [_cleanup_staged(directory_descriptor, json_stage)]
         if markdown_stage is not None:
             cleanup_errors.append(_cleanup_staged(directory_descriptor, markdown_stage))
         for cleanup_error in cleanup_errors:
-            if cleanup_error is not None and error is None:
-                error = cleanup_error
+            recovery_error = recovery_error or cleanup_error
         _close_descriptor(json_stage.descriptor)
         if markdown_stage is not None:
             _close_descriptor(markdown_stage.descriptor)
-    if error is not None:
-        if isinstance(error, PersistenceError):
-            raise error
-        raise PersistenceError("unable to publish immutable report pair") from error
+        if recovery_error is not None and _may_override_with_domain_error(
+            active_error
+        ):
+            raise recovery_error
 
 
 def _publish_no_replace(
@@ -942,7 +1195,6 @@ def _update_latest_pair(
 ) -> None:
     json_stage = _create_staged_file(directory_descriptor, ".latest.json.tmp", json_data)
     markdown_stage: _StagedFile | None = None
-    error: BaseException | None = None
     try:
         markdown_stage = _create_staged_file(
             directory_descriptor,
@@ -965,20 +1217,19 @@ def _update_latest_pair(
                 json_data,
                 markdown_data,
             )
-    except BaseException as caught:
-        error = caught
     finally:
+        active_error = sys.exc_info()[1]
+        cleanup_failure: PersistenceError | None = None
         for stage in (json_stage, markdown_stage):
             if stage is None:
                 continue
             cleanup_error = _cleanup_staged(directory_descriptor, stage)
-            if cleanup_error is not None and error is None:
-                error = cleanup_error
+            cleanup_failure = cleanup_failure or cleanup_error
             _close_descriptor(stage.descriptor)
-    if error is not None:
-        if isinstance(error, PersistenceError):
-            raise error
-        raise PersistenceError("unable to update latest report pair") from error
+        if cleanup_failure is not None and _may_override_with_domain_error(
+            active_error
+        ):
+            raise cleanup_failure
 
 
 def _publish_new_latest(
@@ -994,6 +1245,7 @@ def _publish_new_latest(
     ):
         raise PersistenceError("latest report appeared during publication")
     published: list[tuple[str, tuple[int, int]]] = []
+    completed = False
     try:
         _publish_no_replace(directory_descriptor, json_stage.name, "latest.json")
         published.append(("latest.json", json_stage.inode))
@@ -1007,21 +1259,30 @@ def _publish_new_latest(
             len(markdown_data),
         )
         os.fsync(directory_descriptor)
-    except BaseException as error:
-        reconciliation_error = _reconcile_published_names(
-            directory_descriptor,
-            published,
-            (
-                ("latest.json", json_stage.inode),
-                ("latest.md", markdown_stage.inode),
-            ),
-        )
-        rollback_error = _rollback_new_names(directory_descriptor, published)
-        if reconciliation_error is not None:
-            raise reconciliation_error from error
-        if rollback_error is not None:
-            raise rollback_error from error
+        completed = True
+    except OSError as error:
         raise PersistenceError("unable to publish new latest report pair") from error
+    finally:
+        active_error = sys.exc_info()[1]
+        recovery_error: PersistenceError | None = None
+        if not completed:
+            recovery_error = _reconcile_published_names(
+                directory_descriptor,
+                published,
+                (
+                    ("latest.json", json_stage.inode),
+                    ("latest.md", markdown_stage.inode),
+                ),
+            )
+            rollback_error = _rollback_names_and_sync(
+                directory_descriptor,
+                published,
+            )
+            recovery_error = recovery_error or rollback_error
+        if recovery_error is not None and _may_override_with_domain_error(
+            active_error
+        ):
+            raise recovery_error
 
 
 def _replace_existing_latest(
@@ -1038,6 +1299,7 @@ def _replace_existing_latest(
     json_backup = _unused_name(directory_descriptor, ".latest-json-backup-")
     markdown_backup = _unused_name(directory_descriptor, ".latest-md-backup-")
     backups: list[tuple[str, tuple[int, int]]] = []
+    completed = False
     try:
         _link_named(directory_descriptor, "latest.json", json_backup)
         backups.append((json_backup, old_json_inode))
@@ -1061,34 +1323,47 @@ def _replace_existing_latest(
             len(markdown_data),
         )
         os.fsync(directory_descriptor)
-    except BaseException as error:
-        rollback_error = _restore_previous_latest(
-            directory_descriptor,
-            (
-                ("latest.json", json_stage.inode, old_json_inode, json_backup),
-                ("latest.md", markdown_stage.inode, old_markdown_inode, markdown_backup),
-            ),
-        )
-        cleanup_error = _rollback_new_names(directory_descriptor, backups)
-        try:
-            os.fsync(directory_descriptor)
-        except OSError as sync_error:
-            cleanup_error = cleanup_error or PersistenceError(
-                "unable to sync restored latest pair"
-            )
-            cleanup_error.__cause__ = sync_error
-        if rollback_error is not None:
-            raise rollback_error from error
-        if cleanup_error is not None:
-            raise cleanup_error from error
-        raise PersistenceError("unable to replace latest report pair") from error
-    cleanup_error = _rollback_new_names(directory_descriptor, backups)
-    if cleanup_error is not None:
-        raise cleanup_error
-    try:
-        os.fsync(directory_descriptor)
+        completed = True
     except OSError as error:
-        raise PersistenceError("unable to sync latest report publication") from error
+        raise PersistenceError("unable to replace latest report pair") from error
+    finally:
+        active_error = sys.exc_info()[1]
+        recovery_error: PersistenceError | None = None
+        if not completed:
+            recovery_error = _restore_previous_latest(
+                directory_descriptor,
+                (
+                    (
+                        "latest.json",
+                        json_stage.inode,
+                        old_json_inode,
+                        json_backup,
+                        len(old_json),
+                    ),
+                    (
+                        "latest.md",
+                        markdown_stage.inode,
+                        old_markdown_inode,
+                        markdown_backup,
+                        len(old_markdown),
+                    ),
+                ),
+            )
+        cleanup_error = (
+            _rollback_new_names(directory_descriptor, backups)
+            if recovery_error is None
+            else None
+        )
+        recovery_error = recovery_error or cleanup_error
+        sync_error = _fsync_directory_error(
+            directory_descriptor,
+            "unable to sync latest report publication",
+        )
+        recovery_error = recovery_error or sync_error
+        if recovery_error is not None and _may_override_with_domain_error(
+            active_error
+        ):
+            raise recovery_error
 
 
 def _replace_staged_latest(
@@ -1107,11 +1382,11 @@ def _replace_staged_latest(
 def _restore_previous_latest(
     directory_descriptor: int,
     entries: Sequence[
-        tuple[str, tuple[int, int], tuple[int, int], str]
+        tuple[str, tuple[int, int], tuple[int, int], str, int]
     ],
 ) -> PersistenceError | None:
     first_error: PersistenceError | None = None
-    for name, new_inode, old_inode, backup_name in entries:
+    for name, new_inode, old_inode, backup_name, old_size in entries:
         try:
             current = _optional_name_metadata(directory_descriptor, name)
             if current is not None:
@@ -1123,14 +1398,20 @@ def _restore_previous_latest(
                         "latest report name changed during rollback"
                     )
             if _optional_name_metadata(directory_descriptor, name) is None:
+                backup = _optional_name_metadata(
+                    directory_descriptor,
+                    backup_name,
+                )
+                if backup is None or _inode(backup) != old_inode:
+                    raise PersistenceError(
+                        "previous latest report backup is unavailable"
+                    )
                 _link_named(directory_descriptor, backup_name, name)
-            backup = _name_metadata(directory_descriptor, backup_name)
-            expected_size = backup.st_size
             _require_named_inode(
                 directory_descriptor,
                 name,
                 old_inode,
-                expected_size,
+                old_size,
                 expected_links=None,
             )
         except (OSError, PersistenceError) as error:
@@ -1158,7 +1439,11 @@ def _create_staged_file(
         descriptor = os.open(name, flags, 0o600, dir_fd=directory_descriptor)
     except OSError as error:
         raise PersistenceError("unable to create staged report") from error
+    stage: _StagedFile | None = None
+    completed = False
     try:
+        created = os.fstat(descriptor)
+        stage = _StagedFile(name, descriptor, _inode(created), 0)
         os.fchmod(descriptor, 0o600)
         created = os.fstat(descriptor)
         _validate_regular(created, expected_size=0, expected_links=1)
@@ -1171,14 +1456,23 @@ def _create_staged_file(
         _validate_regular(named, expected_size=len(data), expected_links=1)
         if _inode(written) != inode or _inode(named) != inode:
             raise PersistenceError("staged report changed during preparation")
+        completed = True
         return _StagedFile(name, descriptor, inode, len(data))
-    except Exception as error:
-        stage = _StagedFile(name, descriptor, _inode(os.fstat(descriptor)), 0)
-        _cleanup_staged(directory_descriptor, stage)
-        _close_descriptor(descriptor)
-        if isinstance(error, PersistenceError):
-            raise
+    except OSError as error:
         raise PersistenceError("unable to prepare staged report") from error
+    finally:
+        if not completed:
+            active_error = sys.exc_info()[1]
+            recovery_error = (
+                _cleanup_staged(directory_descriptor, stage)
+                if stage is not None
+                else None
+            )
+            _close_descriptor(descriptor)
+            if recovery_error is not None and _may_override_with_domain_error(
+                active_error
+            ):
+                raise recovery_error
 
 
 def _cleanup_staged(
@@ -1222,6 +1516,35 @@ def _rollback_new_names(
                     first_error = PersistenceError("unable to roll back report pair")
                     first_error.__cause__ = error
     return first_error
+
+
+def _rollback_names_and_sync(
+    directory_descriptor: int,
+    names: Sequence[tuple[str, tuple[int, int]]],
+) -> PersistenceError | None:
+    rollback_error = _rollback_new_names(directory_descriptor, names)
+    sync_error = _fsync_directory_error(
+        directory_descriptor,
+        "unable to sync rolled-back report pair",
+    )
+    return rollback_error or sync_error
+
+
+def _fsync_directory_error(
+    directory_descriptor: int,
+    message: str,
+) -> PersistenceError | None:
+    try:
+        os.fsync(directory_descriptor)
+    except OSError as error:
+        wrapped = PersistenceError(message)
+        wrapped.__cause__ = error
+        return wrapped
+    return None
+
+
+def _may_override_with_domain_error(error: object | None) -> bool:
+    return error is None or isinstance(error, (OSError, PersistenceError))
 
 
 def _reconcile_published_names(

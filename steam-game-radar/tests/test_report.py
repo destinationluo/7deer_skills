@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import stat
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from typing import Any
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -40,8 +42,59 @@ UTC = timezone.utc
 GENERATED_AT = "2026-08-24T03:00:30Z"
 RUN_A = "20260824T030000Z-a1b2c3d4"
 RUN_B = "20260824T040000Z-b1c2d3e4"
+RUN_C = "20260824T050000Z-c1d2e3f4"
 RUN_OLD = "20260824T020000Z-01020304"
 SAFE_TEMP_DIR = str(Path(tempfile.gettempdir()).resolve())
+
+
+def _file_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _concurrent_report_process(
+    root_text: str,
+    lock_name: str,
+    report: dict[str, object],
+    load_reached: Any,
+    release_load: Any,
+    pause_after_load: bool,
+    outcomes: Any,
+) -> None:
+    root = Path(root_text)
+    config = RadarConfig(report_dir=root / "reports")
+    run_id = report["run_id"]
+    lock = RunLock(
+        path=root / "state" / lock_name,
+        run_id=run_id,  # type: ignore[arg-type]
+        now=lambda: datetime(2026, 8, 24, 3, tzinfo=UTC),
+        hostname=lambda: "concurrent-report-worker",
+        pid_alive=lambda _pid: False,
+    )
+    real_load = report_module._load_latest_pair
+
+    def observed_load(directory_descriptor: int) -> object:
+        existing = real_load(directory_descriptor)
+        load_reached.set()
+        if pause_after_load and not release_load.wait(10):
+            raise RuntimeError("timed out pausing report publication")
+        return existing
+
+    try:
+        with mock.patch.object(
+            report_module,
+            "_load_latest_pair",
+            side_effect=observed_load,
+        ), lock:
+            persist_report(config, report, lock)
+        outcomes.put((lock_name, "ok"))
+    except Exception as error:
+        outcomes.put((lock_name, f"{type(error).__name__}:{error}"))
 
 
 class ReportTests(unittest.TestCase):
@@ -455,13 +508,103 @@ class ReportTests(unittest.TestCase):
 
         markdown = render_markdown(result)
 
-        self.assertLess(markdown.index("First & Best"), markdown.index("Second"))
+        self.assertLess(markdown.index("First &amp; Best"), markdown.index("Second"))
         self.assertLess(markdown.index("Second"), markdown.index("Future"))
         self.assertIn("90.0", markdown)
         self.assertIn("source-1", markdown)
         self.assertIn("steam_official", markdown)
         self.assertIn("2026-08-24T03:00:00Z", markdown)
         self.assertIn("Using fallback", markdown)
+
+        malicious_name = "Owned\n# injected <script>`break`\u2028# unicode-injected"
+        malicious_metric = "metric`\n## injected"
+        malicious_source = "source`\n# injected <b>"
+        malicious_value = "</code>\n# injected <script>"
+        malicious_content = "guide\n# injected <script>"
+        malicious_warning = "warning\n# injected <script>`"
+        malicious_url = "https://google.example/x)<script>"
+        base = self.candidate(final=True, confidence="B")
+        record = GameRecord(
+            schema_version=1,
+            appid=base.record.appid,
+            name=malicious_name,
+            release_status=base.record.release_status,
+            store_url=base.record.store_url,
+            metrics={
+                malicious_metric: self.observation(
+                    malicious_value,
+                    malicious_source,
+                )
+            },
+            source_extra={},
+        )
+        malicious = replace(
+            base,
+            record=record,
+            warnings=(WarningRecord("warn`\n# injected", malicious_warning, 10),),
+            evidence=(Evidence("google", malicious_url),),
+            recommended_content_types=(malicious_content,),
+        )
+        malicious_report = build_report(
+            RUN_A,
+            "final",
+            "official_plus_manual",
+            GENERATED_AT,
+            "fresh",
+            [malicious],
+            [],
+            [],
+            [WarningRecord("run`\n# injected", malicious_warning)],
+            [RejectedRow(1, "reject`\n# injected", malicious_warning)],
+        )
+        escaped = render_markdown(malicious_report)
+
+        self.assertNotIn("\n# injected", escaped)
+        self.assertNotIn("\n## injected", escaped)
+        self.assertNotIn("\u2028", escaped)
+        self.assertNotIn("<script>", escaped)
+        self.assertNotIn("<b>", escaped)
+        self.assertNotIn(malicious_url, escaped)
+        self.assertIn("%29%3Cscript%3E", escaped)
+        self.assertEqual(malicious_report["released"][0]["name"], malicious_name)
+        self.assertEqual(
+            malicious_report["released"][0]["observed_metrics"][malicious_metric]["value"],
+            malicious_value,
+        )
+        self.assertEqual(
+            malicious_report["released"][0]["recommended_content_types"],
+            [malicious_content],
+        )
+
+        surrogate_record = GameRecord(
+            schema_version=1,
+            appid=base.record.appid,
+            name="isolated-\ud800-surrogate",
+            release_status=base.record.release_status,
+            store_url=base.record.store_url,
+            metrics=base.record.metrics,
+            source_extra={},
+        )
+        surrogate_candidate = replace(base, record=surrogate_record)
+        with self.assertRaises(InputValidationError):
+            build_report(
+                RUN_A,
+                "final",
+                "official_plus_manual",
+                GENERATED_AT,
+                "fresh",
+                [surrogate_candidate],
+                [],
+                [],
+                [],
+                [],
+            )
+        surrogate_report = dict(malicious_report)
+        surrogate_item = dict(surrogate_report["released"][0])
+        surrogate_item["name"] = "isolated-\ud800-surrogate"
+        surrogate_report["released"] = [surrogate_item]
+        with self.assertRaises(InputValidationError):
+            render_markdown(surrogate_report)
 
     def test_should_publish_latest_is_monotonic_and_strict(self) -> None:
         preliminary = self.report(RUN_A)
@@ -501,11 +644,50 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(original_markdown.decode("utf-8"), render_markdown(report))
                 self.assertEqual(stat.S_IMODE(json_path.stat().st_mode), 0o600)
                 self.assertEqual(stat.S_IMODE(markdown_path.stat().st_mode), 0o600)
+                publication_gate = config.report_dir / ".steam-radar-report-publication.gate"
+                self.assertTrue(publication_gate.exists())
+                self.assertEqual(stat.S_IMODE(publication_gate.stat().st_mode), 0o600)
+                self.assertEqual(publication_gate.stat().st_nlink, 1)
                 with self.assertRaises(PersistenceError):
                     persist_report(config, report, lock)
 
             self.assertEqual(json_path.read_bytes(), original_json)
             self.assertEqual(markdown_path.read_bytes(), original_markdown)
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            config = RadarConfig(report_dir=root / "reports")
+            report = self.report()
+            real_persist_pair = report_module._persist_immutable_pair
+            displaced = root / "reports-displaced"
+
+            def replace_report_directory(
+                directory_descriptor: int,
+                json_name: str,
+                json_data: bytes,
+                markdown_name: str,
+                markdown_data: bytes,
+            ) -> None:
+                real_persist_pair(
+                    directory_descriptor,
+                    json_name,
+                    json_data,
+                    markdown_name,
+                    markdown_data,
+                )
+                config.report_dir.rename(displaced)
+                config.report_dir.mkdir(mode=0o700)
+                config.report_dir.chmod(0o700)
+
+            with self.lock(root, RUN_A) as lock, mock.patch.object(
+                report_module,
+                "_persist_immutable_pair",
+                side_effect=replace_report_directory,
+            ), self.assertRaises(PersistenceError):
+                persist_report(config, report, lock)
+            self.assertEqual(list(config.report_dir.iterdir()), [])
+            self.assertTrue((displaced / f"{RUN_A}.preliminary.json").exists())
+            self.assertTrue((displaced / f"{RUN_A}.preliminary.md").exists())
 
     def test_same_run_preliminary_to_final_advances_latest_pair(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
@@ -555,6 +737,75 @@ class ReportTests(unittest.TestCase):
             self.assertTrue((config.report_dir / f"{RUN_OLD}.final.json").exists())
             self.assertTrue((config.report_dir / f"{RUN_OLD}.final.md").exists())
 
+        if "fork" not in multiprocessing.get_all_start_methods():
+            self.skipTest("requires multiprocessing fork and fcntl")
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            older = self.report(
+                RUN_OLD,
+                generated_at="2026-08-24T02:00:30Z",
+            )
+            newer = self.report(
+                RUN_B,
+                generated_at="2026-08-24T04:00:30Z",
+            )
+            context = multiprocessing.get_context("fork")
+            older_loaded = context.Event()
+            newer_loaded = context.Event()
+            release_older = context.Event()
+            no_pause = context.Event()
+            outcomes = context.Queue()
+            processes = [
+                context.Process(
+                    target=_concurrent_report_process,
+                    args=(
+                        str(root),
+                        "older.lock",
+                        older,
+                        older_loaded,
+                        release_older,
+                        True,
+                        outcomes,
+                    ),
+                ),
+                context.Process(
+                    target=_concurrent_report_process,
+                    args=(
+                        str(root),
+                        "newer.lock",
+                        newer,
+                        newer_loaded,
+                        no_pause,
+                        False,
+                        outcomes,
+                    ),
+                ),
+            ]
+            blocked_before_latest_load = False
+            try:
+                processes[0].start()
+                self.assertTrue(older_loaded.wait(5))
+                processes[1].start()
+                blocked_before_latest_load = not newer_loaded.wait(0.75)
+            finally:
+                release_older.set()
+                for process in processes:
+                    process.join(timeout=10)
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(timeout=5)
+            observed_outcomes = sorted(outcomes.get(timeout=2) for _ in range(2))
+            outcomes.close()
+            outcomes.join_thread()
+            self.assertTrue(blocked_before_latest_load)
+            self.assertEqual(
+                observed_outcomes,
+                [("newer.lock", "ok"), ("older.lock", "ok")],
+            )
+            self.assertTrue(all(process.exitcode == 0 for process in processes))
+            latest = json.loads((root / "reports/latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(latest["run_id"], RUN_B)
+
     def test_latest_pair_failure_restores_previous_pair_and_keeps_immutable_pair(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             root = Path(directory)
@@ -588,6 +839,84 @@ class ReportTests(unittest.TestCase):
             self.assertTrue((config.report_dir / f"{RUN_B}.preliminary.json").exists())
             self.assertTrue((config.report_dir / f"{RUN_B}.preliminary.md").exists())
 
+            third = self.report(RUN_C, generated_at="2026-08-24T05:00:30Z")
+
+            def raise_runtime_after_json(
+                directory_descriptor: int,
+                source_name: str,
+                destination_name: str,
+            ) -> None:
+                if destination_name == "latest.md":
+                    raise RuntimeError("unexpected publisher bug")
+                real_replace(directory_descriptor, source_name, destination_name)
+
+            with self.lock(root, RUN_C) as lock, mock.patch.object(
+                report_module,
+                "_replace_staged_latest",
+                side_effect=raise_runtime_after_json,
+            ), self.assertRaisesRegex(RuntimeError, "publisher bug"):
+                persist_report(config, third, lock)
+            self.assertEqual((config.report_dir / "latest.json").read_bytes(), old_json)
+            self.assertEqual((config.report_dir / "latest.md").read_bytes(), old_markdown)
+            self.assertTrue((config.report_dir / f"{RUN_C}.preliminary.json").exists())
+            self.assertTrue((config.report_dir / f"{RUN_C}.preliminary.md").exists())
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            config = RadarConfig(report_dir=root / "reports")
+            report = self.report()
+            real_publish = report_module._publish_no_replace
+            real_remove = report_module._remove_expected_name
+            real_fsync = os.fsync
+            rolled_back_latest = False
+            rollback_directory_synced = False
+
+            def fail_first_latest_markdown(
+                directory_descriptor: int,
+                source_name: str,
+                destination_name: str,
+            ) -> None:
+                if destination_name == "latest.md":
+                    raise OSError("first latest markdown failed")
+                real_publish(directory_descriptor, source_name, destination_name)
+
+            def observe_latest_rollback(
+                directory_descriptor: int,
+                name: str,
+                expected_inode: tuple[int, int],
+            ) -> None:
+                nonlocal rolled_back_latest
+                real_remove(directory_descriptor, name, expected_inode)
+                if name == "latest.json":
+                    rolled_back_latest = True
+
+            def fail_latest_rollback_sync(descriptor: int) -> None:
+                nonlocal rollback_directory_synced
+                if rolled_back_latest and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    rollback_directory_synced = True
+                    raise OSError("rollback directory sync failed")
+                real_fsync(descriptor)
+
+            with self.lock(root, RUN_A) as lock, mock.patch.object(
+                report_module,
+                "_publish_no_replace",
+                side_effect=fail_first_latest_markdown,
+            ), mock.patch.object(
+                report_module,
+                "_remove_expected_name",
+                side_effect=observe_latest_rollback,
+            ), mock.patch.object(
+                report_module.os,
+                "fsync",
+                side_effect=fail_latest_rollback_sync,
+            ), self.assertRaises(PersistenceError):
+                persist_report(config, report, lock)
+            self.assertTrue(rollback_directory_synced)
+            self.assertFalse((config.report_dir / "latest.json").exists())
+            self.assertFalse((config.report_dir / "latest.md").exists())
+            self.assertTrue((config.report_dir / f"{RUN_A}.preliminary.json").exists())
+            self.assertTrue((config.report_dir / f"{RUN_A}.preliminary.md").exists())
+
     def test_immutable_pair_failure_rolls_back_only_new_first_file(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             root = Path(directory)
@@ -613,6 +942,76 @@ class ReportTests(unittest.TestCase):
 
             self.assertFalse((config.report_dir / f"{RUN_A}.preliminary.json").exists())
             self.assertFalse((config.report_dir / f"{RUN_A}.preliminary.md").exists())
+
+            for injected in (
+                RuntimeError("unexpected immutable bug"),
+                KeyboardInterrupt(),
+                SystemExit(17),
+            ):
+                def raise_non_domain(
+                    directory_descriptor: int,
+                    source_name: str,
+                    destination_name: str,
+                    *,
+                    error: BaseException = injected,
+                ) -> None:
+                    if destination_name.endswith(".md"):
+                        raise error
+                    real_publish(directory_descriptor, source_name, destination_name)
+
+                with self.subTest(exception=type(injected).__name__), self.lock(
+                    root,
+                    RUN_A,
+                ) as lock, mock.patch.object(
+                    report_module,
+                    "_publish_no_replace",
+                    side_effect=raise_non_domain,
+                ), self.assertRaises(type(injected)):
+                    persist_report(config, report, lock)
+                self.assertFalse(
+                    (config.report_dir / f"{RUN_A}.preliminary.json").exists()
+                )
+                self.assertFalse(
+                    (config.report_dir / f"{RUN_A}.preliminary.md").exists()
+                )
+
+            real_remove = report_module._remove_expected_name
+            real_fsync = os.fsync
+            rolled_back_immutable = False
+            rollback_directory_synced = False
+
+            def observe_immutable_rollback(
+                directory_descriptor: int,
+                name: str,
+                expected_inode: tuple[int, int],
+            ) -> None:
+                nonlocal rolled_back_immutable
+                real_remove(directory_descriptor, name, expected_inode)
+                if name == f"{RUN_A}.preliminary.json":
+                    rolled_back_immutable = True
+
+            def fail_immutable_rollback_sync(descriptor: int) -> None:
+                nonlocal rollback_directory_synced
+                if rolled_back_immutable and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    rollback_directory_synced = True
+                    raise OSError("immutable rollback sync failed")
+                real_fsync(descriptor)
+
+            with self.lock(root, RUN_A) as lock, mock.patch.object(
+                report_module,
+                "_publish_no_replace",
+                side_effect=fail_markdown,
+            ), mock.patch.object(
+                report_module,
+                "_remove_expected_name",
+                side_effect=observe_immutable_rollback,
+            ), mock.patch.object(
+                report_module.os,
+                "fsync",
+                side_effect=fail_immutable_rollback_sync,
+            ), self.assertRaises(PersistenceError):
+                persist_report(config, report, lock)
+            self.assertTrue(rollback_directory_synced)
             self.assertFalse((config.report_dir / "latest.json").exists())
             self.assertFalse((config.report_dir / "latest.md").exists())
 
@@ -695,6 +1094,50 @@ class ReportTests(unittest.TestCase):
             latest_markdown.chmod(0o600)
             with self.lock(root, RUN_A) as lock, self.assertRaises(PersistenceError):
                 persist_report(config, report, lock)
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            report_dir = root / "reports"
+            report_dir.mkdir(mode=0o700)
+            report_dir.chmod(0o700)
+            config = RadarConfig(report_dir=report_dir)
+            report = self.report()
+            victim = root / "outside-gate-victim"
+            victim.write_bytes(b"")
+            victim.chmod(0o600)
+            gate = report_dir / ".steam-radar-report-publication.gate"
+            os.link(victim, gate)
+            before = victim.stat()
+            with self.lock(root, RUN_A) as lock, self.assertRaises(PersistenceError):
+                persist_report(config, report, lock)
+            after = victim.stat()
+            self.assertEqual(_file_fingerprint(after), _file_fingerprint(before))
+            self.assertEqual(after.st_nlink, 2)
+            self.assertEqual(victim.read_bytes(), b"")
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            report_dir = root / "reports"
+            report_dir.mkdir(mode=0o700)
+            report_dir.chmod(0o700)
+            config = RadarConfig(report_dir=report_dir)
+            report = self.report()
+            gate = report_dir / ".steam-radar-report-publication.gate"
+            gate.write_bytes(b"")
+            gate.chmod(0o640)
+            with self.lock(root, RUN_A) as lock, self.assertRaises(PersistenceError):
+                persist_report(config, report, lock)
+            self.assertEqual(stat.S_IMODE(gate.stat().st_mode), 0o640)
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            report_dir = root / "world-writable-reports"
+            report_dir.mkdir(mode=0o700)
+            report_dir.chmod(0o777)
+            config = RadarConfig(report_dir=report_dir)
+            with self.lock(root, RUN_A) as lock, self.assertRaises(PersistenceError):
+                persist_report(config, self.report(), lock)
+            self.assertEqual(stat.S_IMODE(report_dir.stat().st_mode), 0o777)
 
 
 if __name__ == "__main__":
