@@ -30,6 +30,8 @@ class LiveOfficialProviderTests(unittest.TestCase):
             config,
             released_candidate_limit=2,
             unreleased_candidate_limit=2,
+            max_retries=0,
+            request_timeout_seconds=5.0,
         )
         observed_at = (
             datetime.now(timezone.utc)
@@ -39,4 +41,7 @@ class LiveOfficialProviderTests(unittest.TestCase):
 
         result = collect_official(JsonHttpClient(config), config, observed_at)
 
-        self.assertTrue(any(result.capabilities.values()))
+        self.assertTrue(
+            result.capabilities["most_played"]
+            or result.capabilities["featured_categories"]
+        )
