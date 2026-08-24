@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 import json
 import math
 import re
+from types import MappingProxyType
 from typing import Literal, Mapping, Sequence, cast
 
 from .config import RadarConfig
@@ -37,6 +38,7 @@ _UTC_TIMESTAMP = re.compile(
     r"[0-9]{2}(?:\.[0-9]{1,6})?Z$",
     re.ASCII,
 )
+_MAPPING_PROXY_TYPE = type(MappingProxyType({}))
 _STALE_WARNING = WarningRecord(
     code="steam_official_snapshot_stale",
     message="Official Steam snapshot is older than 36 hours.",
@@ -44,6 +46,9 @@ _STALE_WARNING = WarningRecord(
 _RELEASE_CONFLICT_CODE = "steam_release_status_conflict"
 _RELEASE_CONFLICT_MESSAGE = (
     "release status conflicts with the available release date"
+)
+_OFFICIAL_RELEASE_DATE_CONFLICT_MESSAGE = (
+    "Release date conflicts with official Steam release status."
 )
 
 
@@ -114,11 +119,11 @@ def merge_import_with_official(
     official_age = (
         current_time - cast(datetime, snapshot_time)
     ).total_seconds() / 3_600
-    warnings: tuple[WarningRecord, ...] = ()
+    warnings: list[WarningRecord] = []
     data_status: DataStatus = "fresh"
     if official_age > config.stale_warning_hours:
         data_status = "stale"
-        warnings = (_STALE_WARNING,)
+        warnings.append(_STALE_WARNING)
 
     official_by_appid = {record.appid: record for record in official_records}
     manual_by_appid = {record.appid: record for record in manual_records}
@@ -132,9 +137,23 @@ def merge_import_with_official(
             if merged is None:
                 rejected.append(_release_rejection(manual_rows[appid], appid))
             else:
-                records.append(merged)
+                normalized, warning = _normalize_official_release_date(
+                    merged,
+                    official,
+                    current_time.date(),
+                )
+                records.append(normalized)
+                if warning is not None:
+                    warnings.append(warning)
         elif official is not None:
-            records.append(official)
+            normalized, warning = _normalize_official_release_date(
+                official,
+                official,
+                current_time.date(),
+            )
+            records.append(normalized)
+            if warning is not None:
+                warnings.append(warning)
         elif manual is not None:
             normalized = _normalize_manual_release(manual, current_time.date())
             if normalized is None:
@@ -145,7 +164,7 @@ def merge_import_with_official(
     return MergeResult(
         records=records,
         rejected_rows=sorted(rejected, key=lambda row: row.row_number),
-        warnings=warnings,
+        warnings=sorted(warnings, key=_warning_sort_key),
         mode="official_plus_manual",
         data_status=data_status,
     )
@@ -161,7 +180,9 @@ def _manual_baseline(
     for record in records:
         normalized = _normalize_manual_release(record, today)
         if normalized is None:
-            rejected.append(_release_rejection(row_numbers[record.appid], record.appid))
+            rejected.append(
+                _release_rejection(row_numbers[record.appid], record.appid)
+            )
         else:
             accepted.append(normalized)
     return MergeResult(
@@ -235,9 +256,12 @@ def _validate_snapshot(
     if not isinstance(run_id, str) or _RUN_ID.fullmatch(run_id) is None:
         raise InputValidationError(f"{label} has an invalid run ID")
     observed_at = _parse_utc(canonical["observed_at"], f"{label} observed_at")
-    expected_time = datetime.strptime(run_id[:16], "%Y%m%dT%H%M%SZ").replace(
-        tzinfo=timezone.utc
-    )
+    try:
+        expected_time = datetime.strptime(
+            run_id[:16], "%Y%m%dT%H%M%SZ"
+        ).replace(tzinfo=timezone.utc)
+    except ValueError as error:
+        raise InputValidationError(f"{label} has an invalid run ID") from error
     if observed_at != expected_time:
         raise InputValidationError(f"{label} time does not match its run ID")
     if not isinstance(canonical["metadata"], Mapping):
@@ -257,6 +281,14 @@ def _validate_snapshot(
             raise InputValidationError(f"{label} nesting is too deep") from error
         if record.appid in appids:
             raise InputValidationError(f"{label} contains duplicate AppIDs")
+        for observation in record.metrics.values():
+            if _parse_utc(
+                observation.observed_at,
+                f"{label} metric observed_at",
+            ) > observed_at:
+                raise InputValidationError(
+                    f"{label} metric observation is later than its snapshot"
+                )
         appids.add(record.appid)
         records.append(record)
     return observed_at, tuple(records)
@@ -315,6 +347,51 @@ def _normalize_manual_release(record: GameRecord, today: date) -> GameRecord | N
     )
 
 
+def _normalize_official_release_date(
+    record: GameRecord,
+    authoritative: GameRecord,
+    today: date,
+) -> tuple[GameRecord, WarningRecord | None]:
+    """Prevent an authoritative official status/date contradiction."""
+
+    if not _has_official_appdetails(authoritative):
+        return record, None
+    release_date = record.metrics.get("release_date")
+    if (
+        release_date is None
+        or authoritative.release_status == "unknown"
+        or _release_date_status(release_date, today)
+        == authoritative.release_status
+    ):
+        return record, None
+
+    metrics = dict(record.metrics)
+    official_date = authoritative.metrics.get("release_date")
+    if (
+        official_date is not None
+        and _release_date_status(official_date, today)
+        == authoritative.release_status
+    ):
+        metrics["release_date"] = official_date
+    else:
+        metrics.pop("release_date", None)
+    normalized = GameRecord(
+        schema_version=record.schema_version,
+        appid=record.appid,
+        name=record.name,
+        release_status=record.release_status,
+        store_url=record.store_url,
+        metrics=metrics,
+        source_extra=cast(Mapping[str, object], record.to_dict()["source_extra"]),
+    )
+    warning = WarningRecord(
+        code="steam_release_date_conflicts_with_official_status",
+        message=_OFFICIAL_RELEASE_DATE_CONFLICT_MESSAGE,
+        appid=record.appid,
+    )
+    return normalized, warning
+
+
 def _resolve_release_status(
     statuses: Sequence[str],
     release_date: MetricObservation | None,
@@ -325,19 +402,26 @@ def _resolve_release_status(
         return None
     date_status: str | None = None
     if release_date is not None:
-        if not isinstance(release_date.value, str):
-            return None
-        try:
-            parsed = date.fromisoformat(release_date.value)
-        except ValueError:
-            return None
-        date_status = "released" if parsed <= today else "unreleased"
+        date_status = _release_date_status(release_date, today)
 
     if concrete == {"released"}:
         return "released" if date_status == "released" else None
     if concrete == {"unreleased"}:
         return None if date_status == "released" else "unreleased"
     return date_status or "unknown"
+
+
+def _release_date_status(
+    observation: MetricObservation,
+    today: date,
+) -> str | None:
+    if not isinstance(observation.value, str):
+        return None
+    try:
+        parsed = date.fromisoformat(observation.value)
+    except ValueError:
+        return None
+    return "released" if parsed <= today else "unreleased"
 
 
 def _merge_metrics(
@@ -397,6 +481,14 @@ def _release_rejection(row_number: int, appid: int) -> RejectedRow:
     )
 
 
+def _warning_sort_key(warning: WarningRecord) -> tuple[str, int, str]:
+    return (
+        warning.code,
+        warning.appid if warning.appid is not None else 0,
+        warning.message,
+    )
+
+
 def _aware_utc(value: datetime, name: str) -> datetime:
     if (
         not isinstance(value, datetime)
@@ -431,17 +523,17 @@ def _thaw_snapshot_value(
         raise InputValidationError("snapshot nesting is too deep")
     if active is None:
         active = set()
-    if value is None or isinstance(value, (str, bool)):
+    if value is None or type(value) in {str, bool}:
         return value
-    if isinstance(value, int):
+    if type(value) is int:
         if value < MIN_JSON_SAFE_INTEGER or value > MAX_JSON_SAFE_INTEGER:
             raise InputValidationError("snapshot integer is outside the JSON-safe range")
         return value
-    if isinstance(value, float):
+    if type(value) is float:
         if not math.isfinite(value):
             raise InputValidationError("snapshot numbers must be finite")
         return value
-    if isinstance(value, Mapping):
+    if type(value) is dict or type(value) is _MAPPING_PROXY_TYPE:
         identity = id(value)
         if identity in active:
             raise InputValidationError("snapshot must not contain cycles")
@@ -459,7 +551,7 @@ def _thaw_snapshot_value(
             return thawed
         finally:
             active.remove(identity)
-    if isinstance(value, (list, tuple)):
+    if type(value) is list or type(value) is tuple:
         identity = id(value)
         if identity in active:
             raise InputValidationError("snapshot must not contain cycles")

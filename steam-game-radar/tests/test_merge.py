@@ -36,6 +36,14 @@ def deep_freeze(value: object) -> object:
     return value
 
 
+class CustomMapping(dict[str, object]):
+    pass
+
+
+class CustomSequence(list[object]):
+    pass
+
+
 class MergeTests(unittest.TestCase):
     def record(
         self,
@@ -113,9 +121,18 @@ class MergeTests(unittest.TestCase):
         eligible = merge_import_with_official(
             [manual], self.snapshot(official_time, [official]), NOW, RadarConfig()
         )
+        expired_time = official_time - timedelta(seconds=1)
+        expired_official = self.record(
+            10,
+            release_status="released",
+            observed_at=expired_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            source_kind="steam_official",
+            metrics={"release_date": ("2026-01-01", "steam_appdetails")},
+            appdetails=True,
+        )
         expired = merge_import_with_official(
             [manual],
-            self.snapshot(official_time - timedelta(seconds=1), [official]),
+            self.snapshot(expired_time, [expired_official]),
             NOW,
             RadarConfig(),
         )
@@ -146,6 +163,8 @@ class MergeTests(unittest.TestCase):
             {"bad": float("nan")},
             {"bad": float("inf")},
             {"bad": MAX_JSON_SAFE_INTEGER + 1},
+            {"bad": CustomMapping({"nested": True})},
+            {"bad": CustomSequence([True])},
             cycle,
             {"bad": too_deep},
         )
@@ -158,6 +177,14 @@ class MergeTests(unittest.TestCase):
                 merge_import_with_official(
                     [manual], invalid, NOW, RadarConfig()
                 )
+
+        invalid_calendar = dict(plain_snapshot)
+        invalid_calendar["run_id"] = "20260230T120000Z-1234abcd"
+        invalid_calendar["observed_at"] = "2026-02-28T12:00:00Z"
+        with self.assertRaises(InputValidationError):
+            merge_import_with_official(
+                [manual], invalid_calendar, NOW, RadarConfig()
+            )
 
     def test_newer_metric_observation_wins(self) -> None:
         official = self.record(
@@ -238,6 +265,41 @@ class MergeTests(unittest.TestCase):
 
         self.assertEqual(result.records[0].release_status, "released")
         self.assertEqual(result.rejected_rows, ())
+        self.assertEqual(
+            result.records[0].metrics["release_date"].value,
+            "2026-08-01",
+        )
+        self.assertEqual(
+            [warning.code for warning in result.warnings],
+            ["steam_release_date_conflicts_with_official_status"],
+        )
+        self.assertEqual(result.warnings[0].appid, 50)
+
+        stale_time = NOW - timedelta(hours=37)
+        official_only = self.record(
+            51,
+            release_status="released",
+            observed_at=stale_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            source_kind="steam_official",
+            metrics={"release_date": ("2026-09-01", "steam_appdetails")},
+            appdetails=True,
+        )
+        official_only_result = merge_import_with_official(
+            [],
+            self.snapshot(stale_time, [official_only]),
+            NOW,
+            RadarConfig(),
+        )
+        self.assertEqual(official_only_result.records[0].release_status, "released")
+        self.assertNotIn("release_date", official_only_result.records[0].metrics)
+        self.assertEqual(
+            [warning.code for warning in official_only_result.warnings],
+            [
+                "steam_official_snapshot_stale",
+                "steam_release_date_conflicts_with_official_status",
+            ],
+        )
+        self.assertEqual(official_only_result.warnings[1].appid, 51)
 
     def test_manual_released_requires_a_non_future_release_date(self) -> None:
         cases = (
@@ -296,9 +358,17 @@ class MergeTests(unittest.TestCase):
         exact = merge_import_with_official(
             [], self.snapshot(NOW - timedelta(hours=36), [official]), NOW, RadarConfig()
         )
+        older_time = NOW - timedelta(hours=36, seconds=1)
+        older_official = self.record(
+            80,
+            release_status="released",
+            observed_at=older_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            source_kind="steam_official",
+            appdetails=True,
+        )
         older = merge_import_with_official(
             [],
-            self.snapshot(NOW - timedelta(hours=36, seconds=1), [official]),
+            self.snapshot(older_time, [older_official]),
             NOW,
             RadarConfig(),
         )

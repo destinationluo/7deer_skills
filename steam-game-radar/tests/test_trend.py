@@ -64,11 +64,13 @@ class TrendTests(unittest.TestCase):
         records: list[GameRecord],
         *,
         frozen: bool = True,
+        observed_at: str = "2026-08-23T12:00:00Z",
     ) -> Mapping[str, object]:
+        stamp = observed_at.replace("-", "").replace(":", "")
         snapshot = {
             "schema_version": 1,
-            "run_id": "20260823T120000Z-1234abcd",
-            "observed_at": "2026-08-23T12:00:00Z",
+            "run_id": f"{stamp}-1234abcd",
+            "observed_at": observed_at,
             "records": [record.to_dict() for record in records],
             "metadata": {},
         }
@@ -91,8 +93,13 @@ class TrendTests(unittest.TestCase):
             10,
             {"peak_players": (100, "steam_current_players", "2026-08-23T12:00:00Z")},
         )
+        wrong_kind = self.record(
+            10,
+            {"current_players": (100, "steam_current_players", "2026-08-23T12:00:00Z")},
+            source_kind="steamdb_manual_import",
+        )
 
-        for historical in (wrong_source, wrong_name):
+        for historical in (wrong_source, wrong_name, wrong_kind):
             with self.subTest(metrics=tuple(historical.metrics)):
                 candidate = analyze_trends(
                     [current], self.snapshot([historical]), None
@@ -122,6 +129,40 @@ class TrendTests(unittest.TestCase):
             manual_candidate.deltas["current_players_1d_percent"],
             50.0,
         )
+
+        equal_time = self.record(
+            10,
+            {"current_players": (100, "steam_current_players", "2026-08-24T12:00:00Z")},
+        )
+        future_time = self.record(
+            10,
+            {"current_players": (100, "steam_current_players", "2026-08-25T12:00:00Z")},
+        )
+        for historical, observed_at in (
+            (equal_time, "2026-08-24T12:00:00Z"),
+            (future_time, "2026-08-25T12:00:00Z"),
+        ):
+            with self.subTest(history_time=observed_at):
+                candidate = analyze_trends(
+                    [current],
+                    self.snapshot([historical], observed_at=observed_at),
+                    None,
+                )[0]
+                self.assertEqual(dict(candidate.deltas), {})
+
+        after_envelope = self.record(
+            10,
+            {"current_players": (100, "steam_current_players", "2026-08-24T12:00:00Z")},
+        )
+        with self.assertRaises(InputValidationError):
+            analyze_trends(
+                [current],
+                self.snapshot(
+                    [after_envelope],
+                    observed_at="2026-08-23T12:00:00Z",
+                ),
+                None,
+            )
 
         cycle: dict[str, object] = {}
         cycle["self"] = cycle
@@ -234,6 +275,7 @@ class TrendTests(unittest.TestCase):
         cases = (
             ({"most_played_rank_7d_change": 11.0, "most_played_rank_1d_change": 8.0}, 11.0),
             ({"most_played_rank_1d_change": 8.0}, 8.0),
+            ({"not_a_rank_7d_change": 99.0}, 7.0),
             ({}, 7.0),
         )
         for deltas, expected in cases:
@@ -245,6 +287,32 @@ class TrendTests(unittest.TestCase):
                     warnings=(),
                 )
                 self.assertEqual(select_rank_improvement(candidate), expected)
+
+        mismatched_time = self.record(
+            51,
+            {
+                "most_played_rank": (
+                    20,
+                    "steam_most_played_rank",
+                    "2026-08-24T12:00:00Z",
+                ),
+                "previous_rank": (
+                    27,
+                    "steam_previous_rank",
+                    "2026-08-24T11:59:59Z",
+                ),
+            },
+        )
+        self.assertIsNone(
+            select_rank_improvement(
+                AnalyzedCandidate(
+                    record=mismatched_time,
+                    deltas={},
+                    newly_observed=False,
+                    warnings=(),
+                )
+            )
+        )
 
 
 if __name__ == "__main__":

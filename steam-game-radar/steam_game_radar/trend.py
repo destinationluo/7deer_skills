@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import math
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
 from .errors import InputValidationError
-from .merge import _validate_snapshot
+from .merge import _parse_utc, _validate_snapshot
 from .schemas import GameRecord, MetricObservation, WarningRecord
 
 
@@ -57,13 +58,27 @@ def analyze_trends(
     """Calculate 1d/7d deltas only for exact metric/source identities."""
 
     current_records = _current_records(current)
-    one_day = _historical_records(one_day_snapshot, "one-day")
-    seven_day = _historical_records(seven_day_snapshot, "seven-day")
+    one_day_time, one_day = _historical_records(one_day_snapshot, "one-day")
+    seven_day_time, seven_day = _historical_records(
+        seven_day_snapshot, "seven-day"
+    )
     candidates: list[AnalyzedCandidate] = []
     for record in sorted(current_records, key=lambda value: value.appid):
         deltas: dict[str, float] = {}
-        _add_window_deltas(record, one_day.get(record.appid), "1d", deltas)
-        _add_window_deltas(record, seven_day.get(record.appid), "7d", deltas)
+        _add_window_deltas(
+            record,
+            one_day.get(record.appid),
+            one_day_time,
+            "1d",
+            deltas,
+        )
+        _add_window_deltas(
+            record,
+            seven_day.get(record.appid),
+            seven_day_time,
+            "7d",
+            deltas,
+        )
         candidates.append(
             AnalyzedCandidate(
                 record=record,
@@ -83,11 +98,12 @@ def select_rank_improvement(candidate: AnalyzedCandidate) -> float | None:
     if not isinstance(candidate, AnalyzedCandidate):
         raise InputValidationError("candidate must be an AnalyzedCandidate")
     for window in ("7d", "1d"):
-        suffix = f"rank_{window}_change"
         values = [
-            value
-            for name, value in candidate.deltas.items()
-            if name.endswith(suffix) and not name.startswith("previous_rank_")
+            candidate.deltas[key]
+            for metric_name in sorted(candidate.record.metrics)
+            if metric_name != "previous_rank" and _is_rank_metric(metric_name)
+            for key in (f"{metric_name}_{window}_change",)
+            if key in candidate.deltas
         ]
         if values:
             return max(values)
@@ -101,6 +117,8 @@ def select_rank_improvement(candidate: AnalyzedCandidate) -> float | None:
         or previous_rank.source_id != _PREVIOUS_RANK_SOURCE
         or current_rank.source_kind != "steam_official"
         or previous_rank.source_kind != "steam_official"
+        or _parse_utc(current_rank.observed_at, "current rank observed_at")
+        != _parse_utc(previous_rank.observed_at, "previous rank observed_at")
     ):
         return None
     current_value = _numeric(current_rank.value)
@@ -128,22 +146,26 @@ def _current_records(current: Sequence[GameRecord]) -> tuple[GameRecord, ...]:
 def _historical_records(
     snapshot: Mapping[str, object] | None,
     label: str,
-) -> dict[int, GameRecord]:
+) -> tuple[datetime | None, dict[int, GameRecord]]:
     if snapshot is None:
-        return {}
+        return None, {}
     if not isinstance(snapshot, Mapping):
         raise InputValidationError(f"{label} snapshot must be a mapping")
-    _, records = _validate_snapshot(snapshot, label=f"{label} snapshot")
-    return {record.appid: record for record in records}
+    observed_at, records = _validate_snapshot(
+        snapshot,
+        label=f"{label} snapshot",
+    )
+    return observed_at, {record.appid: record for record in records}
 
 
 def _add_window_deltas(
     current: GameRecord,
     historical: GameRecord | None,
+    snapshot_time: datetime | None,
     window: str,
     deltas: dict[str, float],
 ) -> None:
-    if historical is None:
+    if historical is None or snapshot_time is None:
         return
     for metric_name in sorted(current.metrics):
         if metric_name == "previous_rank":
@@ -153,7 +175,17 @@ def _add_window_deltas(
         if (
             old_observation is None
             or old_observation.source_id != current_observation.source_id
+            or old_observation.source_kind != current_observation.source_kind
         ):
+            continue
+        current_time = _parse_utc(
+            current_observation.observed_at,
+            "current metric observed_at",
+        )
+        if snapshot_time >= current_time or _parse_utc(
+            old_observation.observed_at,
+            "historical metric observed_at",
+        ) >= current_time:
             continue
         current_value = _numeric(current_observation.value)
         old_value = _numeric(old_observation.value)
