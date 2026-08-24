@@ -363,10 +363,19 @@ def run_enrich(args: argparse.Namespace, services: Services) -> int:
         current = _snapshot_for_run(snapshots, run_id)
         records = _snapshot_records(current)
         metadata = _pipeline_metadata(current)
+        target_observed_at = _snapshot_observed_at(current)
         history = tuple(
-            snapshot for snapshot in snapshots if snapshot["run_id"] != run_id
+            snapshot
+            for snapshot in snapshots
+            if _snapshot_observed_at(snapshot) < target_observed_at
         )
-        analyzed = _analyze(records, history, generated_at, services, use_history=True)
+        analyzed = _analyze(
+            records,
+            history,
+            target_observed_at,
+            services,
+            use_history=True,
+        )
         preliminary = _score_analyzed(analyzed, services)
         final: list[ScoredCandidate] = []
         for candidate in preliminary:
@@ -633,6 +642,17 @@ def _snapshot_records(snapshot: Mapping[str, object]) -> tuple[GameRecord, ...]:
             raise InputValidationError("snapshot record is invalid")
         records.append(GameRecord.from_dict(value))
     return tuple(records)
+
+
+def _snapshot_observed_at(snapshot: Mapping[str, object]) -> datetime:
+    value = snapshot.get("observed_at")
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise InputValidationError("snapshot observed_at is invalid")
+    try:
+        observed_at = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise InputValidationError("snapshot observed_at is invalid") from error
+    return _utc_now(observed_at)
 
 
 def _pipeline_metadata(snapshot: Mapping[str, object]) -> dict[str, Any]:

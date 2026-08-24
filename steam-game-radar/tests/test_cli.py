@@ -552,6 +552,42 @@ class CliTests(unittest.TestCase):
             root = Path(directory)
             self.write_config(root)
             self.write_manual_csv(root)
+
+            def persist_manual_history(
+                observed_at: datetime,
+                wishlist_gain: int,
+                entropy: str,
+            ) -> None:
+                stamp = observed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                run_id = observed_at.strftime("%Y%m%dT%H%M%SZ") + f"-{entropy}"
+                path = root / f"history-{entropy}.csv"
+                path.write_text(
+                    "appid,name,wishlist_7d_gain,release_date\n"
+                    f"20,Manual Twenty,{wishlist_gain},2026-09-01\n",
+                    encoding="utf-8",
+                )
+                imported = cli.default_import_steamdb(
+                    path,
+                    "wishlist_activity",
+                    stamp,
+                )
+                persist_snapshot(
+                    self.config(root),
+                    run_id,
+                    imported.records,
+                    {"provider": "steamdb_manual_import"},
+                )
+
+            persist_manual_history(
+                NOW - timedelta(days=7),
+                250,
+                "17171717",
+            )
+            persist_manual_history(
+                NOW - timedelta(days=1),
+                500,
+                "23232323",
+            )
             parser = cli.build_parser()
             import_args = parser.parse_args(
                 [
@@ -589,10 +625,26 @@ class CliTests(unittest.TestCase):
                     enrichment.name,
                 ]
             )
-            self.assertEqual(cli.run_enrich(enrich_args, self.services(root)), 0)
-            self.assertTrue(
-                (root / "output" / "steam-radar" / f"{RUN_A}.final.json").exists()
+            delayed_services = self.services(
+                root,
+                now=NOW + timedelta(hours=25),
             )
+            self.assertEqual(cli.run_enrich(enrich_args, delayed_services), 0)
+            final_path = root / "output" / "steam-radar" / f"{RUN_A}.final.json"
+            self.assertTrue(final_path.exists())
+            final_report = json.loads(final_path.read_text(encoding="utf-8"))
+            self.assertEqual(final_report["generated_at"], "2026-08-25T13:00:00Z")
+            final_candidate = final_report["unreleased"][0]
+            self.assertEqual(
+                final_candidate["deltas"],
+                {
+                    "wishlist_gain_7d_1d_percent": 100.0,
+                    "wishlist_gain_7d_7d_percent": 300.0,
+                },
+            )
+            self.assertEqual(final_candidate["steam_heat_score"], 73.3)
+            self.assertEqual(final_candidate["confidence"], "B")
+            self.assertIsNotNone(final_candidate["final_score"])
             self.assertEqual(self.latest(root)["run_id"], RUN_B)
 
 
