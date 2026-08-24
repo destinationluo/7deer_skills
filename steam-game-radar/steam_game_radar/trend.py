@@ -79,13 +79,14 @@ def analyze_trends(
             "7d",
             deltas,
         )
+        seen_before = _seen_in_past_snapshot(record, one_day_time, one_day) or (
+            _seen_in_past_snapshot(record, seven_day_time, seven_day)
+        )
         candidates.append(
             AnalyzedCandidate(
                 record=record,
                 deltas=deltas,
-                newly_observed=(
-                    record.appid not in one_day and record.appid not in seven_day
-                ),
+                newly_observed=not seen_before,
                 warnings=(),
             )
         )
@@ -197,6 +198,25 @@ def _add_window_deltas(
             deltas[f"{metric_name}_{window}_percent"] = (
                 (current_value - old_value) / old_value * 100.0
             )
+
+
+def _seen_in_past_snapshot(
+    current: GameRecord,
+    snapshot_time: datetime | None,
+    historical: Mapping[int, GameRecord],
+) -> bool:
+    """Count presence only when the snapshot is provably before this record."""
+
+    if snapshot_time is None or current.appid not in historical:
+        return False
+    if not current.metrics:
+        # With no observation time there is no safe temporal reference.
+        return False
+    reference_time = max(
+        _parse_utc(observation.observed_at, "current metric observed_at")
+        for observation in current.metrics.values()
+    )
+    return snapshot_time < reference_time
 
 
 def _is_rank_metric(metric_name: str) -> bool:

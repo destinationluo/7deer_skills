@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import tempfile
 from types import MappingProxyType
 from typing import Mapping
 import unittest
@@ -10,12 +11,14 @@ import unittest
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
+from steam_game_radar.config import RadarConfig
 from steam_game_radar.errors import InputValidationError
 from steam_game_radar.schemas import (
     GameRecord,
     MAX_JSON_SAFE_INTEGER,
     MetricObservation,
 )
+from steam_game_radar.snapshot import load_snapshots, persist_snapshot
 from steam_game_radar.trend import (
     AnalyzedCandidate,
     analyze_trends,
@@ -105,6 +108,7 @@ class TrendTests(unittest.TestCase):
                     [current], self.snapshot([historical]), None
                 )[0]
                 self.assertEqual(dict(candidate.deltas), {})
+                self.assertFalse(candidate.newly_observed)
 
         plain_snapshot = self.snapshot([wrong_source], frozen=False)
         self.assertEqual(
@@ -149,19 +153,68 @@ class TrendTests(unittest.TestCase):
                     None,
                 )[0]
                 self.assertEqual(dict(candidate.deltas), {})
+                self.assertTrue(candidate.newly_observed)
 
         after_envelope = self.record(
             10,
-            {"current_players": (100, "steam_current_players", "2026-08-24T12:00:00Z")},
+            {
+                "current_players": (
+                    100,
+                    "steam_current_players",
+                    "2026-08-23T12:00:00.000001Z",
+                )
+            },
         )
-        with self.assertRaises(InputValidationError):
-            analyze_trends(
-                [current],
-                self.snapshot(
-                    [after_envelope],
-                    observed_at="2026-08-23T12:00:00Z",
-                ),
-                None,
+        after_envelope_candidate = analyze_trends(
+            [current],
+            self.snapshot(
+                [after_envelope],
+                observed_at="2026-08-23T12:00:00Z",
+            ),
+            None,
+        )[0]
+        self.assertEqual(
+            after_envelope_candidate.deltas["current_players_1d_percent"],
+            50.0,
+        )
+
+        with tempfile.TemporaryDirectory(
+            dir=str(Path(tempfile.gettempdir()).resolve())
+        ) as directory:
+            config = RadarConfig(data_dir=Path(directory))
+            microsecond_history = self.record(
+                12,
+                {
+                    "current_players": (
+                        100,
+                        "steam_current_players",
+                        "2026-08-23T12:00:00.000001Z",
+                    )
+                },
+            )
+            persist_snapshot(
+                config,
+                "20260823T120000Z-abcdef12",
+                [microsecond_history],
+                {"kind": "official"},
+            )
+            loaded = load_snapshots(config)
+            microsecond_current = self.record(
+                12,
+                {
+                    "current_players": (
+                        150,
+                        "steam_current_players",
+                        "2026-08-24T12:00:00Z",
+                    )
+                },
+            )
+            persisted_candidate = analyze_trends(
+                [microsecond_current], loaded[0], None
+            )[0]
+            self.assertEqual(
+                persisted_candidate.deltas["current_players_1d_percent"],
+                50.0,
             )
 
         cycle: dict[str, object] = {}
@@ -255,6 +308,15 @@ class TrendTests(unittest.TestCase):
         self.assertTrue(no_history.newly_observed)
         self.assertEqual(dict(previously_seen.deltas), {})
         self.assertFalse(previously_seen.newly_observed)
+
+        no_time_reference = self.record(41, {})
+        historical_without_metrics = self.record(41, {})
+        conservative = analyze_trends(
+            [no_time_reference],
+            self.snapshot([historical_without_metrics]),
+            None,
+        )[0]
+        self.assertTrue(conservative.newly_observed)
 
     def test_rank_improvement_prefers_7d_then_1d_then_provider_previous(self) -> None:
         record = self.record(

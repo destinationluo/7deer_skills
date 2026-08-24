@@ -281,14 +281,6 @@ def _validate_snapshot(
             raise InputValidationError(f"{label} nesting is too deep") from error
         if record.appid in appids:
             raise InputValidationError(f"{label} contains duplicate AppIDs")
-        for observation in record.metrics.values():
-            if _parse_utc(
-                observation.observed_at,
-                f"{label} metric observed_at",
-            ) > observed_at:
-                raise InputValidationError(
-                    f"{label} metric observation is later than its snapshot"
-                )
         appids.add(record.appid)
         records.append(record)
     return observed_at, tuple(records)
