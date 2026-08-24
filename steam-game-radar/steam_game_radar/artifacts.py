@@ -190,7 +190,7 @@ def prune_raw(config: RadarConfig, now: datetime) -> Sequence[Path]:
         raise PersistenceError("unable to prune raw artifacts safely") from error
     finally:
         if raw_root_descriptor is not None:
-            _close_descriptors((raw_root_descriptor,))
+            _close_prune_root_descriptor(raw_root_descriptor)
 
 
 def _is_sensitive_key(key: str) -> bool:
@@ -629,6 +629,24 @@ def _close_descriptors(descriptors: Sequence[int]) -> None:
                 first_error = error
     if first_error is not None and not active_exception:
         raise first_error
+
+
+def _close_prune_root_descriptor(descriptor: int) -> None:
+    primary_error = sys.exc_info()[1]
+    try:
+        os.close(descriptor)
+    except OSError as cleanup_error:
+        if primary_error is None:
+            raise PersistenceError(
+                "unable to close raw retention root safely"
+            ) from cleanup_error
+        if isinstance(primary_error, Exception) and hasattr(
+            primary_error,
+            "add_note",
+        ):
+            primary_error.add_note(
+                "raw retention descriptor cleanup also failed"
+            )
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:

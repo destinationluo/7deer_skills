@@ -492,6 +492,92 @@ class ArtifactTests(unittest.TestCase):
             self.assertNotIn("private traversal detail", str(captured.exception))
             self.assertTrue(expired.exists())
 
+            cleanup_data = Path(directory) / "cleanup-errors"
+            (cleanup_data / "raw").mkdir(parents=True)
+            artifacts_module = __import__(
+                "steam_game_radar.artifacts",
+                fromlist=["_open_raw_root"],
+            )
+            real_open_raw_root = artifacts_module._open_raw_root
+            real_close = os.close
+
+            def run_with_root_close_failure(
+                primary: BaseException | None,
+            ) -> BaseException:
+                root_descriptor: list[int] = []
+
+                def capture_root(raw_root: Path) -> int | None:
+                    descriptor = real_open_raw_root(raw_root)
+                    if descriptor is not None:
+                        root_descriptor.append(descriptor)
+                    return descriptor
+
+                def close_then_fail(descriptor: int) -> None:
+                    real_close(descriptor)
+                    if root_descriptor and descriptor == root_descriptor[0]:
+                        raise OSError("private cleanup detail")
+
+                patches = [
+                    mock.patch(
+                        "steam_game_radar.artifacts._open_raw_root",
+                        side_effect=capture_root,
+                    ),
+                    mock.patch(
+                        "steam_game_radar.artifacts.os.close",
+                        side_effect=close_then_fail,
+                    ),
+                ]
+                if primary is not None:
+                    patches.append(
+                        mock.patch(
+                            "steam_game_radar.artifacts._prune_candidates",
+                            side_effect=primary,
+                        )
+                    )
+                with patches[0], patches[1]:
+                    if len(patches) == 3:
+                        with patches[2]:
+                            return capture_prune_failure()
+                    return capture_prune_failure()
+
+            def capture_prune_failure() -> BaseException:
+                try:
+                    prune_raw(
+                        RadarConfig(data_dir=cleanup_data),
+                        datetime(2026, 8, 24, tzinfo=timezone.utc),
+                    )
+                except BaseException as error:
+                    return error
+                self.fail("prune_raw unexpectedly succeeded")
+
+            cleanup_only = run_with_root_close_failure(None)
+            self.assertIsInstance(cleanup_only, PersistenceError)
+            self.assertNotIn("private cleanup detail", str(cleanup_only))
+
+            primary_persistence = PersistenceError("primary persistence failure")
+            preserved_persistence = run_with_root_close_failure(
+                primary_persistence
+            )
+            self.assertIs(preserved_persistence, primary_persistence)
+
+            converted_os_error = run_with_root_close_failure(
+                PermissionError("primary private detail")
+            )
+            self.assertIsInstance(converted_os_error, PersistenceError)
+            self.assertNotIn("primary private detail", str(converted_os_error))
+            self.assertNotIn("private cleanup detail", str(converted_os_error))
+
+            primary_interrupt = KeyboardInterrupt()
+            preserved_interrupt = run_with_root_close_failure(primary_interrupt)
+            self.assertIs(preserved_interrupt, primary_interrupt)
+
+            if sys.version_info >= (3, 11):
+                for error in (preserved_persistence, converted_os_error):
+                    self.assertIn(
+                        "raw retention descriptor cleanup also failed",
+                        getattr(error, "__notes__", ()),
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
