@@ -35,7 +35,7 @@
 
 ```bash
 # 克隆到项目的 skills 目录，Agent 自动加载
-git clone https://github.com/kennyzir/7deer_skills.git .agent/skills
+git clone https://github.com/destinationluo/7deer_skills.git .agent/skills
 ```
 
 就这样。你的 Agent 会自动扫描每个 `SKILL.md` 的 name 和 description，在你的请求匹配时自动激活对应技能。
@@ -61,13 +61,13 @@ git clone https://github.com/kennyzir/7deer_skills.git .agent/skills
 
 ```bash
 # Claude Code / Kiro / VS Code Copilot / Codex / Gemini CLI（通用）
-git clone https://github.com/kennyzir/7deer_skills.git .agent/skills
+git clone https://github.com/destinationluo/7deer_skills.git .agent/skills
 
 # Cursor（也支持 .agent/skills，或复制到 .cursor/skills）
-git clone https://github.com/kennyzir/7deer_skills.git .agent/skills
+git clone https://github.com/destinationluo/7deer_skills.git .agent/skills
 
 # OpenClaw（全局安装，所有项目共享）
-git clone https://github.com/kennyzir/7deer_skills.git ~/.openclaw/skills/7deer
+git clone https://github.com/destinationluo/7deer_skills.git ~/.openclaw/skills/7deer
 
 # 只要一个技能？直接复制文件夹
 cp -r 7deer_skills/google-trends-to-pages .agent/skills/
@@ -175,27 +175,27 @@ cp -r 7deer_skills/google-trends-to-pages .agent/skills/
 
 ```bash
 # 在项目根目录执行，适用于 Claude Code / Kiro / VS Code Copilot / Codex / Gemini CLI
-git clone https://github.com/kennyzir/7deer_skills.git .agent/skills
+git clone https://github.com/destinationluo/7deer_skills.git .agent/skills
 ```
 
 ### 方法 2: Git Submodule（团队协作推荐）
 
 ```bash
-git submodule add https://github.com/kennyzir/7deer_skills.git .agent/skills
+git submodule add https://github.com/destinationluo/7deer_skills.git .agent/skills
 ```
 
 ### 方法 3: npx 一键安装（无需 git）
 
 ```bash
 # 下载到当前项目
-npx degit kennyzir/7deer_skills .agent/skills
+npx degit destinationluo/7deer_skills .agent/skills
 ```
 
 ### 方法 4: 只要某个技能
 
 ```bash
 # 只复制你需要的技能
-npx degit kennyzir/7deer_skills/google-trends-to-pages .agent/skills/google-trends-to-pages
+npx degit destinationluo/7deer_skills/google-trends-to-pages .agent/skills/google-trends-to-pages
 ```
 
 ### 安装后验证
@@ -499,8 +499,8 @@ MIT License - 开源分享，欢迎使用和贡献。详见 [LICENSE](./LICENSE)
 
 ## 📧 联系方式
 
-- GitHub: [@kennyzir](https://github.com/kennyzir)
-- Repository: [7deer_skills](https://github.com/kennyzir/7deer_skills)
+- GitHub: [@destinationluo](https://github.com/destinationluo)
+- Repository: [7deer_skills](https://github.com/destinationluo/7deer_skills)
 
 ---
 

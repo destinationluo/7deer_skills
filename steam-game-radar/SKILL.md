@@ -9,6 +9,31 @@ Run every command from the target project root. This radar is separate from
 HTML5/browser-playable discovery and produces released and unreleased Steam
 rankings.
 
+## Path modes
+
+Always run from the target project root. Relative `data_dir` and `report_dir`
+values resolve from that target project root.
+
+**Repository checkout:** the three commands under Manual routes use the
+`steam-game-radar/...` prefix.
+
+**Installed in the target project:** use these `.agent/skills` paths:
+
+```bash
+python3 .agent/skills/steam-game-radar/scripts/steam_radar.py scan \
+  --config .agent/skills/steam-game-radar/references/config.example.json
+
+python3 .agent/skills/steam-game-radar/scripts/steam_radar.py import-steamdb \
+  --config .agent/skills/steam-game-radar/references/config.example.json \
+  --view wishlist_activity \
+  --input /path/to/steamdb-export.csv
+
+python3 .agent/skills/steam-game-radar/scripts/steam_radar.py enrich \
+  --config .agent/skills/steam-game-radar/references/config.example.json \
+  --run-id 20260824T030000Z-a1b2c3d4 \
+  --input /path/to/enrichment.json
+```
+
 ## Manual routes
 
 For `跑 Steam 雷达`, run:
@@ -28,10 +53,11 @@ python3 steam-game-radar/scripts/steam_radar.py import-steamdb \
   --input /path/to/steamdb-export.csv
 ```
 
-After the scan preliminary report, collect Google, YouTube, and Reddit
-evidence for the configured Top 10 candidates (default). For an import
-preliminary report, this same enrichment is optional. When enriching, save the
-versioned evidence file and run:
+After the scan preliminary report, parse its manifest and collect Google,
+YouTube, and Reddit evidence for every listed enrichment AppID (one total
+Top 10 maximum by default). For an import preliminary report, this same
+enrichment is optional. When enriching, save the versioned evidence file and
+run:
 
 ```bash
 python3 steam-game-radar/scripts/steam_radar.py enrich \
@@ -42,16 +68,43 @@ python3 steam-game-radar/scripts/steam_radar.py enrich \
 
 ## Schedules
 
-Use this host-agent schedule registration; its payload owns the two-phase run:
+The following are scheduler-neutral parameters to map into the host Agent
+scheduler UI or API; they are not a universal registration JSON.
 
-```json
-{
-  "name": "Daily Steam Game Radar",
-  "expression": "0 11 * * *",
-  "timezone": "Asia/Shanghai",
-  "payload": "At the target project root, run python3 steam-game-radar/scripts/steam_radar.py scan --config steam-game-radar/references/config.example.json; read its preliminary report; collect Google, YouTube, and Reddit evidence for preliminary Top 10; write the versioned evidence file; run python3 steam-game-radar/scripts/steam_radar.py enrich --config steam-game-radar/references/config.example.json --run-id <preliminary_run_id> --input <enrichment_file>; report both output paths and any warnings."
-}
+| Parameter | Value |
+|---|---|
+| Name | Daily Steam Game Radar |
+| Cron expression | `0 11 * * *` |
+| Timezone | `Asia/Shanghai` |
+| Payload | Execute the Agent payload below from the target project root |
+
+### Manifest contract
+
+Each successful command writes exactly one compact JSON manifest line to
+stdout. A preliminary example is:
+
+```jsonl
+{"enrichment_candidate_appids":[123456],"phase":"preliminary","report_json":"/absolute/reports/steam-game-radar/20260824T030000Z-a1b2c3d4.preliminary.json","report_markdown":"/absolute/reports/steam-game-radar/20260824T030000Z-a1b2c3d4.preliminary.md","run_id":"20260824T030000Z-a1b2c3d4","schema_version":1,"warnings":[]}
 ```
+
+### Agent payload
+
+1. Run `scan` with the active path mode, then capture and parse its exact
+   one-line JSON manifest.
+2. From that manifest, read `run_id`, `report_json`, `report_markdown`, and
+   `warnings`.
+3. The `enrichment_candidate_appids` manifest field is authoritative:
+   research every AppID in `enrichment_candidate_appids`, then collect Google,
+   YouTube, and Reddit evidence. It is one total Top N across released and
+   unreleased eligible reported candidates, selected by canonical
+   `candidate_sort_key`; it is not N per pool and is already limited by
+   configured `enrichment_top_n`.
+4. Using that exact `run_id`, write `enrichment.json` according to
+   `references/scoring-rules.md`.
+5. With the active path mode, run `enrich` using the captured `run_id` and the
+   evidence file.
+6. Immediately capture and consume the final one-line manifest, including its
+   report paths and warnings.
 
 For a host without agent scheduling, conventional cron is scan-only:
 

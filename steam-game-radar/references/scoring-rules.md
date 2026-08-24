@@ -31,6 +31,12 @@ Upcoming rank precedence is 7d same-source -> 1d same-source; provider previous_
 wishlist/follower value. The gate is at least 2 metrics and at least 30
 configured weight.
 
+Missing or TBA `release_date` contributes `release_proximity = 0` at weight 10.
+Missing or unranked `coming_soon_rank` contributes `coming_soon_visibility = 0` at weight 10.
+Both zero-valued signals count toward metric count and available weight.
+Malformed or non-Steam observations remain omitted rather than becoming an
+observed zero.
+
 ## SEO opportunity
 
 | Metric | Weight | Transform |
@@ -46,6 +52,56 @@ expandable_queries is an observed zero. Valid HTTPS typed evidence is
 mandatory: Google evidence always, plus matching YouTube/Reddit evidence for
 each supplied signal.
 
+## Enrichment file contract
+
+Write this local file from evidence gathered for the preliminary manifest's
+authoritative AppID list:
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "20260824T030000Z-a1b2c3d4",
+  "observed_at": "2026-08-24T03:20:00Z",
+  "games": [
+    {
+      "appid": 123456,
+      "google_competition_gap_score": 80,
+      "expandable_queries": [
+        "example game wiki",
+        "example game guide"
+      ],
+      "youtube_relevant_7d": 6,
+      "reddit_relevant_7d": 4,
+      "reddit_upvotes_7d": 240,
+      "evidence": [
+        {
+          "source": "google",
+          "url": "https://www.google.com/search?q=example+game"
+        },
+        {
+          "source": "youtube",
+          "url": "https://www.youtube.com/results?search_query=example+game"
+        },
+        {
+          "source": "reddit",
+          "url": "https://www.reddit.com/search/?q=example+game"
+        }
+      ]
+    }
+  ]
+}
+```
+
+The envelope is exact: `schema_version` is 1, `observed_at` is UTC, `games` is
+an array with unique positive AppIDs, and the file `run_id` must exactly match
+the preliminary manifest `run_id`. `google_competition_gap_score` is an integer
+from 0 through 100. `expandable_queries` is an array of non-empty strings.
+YouTube/Reddit counts are null or non-negative integers. Google evidence is
+required; supplied YouTube or Reddit signals require source-matching evidence.
+Evidence `source` is only `google`, `youtube`, or `reddit`, and evidence URLs
+must use HTTPS. The loader rejects unknown fields, duplicate AppIDs, invalid
+types, and mismatched run IDs without making network requests.
+
 ## Combination, actions, and confidence
 
 The exact combination is
@@ -53,7 +109,13 @@ The exact combination is
 Preliminary heat has no final score and uses `needs_seo_enrichment`. Failed
 Steam gates use `insufficient_data`.
 
-| Exact final-score interval | Action |
+Action is selected from exact pre-round composite hundredths before final_score
+is persisted half-up to one decimal. Therefore a displayed score can cross a
+label boundary without changing the action: Steam heat 50.0 and SEO 49.9 give
+49.96 -> persisted 50.0 -> `skip`; Steam heat 65.0 and SEO 64.9 give 64.96 ->
+persisted 65.0 -> `watch`.
+
+| Exact pre-round composite interval | Action |
 |---|---|
 | 80.00-100.00 | `immediate_action` |
 | 65.00-79.99 | `worth_positioning` |

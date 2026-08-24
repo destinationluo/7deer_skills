@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import sys
+import tempfile
 import unittest
 from urllib.parse import urlsplit
 
@@ -17,6 +18,7 @@ if str(SKILL_ROOT) not in sys.path:
     sys.path.insert(0, str(SKILL_ROOT))
 
 from steam_game_radar.config import RadarConfig
+from steam_game_radar.enrichment import load_enrichment
 from steam_game_radar.http_client import ALLOWED_HOSTS, USER_AGENT
 from steam_game_radar.official_provider import (
     APPDETAILS_URL,
@@ -26,8 +28,16 @@ from steam_game_radar.official_provider import (
     _CAPABILITY_NAMES,
 )
 from steam_game_radar.report import _CANDIDATE_FIELDS, _REPORT_FIELDS
-from steam_game_radar.score import _RELEASED_WEIGHTS, _UNRELEASED_WEIGHTS
+from steam_game_radar.schemas import GameRecord, MetricObservation
+from steam_game_radar.score import (
+    _RELEASED_WEIGHTS,
+    _UNRELEASED_WEIGHTS,
+    _action_for_combined_score,
+    _combine_scores,
+    score_unreleased,
+)
 from steam_game_radar.steamdb_import import _ALIASES, _ALLOWED_VIEWS
+from steam_game_radar.trend import AnalyzedCandidate
 
 
 SCAN_COMMAND = """python3 steam-game-radar/scripts/steam_radar.py scan \\
@@ -38,6 +48,16 @@ IMPORT_COMMAND = """python3 steam-game-radar/scripts/steam_radar.py import-steam
   --input /path/to/steamdb-export.csv"""
 ENRICH_COMMAND = """python3 steam-game-radar/scripts/steam_radar.py enrich \\
   --config steam-game-radar/references/config.example.json \\
+  --run-id 20260824T030000Z-a1b2c3d4 \\
+  --input /path/to/enrichment.json"""
+INSTALLED_SCAN_COMMAND = """python3 .agent/skills/steam-game-radar/scripts/steam_radar.py scan \\
+  --config .agent/skills/steam-game-radar/references/config.example.json"""
+INSTALLED_IMPORT_COMMAND = """python3 .agent/skills/steam-game-radar/scripts/steam_radar.py import-steamdb \\
+  --config .agent/skills/steam-game-radar/references/config.example.json \\
+  --view wishlist_activity \\
+  --input /path/to/steamdb-export.csv"""
+INSTALLED_ENRICH_COMMAND = """python3 .agent/skills/steam-game-radar/scripts/steam_radar.py enrich \\
+  --config .agent/skills/steam-game-radar/references/config.example.json \\
   --run-id 20260824T030000Z-a1b2c3d4 \\
   --input /path/to/enrichment.json"""
 
@@ -68,7 +88,7 @@ class SkillDocumentationTests(unittest.TestCase):
         for workflow_word in ("runs scan", "then enrich", "workflow", "three steps"):
             self.assertNotIn(workflow_word, description.casefold())
         body = text[match.end() :] if match else ""
-        self.assertLess(len(body.split()), 500)
+        self.assertLess(len(body.split()), 700)
         for reference in (
             "references/data-sources.md",
             "references/steamdb-import-format.md",
@@ -89,6 +109,20 @@ class SkillDocumentationTests(unittest.TestCase):
         self.assertRegex(import_route, r"\u672c\u5730(?: CSV/JSON| CSV \u6216 JSON).*(?:view|\u89c6\u56fe)")
         for token in ("Top 10", "Google", "YouTube", "Reddit"):
             self.assertIn(token, import_route)
+        path_section = text[text.find("## Path modes") : text.find("## Manual routes")]
+        self.assertIn("Repository checkout", path_section)
+        self.assertIn("Installed in the target project", path_section)
+        self.assertIn("target project root", path_section)
+        self.assertIn(
+            "Relative `data_dir` and `report_dir` values resolve from that target project root",
+            " ".join(path_section.split()),
+        )
+        for command in (
+            INSTALLED_SCAN_COMMAND,
+            INSTALLED_IMPORT_COMMAND,
+            INSTALLED_ENRICH_COMMAND,
+        ):
+            self.assertIn(command, path_section)
 
     def test_exact_cli_commands_and_outputs(self) -> None:
         text = _read(SKILL_ROOT / "SKILL.md")
@@ -121,12 +155,65 @@ class SkillDocumentationTests(unittest.TestCase):
 
     def test_agent_schedule_and_preliminary_only_cron(self) -> None:
         text = _read(SKILL_ROOT / "SKILL.md")
-        self.assertIn('"expression": "0 11 * * *"', text)
-        self.assertIn('"timezone": "Asia/Shanghai"', text)
-        self.assertIn('"payload":', text)
-        schedule = text[text.find('"expression": "0 11 * * *"') :]
-        self.assertLess(schedule.find("scan"), schedule.find("Top 10"))
-        self.assertLess(schedule.find("Top 10"), schedule.find("enrich"))
+        schedule = text[text.find("## Schedules") : text.find("## Policy and outputs")]
+        schedule_flat = " ".join(schedule.split())
+        self.assertIn("scheduler-neutral parameters", schedule_flat)
+        self.assertIn("map into the host Agent scheduler UI or API", schedule_flat)
+        self.assertIn("not a universal registration JSON", schedule_flat)
+        self.assertIn("`0 11 * * *`", schedule)
+        self.assertIn("`Asia/Shanghai`", schedule)
+        self.assertNotIn("<preliminary_run_id>", schedule)
+        manifest_match = re.search(
+            r"```jsonl\n([^\n]+)\n```",
+            schedule,
+        )
+        self.assertIsNotNone(manifest_match)
+        manifest = json.loads(manifest_match.group(1) if manifest_match else "{}")
+        self.assertEqual(
+            set(manifest),
+            {
+                "schema_version",
+                "run_id",
+                "phase",
+                "report_json",
+                "report_markdown",
+                "warnings",
+                "enrichment_candidate_appids",
+            },
+        )
+        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["phase"], "preliminary")
+        self.assertEqual(manifest["enrichment_candidate_appids"], [123456])
+        self.assertEqual(manifest["warnings"], [])
+        self.assertTrue(Path(manifest["report_json"]).is_absolute())
+        self.assertTrue(Path(manifest["report_markdown"]).is_absolute())
+        workflow = " ".join(
+            schedule[schedule.find("### Agent payload") :].split()
+        )
+        workflow_steps = (
+            "Run `scan`",
+            "capture and parse its exact one-line JSON manifest",
+            "read `run_id`",
+            "research every AppID in `enrichment_candidate_appids`",
+            "write `enrichment.json`",
+            "run `enrich`",
+            "capture and consume the final one-line manifest",
+        )
+        for step in workflow_steps:
+            self.assertIn(step, workflow)
+        for earlier, later in zip(
+            workflow_steps,
+            workflow_steps[1:],
+        ):
+            self.assertLess(workflow.find(earlier), workflow.find(later))
+        self.assertIn(
+            "one total Top N across released and unreleased eligible reported candidates",
+            workflow,
+        )
+        self.assertIn("canonical `candidate_sort_key`", workflow)
+        self.assertIn("not N per pool", workflow)
+        self.assertIn("already limited by configured `enrichment_top_n`", workflow)
+        self.assertIn("manifest field is authoritative", workflow)
         self.assertIn("TZ=Asia/Shanghai", text)
         self.assertIn("0 11 * * *", text)
         self.assertRegex(
@@ -342,6 +429,142 @@ class SkillDocumentationTests(unittest.TestCase):
         ):
             self.assertIn(criterion, ordering_section)
 
+        enrichment_match = re.search(
+            r"## Enrichment file contract.*?```json\n(.*?)\n```",
+            text,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(enrichment_match)
+        enrichment_example = json.loads(
+            enrichment_match.group(1) if enrichment_match else "{}"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "enrichment.json"
+            path.write_text(
+                json.dumps(enrichment_example),
+                encoding="utf-8",
+            )
+            bundle = load_enrichment(
+                path,
+                expected_run_id=enrichment_example["run_id"],
+            )
+        self.assertEqual(bundle.schema_version, 1)
+        self.assertEqual(set(bundle.games), {123456})
+        enrichment_section = " ".join(
+            text[text.find("## Enrichment file contract") : text.find("## Combination, actions, and confidence")].split()
+        )
+        for contract in (
+            "`google_competition_gap_score` is an integer from 0 through 100",
+            "YouTube/Reddit counts are null or non-negative integers",
+            "Google evidence is required",
+            "supplied YouTube or Reddit signals require source-matching evidence",
+            "evidence URLs must use HTTPS",
+            "file `run_id` must exactly match the preliminary manifest `run_id`",
+        ):
+            self.assertIn(contract, enrichment_section)
+
+        self.assertEqual(_combine_scores(50.0, 49.9), (50.0, 4_996))
+        self.assertEqual(_action_for_combined_score(4_996), "skip")
+        self.assertEqual(_combine_scores(65.0, 64.9), (65.0, 6_496))
+        self.assertEqual(_action_for_combined_score(6_496), "watch")
+        self.assertIn(
+            "49.96 -> persisted 50.0 -> `skip`",
+            confidence_section,
+        )
+        self.assertIn(
+            "64.96 -> persisted 65.0 -> `watch`",
+            confidence_section,
+        )
+        self.assertIn("pre-round composite interval", confidence_section)
+        self.assertIn(
+            "Action is selected from exact pre-round composite hundredths before final_score is persisted half-up to one decimal",
+            confidence_section,
+        )
+
+        observed_at = "2026-08-24T03:00:00Z"
+
+        def observation(
+            value: object,
+            source_id: str,
+            source_kind: str = "steam_official",
+        ) -> MetricObservation:
+            return MetricObservation(
+                value=value,
+                source_id=source_id,
+                source_kind=source_kind,  # type: ignore[arg-type]
+                observed_at=observed_at,
+            )
+
+        def analyzed(
+            appid: int,
+            metrics: dict[str, MetricObservation],
+        ) -> AnalyzedCandidate:
+            return AnalyzedCandidate(
+                record=GameRecord(
+                    schema_version=1,
+                    appid=appid,
+                    name=f"Upcoming {appid}",
+                    release_status="unreleased",
+                    store_url=f"https://store.steampowered.com/app/{appid}/",
+                    metrics=metrics,
+                    source_extra={},
+                ),
+                deltas={},
+                newly_observed=True,
+                warnings=(),
+            )
+
+        missing = score_unreleased(
+            analyzed(
+                700001,
+                {"follower_gain_7d": observation(1_000, "gain")},
+            )
+        )
+        self.assertEqual(
+            dict(missing.metric_scores),
+            {
+                "coming_soon_visibility": 0.0,
+                "release_proximity": 0.0,
+                "wishlist_or_follower_gain": 60.0,
+            },
+        )
+        self.assertEqual(missing.steam_heat_score, 30.0)
+        unavailable = score_unreleased(
+            analyzed(
+                700002,
+                {
+                    "follower_gain_7d": observation(1_000, "gain"),
+                    "release_date": observation("TBA", "release"),
+                    "coming_soon_rank": observation("unranked", "rank"),
+                },
+            )
+        )
+        self.assertEqual(missing.metric_scores, unavailable.metric_scores)
+        omitted = score_unreleased(
+            analyzed(
+                700003,
+                {
+                    "follower_gain_7d": observation(1_000, "gain"),
+                    "release_date": observation(
+                        "TBA",
+                        "seo_release",
+                        "seo_enrichment",
+                    ),
+                    "coming_soon_rank": observation("malformed", "rank"),
+                },
+            )
+        )
+        self.assertNotIn("release_proximity", omitted.metric_scores)
+        self.assertNotIn("coming_soon_visibility", omitted.metric_scores)
+        self.assertIsNone(omitted.steam_heat_score)
+        for rule in (
+            "Missing or TBA `release_date` contributes `release_proximity = 0` at weight 10",
+            "Missing or unranked `coming_soon_rank` contributes `coming_soon_visibility = 0` at weight 10",
+            "Both zero-valued signals count toward metric count and available weight",
+            "Malformed or non-Steam observations remain omitted",
+        ):
+            self.assertIn(rule, unreleased_section)
+
     def test_report_template_lists_the_canonical_schema(self) -> None:
         text = _read(SKILL_ROOT / "references/report-template.md")
         top_section = text[text.find("## Canonical top-level fields") : text.find("## Canonical candidate fields")]
@@ -355,6 +578,19 @@ class SkillDocumentationTests(unittest.TestCase):
 
     def test_readme_catalog_count_and_transport_policy(self) -> None:
         readme = _read(ROOT / "README.md")
+        self.assertNotIn("kennyzir", readme.casefold())
+        for command in (
+            "git clone https://github.com/destinationluo/7deer_skills.git .agent/skills",
+            "git clone https://github.com/destinationluo/7deer_skills.git ~/.openclaw/skills/7deer",
+            "git submodule add https://github.com/destinationluo/7deer_skills.git .agent/skills",
+            "npx degit destinationluo/7deer_skills .agent/skills",
+            "npx degit destinationluo/7deer_skills/google-trends-to-pages .agent/skills/google-trends-to-pages",
+        ):
+            self.assertIn(command, readme)
+        self.assertIn(
+            "https://github.com/destinationluo/7deer_skills",
+            readme,
+        )
         skill_names = sorted(path.parent.name for path in ROOT.glob("*/SKILL.md"))
         self.assertEqual(len(skill_names), 32)
         self.assertIn("32 \u4e2a\u53ef\u590d\u7528", readme)
