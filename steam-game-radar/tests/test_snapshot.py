@@ -324,9 +324,27 @@ class SnapshotTests(unittest.TestCase):
                 )
 
             payload["schema_version"] = 1.0
-            atomic_write_json(path, payload)
+            path.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaises(PersistenceError):
                 load_snapshots(config)
+
+            payload["schema_version"] = 1
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            tampered = json.loads(path.read_text(encoding="utf-8"))
+            tampered["metadata"]["mode"] = "atomic-replacement"
+            atomic_write_json(path, tampered)
+            path.chmod(0o600)
+            journal_entry = path.parent / ".journal" / path.name
+            self.assertEqual(path.stat().st_nlink, 1)
+            self.assertEqual(journal_entry.stat().st_nlink, 1)
+            self.assertNotEqual(path.stat().st_ino, journal_entry.stat().st_ino)
+            with self.assertRaises(PersistenceError):
+                load_snapshots(config)
+            journal_entry.unlink()
+            self.assertEqual(
+                load_snapshots(config)[0]["metadata"]["mode"],
+                "atomic-replacement",
+            )
 
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             config = RadarConfig(data_dir=Path(directory))

@@ -487,8 +487,19 @@ def _load_snapshot(
     _validate_regular(before, expected_links=None)
     if before.st_nlink not in {1, 2}:
         raise PersistenceError("snapshot artifact has an unexpected link count")
-    if before.st_nlink == 2:
-        _validate_journal_link(journal_descriptor, name, before)
+    if before.st_nlink == 1:
+        _require_journal_entry_absent(
+            snapshots_descriptor,
+            journal_descriptor,
+            name,
+        )
+    else:
+        _validate_journal_link(
+            snapshots_descriptor,
+            journal_descriptor,
+            name,
+            before,
+        )
 
     data, opened = _read_named_file(
         snapshots_descriptor,
@@ -497,8 +508,19 @@ def _load_snapshot(
     )
     if _file_identity(opened) != _file_identity(before):
         raise PersistenceError("snapshot changed before it was read")
-    if opened.st_nlink == 2:
-        _validate_journal_link(journal_descriptor, name, opened)
+    if opened.st_nlink == 1:
+        _require_journal_entry_absent(
+            snapshots_descriptor,
+            journal_descriptor,
+            name,
+        )
+    else:
+        _validate_journal_link(
+            snapshots_descriptor,
+            journal_descriptor,
+            name,
+            opened,
+        )
 
     raw = _parse_snapshot_json(data)
     canonical = _validate_snapshot(raw, name)
@@ -512,20 +534,69 @@ def _load_snapshot(
 
 
 def _validate_journal_link(
+    snapshots_descriptor: int,
     journal_descriptor: int | None,
     name: str,
     final: os.stat_result,
 ) -> None:
     if journal_descriptor is None:
         raise PersistenceError("linked snapshot does not have a journal")
-    journal = _name_metadata(journal_descriptor, name)
-    _validate_regular(
-        journal,
-        expected_links=2,
-        expected_size=final.st_size,
+    _validate_journal_directory_binding(
+        snapshots_descriptor,
+        journal_descriptor,
     )
+    _, journal = _read_named_file(
+        journal_descriptor,
+        name,
+        expected_links=2,
+    )
+    _validate_regular(final, expected_links=2, expected_size=journal.st_size)
     if _file_identity(journal) != _file_identity(final):
         raise PersistenceError("snapshot journal does not match its final link")
+
+
+def _require_journal_entry_absent(
+    snapshots_descriptor: int,
+    journal_descriptor: int | None,
+    name: str,
+) -> None:
+    if journal_descriptor is None:
+        if (
+            _optional_name_metadata(
+                snapshots_descriptor,
+                _JOURNAL_DIRECTORY,
+            )
+            is not None
+        ):
+            raise PersistenceError("snapshot journal appeared during legacy load")
+        return
+    _validate_journal_directory_binding(
+        snapshots_descriptor,
+        journal_descriptor,
+    )
+    if _optional_name_metadata(journal_descriptor, name) is not None:
+        raise PersistenceError("legacy snapshot conflicts with a journal entry")
+
+
+def _validate_journal_directory_binding(
+    snapshots_descriptor: int,
+    journal_descriptor: int,
+) -> None:
+    try:
+        opened = os.fstat(journal_descriptor)
+        named = os.stat(
+            _JOURNAL_DIRECTORY,
+            dir_fd=snapshots_descriptor,
+            follow_symlinks=False,
+        )
+        _validate_directory(opened, exact_mode=0o700)
+        _validate_directory(named, exact_mode=0o700)
+    except PersistenceError:
+        raise
+    except OSError as error:
+        raise PersistenceError("unable to verify snapshot journal") from error
+    if _inode(opened) != _inode(named):
+        raise PersistenceError("snapshot journal directory changed during load")
 
 
 def _read_named_file(
