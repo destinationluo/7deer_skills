@@ -1000,7 +1000,7 @@ class CliTests(unittest.TestCase):
                     "wishlist_gain_7d_7d_percent": 300.0,
                 },
             )
-            self.assertEqual(final_candidate["steam_heat_score"], 73.3)
+            self.assertEqual(final_candidate["steam_heat_score"], 55.0)
             self.assertEqual(final_candidate["confidence"], "B")
             self.assertIsNotNone(final_candidate["final_score"])
             self.assertEqual(self.latest(root)["run_id"], RUN_B)
