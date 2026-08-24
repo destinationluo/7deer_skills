@@ -2,7 +2,9 @@
 
 Snapshot I/O stays anchored to an opened directory descriptor. Absolute paths
 must use canonical, non-symlink components; relative paths are resolved from an
-opened descriptor for the active working directory.
+opened descriptor for the active working directory. Callers serialize snapshot
+operations with the project ``RunLock``; orphan-stage recovery is nevertheless
+idempotent if it overlaps a publisher after the final hard link exists.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import stat
 from typing import Mapping, Sequence
@@ -37,8 +40,14 @@ _SNAPSHOT_FIELDS = {
     "metadata",
 }
 _MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
+_MAX_JSON_NESTING = 128
 _TEMP_ATTEMPTS = 8
 _READ_CHUNK_BYTES = 64 * 1024
+_STAGED_NAME = re.compile(r"\.snapshot-[0-9a-f]{24}\.staged\Z", re.ASCII)
+_QUARANTINE_NAME = re.compile(
+    r"\.quarantine-[0-9a-f]{48}\.holding\Z",
+    re.ASCII,
+)
 
 
 def make_run_id(now: datetime, entropy: bytes) -> str:
@@ -90,6 +99,8 @@ def load_snapshots(config: RadarConfig) -> Sequence[Mapping[str, object]]:
     if directory_descriptor is None:
         return ()
     try:
+        entries = os.listdir(directory_descriptor)
+        _recover_orphaned_stages(directory_descriptor, entries)
         names = sorted(
             name
             for name in os.listdir(directory_descriptor)
@@ -165,6 +176,7 @@ def _open_directory(path: Path, *, create: bool) -> int | None:
         for component in components:
             if component in {"", "."}:
                 continue
+            created_directory_identity: tuple[int, int] | None = None
             try:
                 next_descriptor = os.open(component, flags, dir_fd=descriptor)
             except FileNotFoundError:
@@ -179,6 +191,49 @@ def _open_directory(path: Path, *, create: bool) -> int | None:
                     raise PersistenceError(
                         "unable to create snapshot directory component"
                     ) from error
+                else:
+                    try:
+                        created_status = os.stat(
+                            component,
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
+                        )
+                        if not stat.S_ISDIR(created_status.st_mode):
+                            raise PersistenceError(
+                                "new snapshot path component is not a directory"
+                            )
+                        if (
+                            hasattr(os, "geteuid")
+                            and created_status.st_uid != os.geteuid()
+                        ):
+                            raise PersistenceError(
+                                "new snapshot directory has an unexpected owner"
+                            )
+                        created_directory_identity = _inode(created_status)
+                        os.chmod(
+                            component,
+                            0o700,
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
+                        )
+                        secured_status = os.stat(
+                            component,
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
+                        )
+                        if (
+                            _inode(secured_status) != created_directory_identity
+                            or stat.S_IMODE(secured_status.st_mode) != 0o700
+                        ):
+                            raise PersistenceError(
+                                "new snapshot directory changed during setup"
+                            )
+                    except PersistenceError:
+                        raise
+                    except OSError as error:
+                        raise PersistenceError(
+                            "unable to secure snapshot directory component"
+                        ) from error
                 try:
                     next_descriptor = os.open(component, flags, dir_fd=descriptor)
                 except OSError as error:
@@ -190,9 +245,17 @@ def _open_directory(path: Path, *, create: bool) -> int | None:
                     "unable to securely open snapshot directory component"
                 ) from error
             try:
-                if not stat.S_ISDIR(os.fstat(next_descriptor).st_mode):
+                opened_status = os.fstat(next_descriptor)
+                if not stat.S_ISDIR(opened_status.st_mode):
                     raise PersistenceError(
                         "snapshot path component is not a directory"
+                    )
+                if (
+                    created_directory_identity is not None
+                    and _inode(opened_status) != created_directory_identity
+                ):
+                    raise PersistenceError(
+                        "new snapshot directory changed before open"
                     )
             except Exception:
                 _close_descriptor(next_descriptor)
@@ -280,7 +343,12 @@ def _write_immutable(
         if _inode(temporary_after_link) != created_identity:
             raise PersistenceError("snapshot temporary name changed during publish")
 
-        os.unlink(temporary_name, dir_fd=directory_descriptor)
+        _quarantine_remove_expected(
+            directory_descriptor,
+            temporary_name,
+            created_identity,
+            missing_ok=True,
+        )
         temporary_name = ""
         final = _name_metadata(directory_descriptor, destination_name)
         _validate_regular(
@@ -291,29 +359,25 @@ def _write_immutable(
         if _inode(final) != created_identity:
             raise PersistenceError("published snapshot changed before completion")
         os.fsync(directory_descriptor)
-    except (InputValidationError, PersistenceError):
+    except (InputValidationError, PersistenceError, OSError) as error:
         if published and created_identity is not None:
-            _unlink_if_identity(
+            _quarantine_remove_expected(
                 directory_descriptor,
                 destination_name,
                 created_identity,
+                missing_ok=True,
             )
-        raise
-    except OSError as error:
-        if published and created_identity is not None:
-            _unlink_if_identity(
-                directory_descriptor,
-                destination_name,
-                created_identity,
-            )
+        if isinstance(error, (InputValidationError, PersistenceError)):
+            raise
         raise PersistenceError("unable to persist immutable snapshot") from error
     finally:
         _close_descriptor(descriptor)
         if temporary_name and created_identity is not None:
-            _unlink_if_identity(
+            _quarantine_remove_expected(
                 directory_descriptor,
                 temporary_name,
                 created_identity,
+                missing_ok=True,
             )
 
 
@@ -335,6 +399,32 @@ def _create_temporary(directory_descriptor: int) -> tuple[str, int]:
         except OSError as error:
             raise PersistenceError(
                 "unable to create snapshot temporary file"
+            ) from error
+        identity: tuple[int, int] | None = None
+        try:
+            os.fchmod(descriptor, 0o600)
+            metadata = os.fstat(descriptor)
+            identity = _inode(metadata)
+            _validate_regular(metadata, expected_links=1, expected_size=0)
+            named = _name_metadata(directory_descriptor, name)
+            _validate_regular(named, expected_links=1, expected_size=0)
+            if _inode(named) != identity:
+                raise PersistenceError(
+                    "snapshot temporary name changed during creation"
+                )
+        except (OSError, PersistenceError) as error:
+            _close_descriptor(descriptor)
+            if identity is not None:
+                _quarantine_remove_expected(
+                    directory_descriptor,
+                    name,
+                    identity,
+                    missing_ok=True,
+                )
+            if isinstance(error, PersistenceError):
+                raise
+            raise PersistenceError(
+                "unable to secure snapshot temporary file"
             ) from error
         return name, descriptor
     raise PersistenceError("unable to allocate snapshot temporary file")
@@ -387,7 +477,7 @@ def _load_snapshot(
     canonical = _validate_snapshot(raw, name)
     try:
         frozen = _freeze_json(canonical, "snapshot")
-    except InputValidationError as error:
+    except (InputValidationError, RecursionError) as error:
         raise PersistenceError("snapshot cannot be frozen safely") from error
     if not isinstance(frozen, Mapping):  # pragma: no cover - canonical is a dict
         raise PersistenceError("snapshot has an invalid canonical shape")
@@ -467,7 +557,12 @@ def _validate_snapshot(value: object, name: str) -> dict[str, object]:
     try:
         records = [GameRecord.from_dict(record).to_dict() for record in raw_records]
         metadata = _canonical_metadata(value["metadata"])
-    except (InputValidationError, AttributeError, TypeError) as error:
+    except (
+        InputValidationError,
+        AttributeError,
+        TypeError,
+        RecursionError,
+    ) as error:
         raise PersistenceError(
             "snapshot contains invalid records or metadata"
         ) from error
@@ -483,19 +578,19 @@ def _validate_snapshot(value: object, name: str) -> dict[str, object]:
 def _validate_regular(
     metadata: os.stat_result,
     *,
-    expected_links: int,
+    expected_links: int | None,
     expected_size: int | None = None,
 ) -> None:
     if not stat.S_ISREG(metadata.st_mode):
         raise PersistenceError("snapshot artifact is not a regular file")
-    if metadata.st_nlink != expected_links:
+    if expected_links is not None and metadata.st_nlink != expected_links:
         raise PersistenceError("snapshot artifact has an unexpected link count")
     if expected_size is not None and metadata.st_size != expected_size:
         raise PersistenceError("snapshot artifact has an unexpected size")
     if metadata.st_size < 0 or metadata.st_size > _MAX_SNAPSHOT_BYTES:
         raise PersistenceError("snapshot exceeds the safe size limit")
-    if stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise PersistenceError("snapshot artifact has unsafe permissions")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise PersistenceError("snapshot artifact must use mode 0600")
     if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
         raise PersistenceError("snapshot artifact has an unexpected owner")
 
@@ -511,24 +606,177 @@ def _name_metadata(directory_descriptor: int, name: str) -> os.stat_result:
         raise PersistenceError("unable to inspect snapshot artifact name") from error
 
 
-def _unlink_if_identity(
+def _recover_orphaned_stages(
+    directory_descriptor: int,
+    entries: Sequence[str],
+) -> None:
+    final_names = [name for name in entries if _is_final_name(name)]
+    for staged_name in sorted(
+        name
+        for name in entries
+        if _STAGED_NAME.fullmatch(name) is not None
+        or _QUARANTINE_NAME.fullmatch(name) is not None
+    ):
+        staged = _name_metadata(directory_descriptor, staged_name)
+        if (
+            staged.st_nlink != 2
+            and _QUARANTINE_NAME.fullmatch(staged_name) is not None
+        ):
+            continue
+        _validate_regular(staged, expected_links=2)
+        identity = _inode(staged)
+        matching_finals: list[tuple[str, os.stat_result]] = []
+        for final_name in final_names:
+            final = _name_metadata(directory_descriptor, final_name)
+            if _inode(final) == identity:
+                matching_finals.append((final_name, final))
+        if len(matching_finals) != 1:
+            raise PersistenceError(
+                "orphan snapshot stage does not have exactly one final link"
+            )
+        final_name, final_before = matching_finals[0]
+        _validate_regular(
+            final_before,
+            expected_links=2,
+            expected_size=staged.st_size,
+        )
+        _quarantine_remove_expected(
+            directory_descriptor,
+            staged_name,
+            identity,
+            missing_ok=True,
+        )
+        final_after = _name_metadata(directory_descriptor, final_name)
+        _validate_regular(
+            final_after,
+            expected_links=1,
+            expected_size=staged.st_size,
+        )
+        if _inode(final_after) != identity:
+            raise PersistenceError(
+                "recovered snapshot final changed identity"
+            )
+        os.fsync(directory_descriptor)
+
+
+def _is_final_name(name: str) -> bool:
+    if not isinstance(name, str) or not name.endswith(".json"):
+        return False
+    try:
+        _validate_run_id(name[:-5])
+    except InputValidationError:
+        return False
+    return True
+
+
+def _quarantine_remove_expected(
     directory_descriptor: int,
     name: str,
     expected_identity: tuple[int, int],
+    *,
+    missing_ok: bool,
+) -> bool:
+    quarantine = f".quarantine-{secrets.token_hex(24)}.holding"
+    try:
+        os.rename(
+            name,
+            quarantine,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+    except FileNotFoundError:
+        if missing_ok:
+            return False
+        raise PersistenceError("snapshot cleanup target disappeared")
+    except OSError as error:
+        raise PersistenceError("unable to quarantine snapshot artifact") from error
+
+    descriptor: int | None = None
+    try:
+        descriptor = _open_snapshot_file(directory_descriptor, quarantine)
+        opened = os.fstat(descriptor)
+        named = _name_metadata(directory_descriptor, quarantine)
+        if _inode(opened) != _inode(named):
+            raise PersistenceError("snapshot quarantine changed during open")
+        if _inode(opened) != expected_identity:
+            _close_descriptor(descriptor)
+            descriptor = None
+            _restore_quarantine(
+                directory_descriptor,
+                quarantine,
+                name,
+            )
+            raise PersistenceError(
+                "snapshot cleanup refused a competing inode"
+            )
+        _validate_regular(opened, expected_links=None)
+        _validate_regular(
+            named,
+            expected_links=opened.st_nlink,
+            expected_size=opened.st_size,
+        )
+        os.unlink(quarantine, dir_fd=directory_descriptor)
+        os.fsync(directory_descriptor)
+        return True
+    except (PersistenceError, OSError) as error:
+        if _name_exists(directory_descriptor, quarantine):
+            _restore_quarantine(
+                directory_descriptor,
+                quarantine,
+                name,
+            )
+        if isinstance(error, PersistenceError):
+            raise
+        raise PersistenceError("unable to remove quarantined snapshot") from error
+    finally:
+        if descriptor is not None:
+            _close_descriptor(descriptor)
+
+
+def _restore_quarantine(
+    directory_descriptor: int,
+    quarantine: str,
+    original_name: str,
 ) -> None:
     try:
-        metadata = os.stat(
+        os.link(
+            quarantine,
+            original_name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise PersistenceError(
+            "unable to restore competing snapshot artifact; quarantine retained"
+        ) from error
+    quarantine_metadata = _name_metadata(directory_descriptor, quarantine)
+    restored_metadata = _name_metadata(directory_descriptor, original_name)
+    if _inode(quarantine_metadata) != _inode(restored_metadata):
+        raise PersistenceError(
+            "restored snapshot artifact has an unexpected identity"
+        )
+    try:
+        os.unlink(quarantine, dir_fd=directory_descriptor)
+        os.fsync(directory_descriptor)
+    except OSError as error:
+        raise PersistenceError(
+            "unable to finalize competing snapshot restoration"
+        ) from error
+
+
+def _name_exists(directory_descriptor: int, name: str) -> bool:
+    try:
+        os.stat(
             name,
             dir_fd=directory_descriptor,
             follow_symlinks=False,
         )
-        if _inode(metadata) == expected_identity:
-            os.unlink(name, dir_fd=directory_descriptor)
-            os.fsync(directory_descriptor)
     except FileNotFoundError:
-        return
+        return False
     except OSError:
-        return
+        return True
+    return True
 
 
 def _inode(metadata: os.stat_result) -> tuple[int, int]:
@@ -567,11 +815,43 @@ def _canonical_records(records: Sequence[GameRecord]) -> list[dict[str, object]]
 def _canonical_metadata(metadata: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(metadata, Mapping):
         raise InputValidationError("snapshot metadata must be a mapping")
-    frozen = _freeze_json(metadata, "snapshot metadata")
-    thawed = _thaw_json(frozen)
+    try:
+        _validate_metadata_structure(metadata, depth=0, active=set())
+        frozen = _freeze_json(metadata, "snapshot metadata")
+        thawed = _thaw_json(frozen)
+    except RecursionError as error:
+        raise InputValidationError(
+            "snapshot metadata nesting is too deep"
+        ) from error
     if not isinstance(thawed, dict):
         raise InputValidationError("snapshot metadata must be a mapping")
     return thawed
+
+
+def _validate_metadata_structure(
+    value: object,
+    *,
+    depth: int,
+    active: set[int],
+) -> None:
+    if depth > _MAX_JSON_NESTING:
+        raise InputValidationError("snapshot metadata nesting is too deep")
+    if not isinstance(value, (Mapping, list)):
+        return
+    identity = id(value)
+    if identity in active:
+        raise InputValidationError("snapshot metadata must not contain cycles")
+    active.add(identity)
+    try:
+        nested_values = value.values() if isinstance(value, Mapping) else value
+        for nested in nested_values:
+            _validate_metadata_structure(
+                nested,
+                depth=depth + 1,
+                active=active,
+            )
+    finally:
+        active.remove(identity)
 
 
 def _snapshot_datetime(snapshot: Mapping[str, object]) -> datetime:
@@ -617,10 +897,20 @@ def _validate_window(target: int, minimum: int, maximum: int) -> None:
 
 
 def _parse_json_integer(value: str) -> int:
-    parsed = int(value)
-    if parsed < MIN_JSON_SAFE_INTEGER or parsed > MAX_JSON_SAFE_INTEGER:
+    negative = value.startswith("-")
+    digits = value[1:] if negative else value
+    if not digits or any(character < "0" or character > "9" for character in digits):
+        raise ValueError("snapshot integer is malformed")
+    normalized = digits.lstrip("0") or "0"
+    limit = str(
+        abs(MIN_JSON_SAFE_INTEGER) if negative else MAX_JSON_SAFE_INTEGER
+    )
+    if len(normalized) > len(limit) or (
+        len(normalized) == len(limit) and normalized > limit
+    ):
         raise ValueError("snapshot integer is outside the JSON-safe range")
-    return parsed
+    parsed = int(normalized)
+    return -parsed if negative else parsed
 
 
 def _reject_json_constant(value: str) -> float:

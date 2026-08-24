@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
 import unittest
@@ -100,6 +101,112 @@ class SnapshotTests(unittest.TestCase):
                 persist_snapshot(config, first_run, [], {"run": "replacement"})
             self.assertEqual(first.read_bytes(), original)
 
+            staged = first.parent / ".snapshot-0123456789abcdef01234567.staged"
+            os.link(first, staged)
+            self.assertEqual(first.stat().st_nlink, 2)
+            recovered = load_snapshots(config)
+            self.assertEqual(len(recovered), 2)
+            self.assertFalse(staged.exists())
+            self.assertEqual(first.stat().st_nlink, 1)
+
+            competitor = b"competitor-must-survive"
+            real_stat = os.stat
+            real_rename = os.rename
+            real_open = os.open
+            staged_stats = 0
+            raced = False
+
+            def install_competitor(name: str, dir_fd: int) -> None:
+                nonlocal raced
+                backup = ".owner-backup.staged"
+                real_rename(
+                    name,
+                    backup,
+                    src_dir_fd=dir_fd,
+                    dst_dir_fd=dir_fd,
+                )
+                descriptor = real_open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=dir_fd,
+                )
+                try:
+                    os.fchmod(descriptor, 0o600)
+                    os.write(descriptor, competitor)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                raced = True
+
+            def racing_stat(
+                name: object,
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ) -> os.stat_result:
+                nonlocal staged_stats
+                result = real_stat(
+                    name,
+                    dir_fd=dir_fd,
+                    follow_symlinks=follow_symlinks,
+                )
+                if (
+                    isinstance(name, str)
+                    and name.startswith(".snapshot-")
+                    and name.endswith(".staged")
+                    and dir_fd is not None
+                ):
+                    staged_stats += 1
+                    if staged_stats == 2 and not raced:
+                        install_competitor(name, dir_fd)
+                return result
+
+            def racing_rename(
+                source: object,
+                destination: object,
+                *,
+                src_dir_fd: int | None = None,
+                dst_dir_fd: int | None = None,
+            ) -> None:
+                if (
+                    isinstance(source, str)
+                    and source.startswith(".snapshot-")
+                    and source.endswith(".staged")
+                    and isinstance(destination, str)
+                    and ".quarantine-" in destination
+                    and src_dir_fd is not None
+                    and not raced
+                ):
+                    install_competitor(source, src_dir_fd)
+                real_rename(
+                    source,
+                    destination,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
+                )
+
+            with mock.patch(
+                "steam_game_radar.snapshot.os.stat",
+                side_effect=racing_stat,
+            ), mock.patch(
+                "steam_game_radar.snapshot.os.rename",
+                side_effect=racing_rename,
+            ), self.assertRaises(PersistenceError):
+                persist_snapshot(config, first_run, [], {"run": "collision"})
+
+            self.assertTrue(raced)
+            surviving_values = []
+            for candidate in first.parent.iterdir():
+                try:
+                    if candidate.is_file():
+                        surviving_values.append(candidate.read_bytes())
+                except OSError:
+                    continue
+            self.assertIn(competitor, surviving_values)
+            self.assertTrue(first.exists())
+            self.assertEqual(first.read_bytes(), original)
+
     def test_persist_snapshot_atomically_publishes_valid_json(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             config = RadarConfig(data_dir=Path(directory))
@@ -157,6 +264,21 @@ class SnapshotTests(unittest.TestCase):
                 )
             self.assertFalse((outside / "data").exists())
 
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            restrictive = RadarConfig(data_dir=Path(directory))
+            previous_umask = os.umask(0o777)
+            try:
+                restricted_path = persist_snapshot(
+                    restrictive,
+                    "20260824T030405Z-87654321",
+                    [self.record()],
+                    {"permissions": "strict"},
+                )
+            finally:
+                os.umask(previous_umask)
+            self.assertEqual(stat.S_IMODE(restricted_path.stat().st_mode), 0o600)
+            self.assertEqual(len(load_snapshots(restrictive)), 1)
+
     def test_snapshot_has_versioned_canonical_schema(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             config = RadarConfig(data_dir=Path(directory))
@@ -201,6 +323,70 @@ class SnapshotTests(unittest.TestCase):
             payload["schema_version"] = 1.0
             atomic_write_json(path, payload)
             with self.assertRaises(PersistenceError):
+                load_snapshots(config)
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            config = RadarConfig(data_dir=Path(directory))
+            cycle: dict[str, object] = {}
+            cycle["self"] = cycle
+            with self.assertRaises(InputValidationError):
+                persist_snapshot(
+                    config,
+                    "20260824T030407Z-aaaaaaaa",
+                    [],
+                    cycle,
+                )
+
+            deep: dict[str, object] = {}
+            cursor = deep
+            for _ in range(500):
+                child: dict[str, object] = {}
+                cursor["nested"] = child
+                cursor = child
+            with self.assertRaises(InputValidationError):
+                persist_snapshot(
+                    config,
+                    "20260824T030408Z-bbbbbbbb",
+                    [],
+                    deep,
+                )
+
+            run_id = "20260824T030409Z-cccccccc"
+            path = persist_snapshot(config, run_id, [], {})
+            deep_json = (
+                '{"metadata":{"nested":'
+                + "[" * 500
+                + "0"
+                + "]" * 500
+                + '},"observed_at":"2026-08-24T03:04:09Z",'
+                + '"records":[],"run_id":"'
+                + run_id
+                + '","schema_version":1}'
+            )
+            path.write_text(deep_json, encoding="utf-8")
+            with self.assertRaises(PersistenceError):
+                load_snapshots(config)
+
+            huge_integer_json = (
+                '{"metadata":{"huge":'
+                + "9" * 50_000
+                + '},"observed_at":"2026-08-24T03:04:09Z",'
+                + '"records":[],"run_id":"'
+                + run_id
+                + '","schema_version":1}'
+            )
+            path.write_text(huge_integer_json, encoding="utf-8")
+            real_int = int
+
+            def reject_large_int_conversion(value: object, *args: object) -> int:
+                if isinstance(value, str) and len(value) > 1_000:
+                    raise AssertionError("oversized integer reached int()")
+                return real_int(value, *args)
+
+            with mock.patch(
+                "builtins.int",
+                side_effect=reject_large_int_conversion,
+            ), self.assertRaises(PersistenceError):
                 load_snapshots(config)
 
     def test_load_snapshots_sorts_by_explicit_utc_time_not_mtime(self) -> None:
