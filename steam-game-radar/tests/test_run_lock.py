@@ -321,6 +321,34 @@ class RunLockTests(unittest.TestCase):
             with self.assertRaises(RunBusyError):
                 self._lock(future).__enter__()
 
+            state_directory = root / "hardlink-state"
+            state_directory.mkdir()
+            victim = root / "outside-gate-victim.txt"
+            victim.write_text("do-not-touch", encoding="utf-8")
+            victim.chmod(0o644)
+            hardlinked_gate = state_directory / ".steam-radar-run-lock.gate"
+            os.link(victim, hardlinked_gate)
+            victim_before = victim.stat()
+            with self.assertRaises(PersistenceError):
+                self._lock(state_directory / "radar.lock").__enter__()
+            victim_after = victim.stat()
+            self.assertEqual(victim.read_text(encoding="utf-8"), "do-not-touch")
+            self.assertEqual(stat.S_IMODE(victim_after.st_mode), 0o644)
+            self.assertEqual(victim_after.st_ino, victim_before.st_ino)
+            self.assertEqual(victim_after.st_nlink, 2)
+            self.assertEqual(hardlinked_gate.stat().st_ino, victim_before.st_ino)
+            self.assertFalse((state_directory / "radar.lock").exists())
+
+            wrong_mode_state = root / "wrong-mode-state"
+            wrong_mode_state.mkdir()
+            wrong_mode_gate = wrong_mode_state / ".steam-radar-run-lock.gate"
+            wrong_mode_gate.write_bytes(b"")
+            wrong_mode_gate.chmod(0o640)
+            with self.assertRaises(PersistenceError):
+                self._lock(wrong_mode_state / "radar.lock").__enter__()
+            self.assertEqual(stat.S_IMODE(wrong_mode_gate.stat().st_mode), 0o640)
+            self.assertFalse((wrong_mode_state / "radar.lock").exists())
+
     def test_context_manager_cleanup_missing_lock_and_double_exit_are_harmless(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             path = Path(directory) / "radar.lock"
@@ -389,7 +417,7 @@ class RunLockTests(unittest.TestCase):
             def fail_canonical_fchmod(descriptor: int, mode: int) -> None:
                 nonlocal fchmod_calls
                 fchmod_calls += 1
-                if fchmod_calls == 2:
+                if fchmod_calls == 1:
                     raise OSError("mode failed")
                 real_fchmod(descriptor, mode)
 
@@ -399,7 +427,7 @@ class RunLockTests(unittest.TestCase):
             ), self.assertRaises(PersistenceError):
                 self._lock(path).__enter__()
             self.assertFalse(path.exists())
-            self.assertEqual(fchmod_calls, 2)
+            self.assertEqual(fchmod_calls, 1)
 
             real_rename = os.rename
             before_move = Path(directory) / "cleanup-before-move.lock"

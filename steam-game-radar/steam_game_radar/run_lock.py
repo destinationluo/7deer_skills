@@ -3,6 +3,8 @@
 A permanent mode-0600 sidecar gate serializes short lock-management operations.
 The gate is never removed: ``flock`` is crash-released while the canonical JSON
 lock continues to represent ownership of the user critical section.
+Absolute lock paths must use canonical, non-symlink directory components; the
+descriptor walk deliberately does not resolve symlink-prefixed aliases.
 """
 
 from __future__ import annotations
@@ -270,7 +272,18 @@ class RunLock:
                     except OSError:
                         pass
                     raise
-                os.close(descriptor)
+                old_descriptor = descriptor
+                try:
+                    os.close(old_descriptor)
+                except OSError as exc:
+                    try:
+                        os.close(next_descriptor)
+                    except OSError:
+                        pass
+                    descriptor = -1
+                    raise PersistenceError(
+                        "cannot close traversed lock-directory descriptor"
+                    ) from exc
                 descriptor = next_descriptor
             if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
                 raise PersistenceError("lock parent is not a directory")
@@ -284,25 +297,84 @@ class RunLock:
             raise PersistenceError("cannot securely traverse lock parent") from exc
         return descriptor
 
+    def _validate_gate_metadata(
+        self,
+        metadata: os.stat_result,
+        *,
+        require_exact_mode: bool,
+    ) -> None:
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PersistenceError("run-lock gate is not a regular file")
+        if metadata.st_nlink != 1:
+            raise PersistenceError("run-lock gate must have exactly one link")
+        if metadata.st_size != 0:
+            raise PersistenceError("run-lock gate must be empty")
+        if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+            raise PersistenceError("run-lock gate has an unexpected owner")
+        mode = stat.S_IMODE(metadata.st_mode)
+        if require_exact_mode:
+            if mode != 0o600:
+                raise PersistenceError("existing run-lock gate must use mode 0600")
+        elif mode & ~0o600:
+            raise PersistenceError("new run-lock gate has unsafe permissions")
+
+    def _gate_name_metadata(self, parent_descriptor: int) -> os.stat_result:
+        try:
+            return os.stat(
+                _GATE_NAME,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise PersistenceError("cannot inspect run-lock gate name") from exc
+
     def _acquire_gate(self, parent_descriptor: int) -> int:
-        flags = os.O_CREAT | os.O_RDWR
+        flags = os.O_RDWR
         flags |= getattr(os, "O_NOFOLLOW", 0)
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NONBLOCK", 0)
+        created = False
         try:
             descriptor = os.open(
                 _GATE_NAME,
-                flags,
+                flags | os.O_CREAT | os.O_EXCL,
                 0o600,
                 dir_fd=parent_descriptor,
             )
         except OSError as exc:
-            raise PersistenceError("cannot securely open run-lock gate") from exc
+            if exc.errno != errno.EEXIST:
+                raise PersistenceError("cannot securely create run-lock gate") from exc
+            try:
+                descriptor = os.open(
+                    _GATE_NAME,
+                    flags,
+                    dir_fd=parent_descriptor,
+                )
+            except OSError as open_error:
+                raise PersistenceError(
+                    "cannot securely open existing run-lock gate"
+                ) from open_error
+        else:
+            created = True
         try:
             metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise PersistenceError("run-lock gate is not a regular file")
-            os.fchmod(descriptor, 0o600)
+            self._validate_gate_metadata(
+                metadata,
+                require_exact_mode=not created,
+            )
+            named_metadata = self._gate_name_metadata(parent_descriptor)
+            self._validate_gate_metadata(
+                named_metadata,
+                require_exact_mode=not created,
+            )
+            if (metadata.st_dev, metadata.st_ino) != (
+                named_metadata.st_dev,
+                named_metadata.st_ino,
+            ):
+                raise PersistenceError("run-lock gate name changed during open")
+            if created:
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
             while True:
                 try:
                     fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -311,6 +383,21 @@ class RunLock:
                     continue
                 except OSError as exc:
                     raise PersistenceError("cannot acquire run-lock gate") from exc
+            locked_metadata = os.fstat(descriptor)
+            self._validate_gate_metadata(
+                locked_metadata,
+                require_exact_mode=True,
+            )
+            locked_named_metadata = self._gate_name_metadata(parent_descriptor)
+            self._validate_gate_metadata(
+                locked_named_metadata,
+                require_exact_mode=True,
+            )
+            if (locked_metadata.st_dev, locked_metadata.st_ino) != (
+                locked_named_metadata.st_dev,
+                locked_named_metadata.st_ino,
+            ):
+                raise PersistenceError("run-lock gate changed before acquisition")
             return descriptor
         except Exception as exc:
             try:
