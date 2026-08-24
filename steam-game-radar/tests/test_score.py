@@ -174,10 +174,28 @@ class ScoreTests(unittest.TestCase):
         self.assertNotIn("release_recency", future.metric_scores)
 
     def test_released_gate_uses_available_weighted_average(self) -> None:
-        insufficient = score_released(self.candidate(metrics={"current_players": self.observation(100_000, "players")}))
-        self.assertIsNone(insufficient.steam_heat_score)
-        self.assertEqual(insufficient.action, "insufficient_data")
-        self.assertEqual(insufficient.confidence, "C")
+        count_failure = score_released(
+            self.candidate(deltas={"current_players_1d_percent": 60})
+        )
+        self.assertEqual(tuple(count_failure.metric_scores), ("player_growth",))
+        self.assertIsNone(count_failure.steam_heat_score)
+        self.assertEqual(count_failure.action, "insufficient_data")
+        self.assertEqual(count_failure.confidence, "C")
+
+        weight_failure = score_released(
+            self.candidate(
+                metrics={
+                    "current_players": self.observation(100_000, "players"),
+                    "release_date": self.observation("2026-08-24", "release"),
+                }
+            )
+        )
+        self.assertEqual(
+            set(weight_failure.metric_scores),
+            {"current_player_scale", "release_recency"},
+        )
+        self.assertIsNone(weight_failure.steam_heat_score)
+        self.assertEqual(weight_failure.action, "insufficient_data")
 
         passing = score_released(self.candidate(metrics={"current_players": self.observation(100_000, "players")}, deltas={"current_players_1d_percent": 15}))
         self.assertEqual(dict(passing.metric_scores), {"current_player_scale": 100.0, "player_growth": 50.0})
@@ -217,6 +235,23 @@ class ScoreTests(unittest.TestCase):
                 )
                 self.assertEqual(scored.metric_scores["upcoming_rank_improvement"], expected)
 
+        provider_only = score_unreleased(
+            self.candidate(
+                release_status="unreleased",
+                metrics={
+                    "most_played_rank": self.observation(
+                        10,
+                        "steam_most_played_rank",
+                    ),
+                    "previous_rank": self.observation(
+                        60,
+                        "steam_previous_rank",
+                    ),
+                },
+            )
+        )
+        self.assertNotIn("upcoming_rank_improvement", provider_only.metric_scores)
+
     def test_unreleased_uses_larger_wishlist_or_follower_gain(self) -> None:
         gain_cases = ((0, 0), (50, 10), (100, 20), (550, 40), (1000, 60), (3000, 72.5), (5000, 85), (12_500, 92.5), (20_000, 100), (30_000, 100))
         for gain, expected in gain_cases:
@@ -251,15 +286,51 @@ class ScoreTests(unittest.TestCase):
             score_unreleased(self.candidate(release_status="released"))
 
     def test_seo_transforms_require_google_plus_another_metric_and_weight_30(self) -> None:
-        self.assertIsNone(score_seo(self.enrichment(queries=(), youtube=None, reddit=None)))
+        self.assertEqual(
+            score_seo(self.enrichment(google=80, queries=(), youtube=None, reddit=None)),
+            53.3,
+        )
         query_score = score_seo(self.enrichment(google=80, queries=tuple(f"q{i}" for i in range(10))))
         self.assertEqual(query_score, 70.0)
-        capped = score_seo(self.enrichment(google=100, queries=tuple(f"q{i}" for i in range(30))))
-        self.assertEqual(capped, 100.0)
+        for count in (20, 30):
+            with self.subTest(query_count=count):
+                capped = score_seo(
+                    self.enrichment(
+                        google=100,
+                        queries=tuple(f"q{i}" for i in range(count)),
+                    )
+                )
+                self.assertEqual(capped, 100.0)
+
+        community_cases = (
+            (0, 0.0),
+            (1, 5.0),
+            (2, 8.8),
+            (3, 12.5),
+            (6, 15.7),
+            (10, 20.0),
+            (17, 22.3),
+            (25, 25.0),
+            (30, 25.0),
+        )
+        for count, expected in community_cases:
+            with self.subTest(community_count=count):
+                self.assertEqual(
+                    score_seo(
+                        self.enrichment(
+                            google=0,
+                            queries=(),
+                            youtube=count,
+                        )
+                    ),
+                    expected,
+                )
         cross_signal = score_seo(self.enrichment(google=80, queries=(), youtube=3, reddit=10))
-        self.assertEqual(cross_signal, 75.0)
+        self.assertEqual(cross_signal, 56.2)
         youtube_only = score_seo(self.enrichment(google=80, queries=(), youtube=1))
-        self.assertEqual(youtube_only, 60.0)
+        reddit_only = score_seo(self.enrichment(google=80, queries=(), reddit=1))
+        self.assertEqual(youtube_only, 45.0)
+        self.assertEqual(reddit_only, 45.0)
 
     def test_final_score_actions_confidence_evidence_and_content_are_exact(self) -> None:
         record = self.enrichment(youtube=25, reddit=25, reddit_upvotes=20)
@@ -306,6 +377,14 @@ class ScoreTests(unittest.TestCase):
                 final_score=80,
                 action="watch",
                 confidence="B",
+            )
+        with self.assertRaises(InputValidationError):
+            replace(
+                self.preliminary(80),
+                seo_opportunity_score=80,
+                final_score=80,
+                action="immediate_action",
+                confidence="C",
             )
         with self.assertRaises(InputValidationError):
             self.preliminary(float("nan"))

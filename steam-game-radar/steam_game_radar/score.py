@@ -213,7 +213,7 @@ def score_unreleased(candidate: AnalyzedCandidate) -> ScoredCandidate:
 
     _candidate_for_status(candidate, "unreleased")
     raw_scores: dict[str, float] = {}
-    improvement = select_rank_improvement(candidate)
+    improvement = _select_historical_rank_improvement(candidate)
     if improvement is not None:
         raw_scores["upcoming_rank_improvement"] = interpolate(
             _RANK_POINTS,
@@ -252,11 +252,10 @@ def score_seo(record: EnrichmentRecord) -> float | None:
             20,
         )
     }
-    if record.expandable_queries:
-        scores["expandable_query_count"] = (
-            min(len(record.expandable_queries) / 20.0 * 100.0, 100.0),
-            10,
-        )
+    scores["expandable_query_count"] = (
+        min(len(record.expandable_queries) / 20.0 * 100.0, 100.0),
+        10,
+    )
     community = tuple(
         interpolate(_COMMUNITY_POINTS, value)
         for value in (
@@ -412,6 +411,30 @@ def _candidate_for_status(candidate: object, expected: str) -> AnalyzedCandidate
 def _largest_delta(candidate: AnalyzedCandidate, names: Sequence[str]) -> float | None:
     values = tuple(candidate.deltas[name] for name in names if name in candidate.deltas)
     return max(values) if values else None
+
+
+def _select_historical_rank_improvement(
+    candidate: AnalyzedCandidate,
+) -> float | None:
+    """Choose only 7d then 1d deltas for rank metrics present now.
+
+    Unlike released scoring, upcoming scoring has no provider previous-rank
+    fallback. Every selected delta must correspond exactly to a rank metric on
+    the current candidate, preserving the Task 8 same-source history contract.
+    """
+
+    for window in ("7d", "1d"):
+        values = tuple(
+            candidate.deltas[key]
+            for metric_name in sorted(candidate.record.metrics)
+            if metric_name != "previous_rank"
+            and (metric_name == "rank" or metric_name.endswith("_rank"))
+            for key in (f"{metric_name}_{window}_change",)
+            if key in candidate.deltas
+        )
+        if values:
+            return max(values)
+    return None
 
 
 def _non_negative_metric(record: GameRecord, name: str) -> float | None:
