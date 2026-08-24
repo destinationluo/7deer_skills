@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import tempfile
 from typing import Sequence
 
@@ -36,6 +37,26 @@ class _WriteConfinement:
     destination_parent: Path
     resolved_destination_parent: Path
     parent_identity: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class _PruneDirectory:
+    name: str
+    device: int
+    inode: int
+    mode: int
+
+
+@dataclass(frozen=True)
+class _PruneCandidate:
+    directory_chain: tuple[_PruneDirectory, ...]
+    name: str
+    device: int
+    inode: int
+    mode: int
+    modified_at: float
+    modified_at_ns: int
+    logical_path: Path
 
 
 def redact(value: object) -> object:
@@ -143,33 +164,33 @@ def persist_raw(
 def prune_raw(config: RadarConfig, now: datetime) -> Sequence[Path]:
     """Remove safe raw JSON files strictly beyond the retention boundary."""
 
+    if os.name != "posix" or not all(
+        hasattr(os, flag) for flag in ("O_DIRECTORY", "O_NOFOLLOW")
+    ):
+        raise PersistenceError("raw retention requires secure POSIX directory access")
+
     raw_root = config.data_dir / "raw"
+    raw_root_descriptor: int | None = None
     try:
-        try:
-            root_status = raw_root.lstat()
-        except FileNotFoundError:
+        raw_root_descriptor = _open_raw_root(raw_root)
+        if raw_root_descriptor is None:
             return []
-        if stat.S_ISLNK(root_status.st_mode) or not stat.S_ISDIR(
-            root_status.st_mode
-        ):
-            raise PersistenceError("configured raw root is not a safe directory")
-        resolved_root = raw_root.resolve(strict=True)
-        candidates = _prune_candidates(raw_root, resolved_root)
+        candidates = _prune_candidates(raw_root_descriptor, raw_root)
+        cutoff = _utc_timestamp(now) - config.raw_retention_days * 86_400
+        expired = sorted(
+            (candidate for candidate in candidates if candidate.modified_at < cutoff),
+            key=lambda candidate: candidate.logical_path.parts,
+        )
+        for candidate in expired:
+            _delete_prune_candidate(raw_root_descriptor, candidate)
+        return [candidate.logical_path for candidate in expired]
     except PersistenceError:
         raise
     except OSError as error:
-        raise PersistenceError("unable to inspect raw artifacts safely") from error
-
-    cutoff = _utc_timestamp(now) - config.raw_retention_days * 86_400
-    expired = sorted(
-        path for path, modified_at in candidates if modified_at < cutoff
-    )
-    try:
-        for path in expired:
-            path.unlink()
-    except OSError as error:
         raise PersistenceError("unable to prune raw artifacts safely") from error
-    return expired
+    finally:
+        if raw_root_descriptor is not None:
+            _close_descriptors((raw_root_descriptor,))
 
 
 def _is_sensitive_key(key: str) -> bool:
@@ -367,41 +388,247 @@ def _fsync_parent_directory(parent: Path) -> None:
         os.close(descriptor)
 
 
+def _open_raw_root(raw_root: Path) -> int | None:
+    try:
+        expected = raw_root.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(expected.st_mode):
+        raise PersistenceError("configured raw root is not a safe directory")
+
+    descriptor = os.open(raw_root, _directory_open_flags())
+    try:
+        actual = os.fstat(descriptor)
+        if not _same_directory(expected, actual):
+            raise PersistenceError("configured raw root changed during inspection")
+        return descriptor
+    except BaseException:
+        _close_descriptors((descriptor,))
+        raise
+
+
 def _prune_candidates(
+    raw_root_descriptor: int,
     raw_root: Path,
-    resolved_root: Path,
-) -> list[tuple[Path, float]]:
-    candidates: list[tuple[Path, float]] = []
-    for directory, directory_names, file_names in os.walk(
-        raw_root,
-        topdown=True,
-        onerror=_raise_walk_error,
-        followlinks=False,
-    ):
-        current = Path(directory)
-        for directory_name in directory_names:
-            child = current / directory_name
-            child_status = child.lstat()
-            if stat.S_ISLNK(child_status.st_mode):
-                raise PersistenceError("unsafe symlink found below raw root")
-        for file_name in file_names:
-            if not file_name.endswith(".json"):
-                continue
-            candidate = current / file_name
-            candidate_status = candidate.lstat()
-            if stat.S_ISLNK(candidate_status.st_mode):
-                raise PersistenceError("unsafe symlink found below raw root")
-            if not stat.S_ISREG(candidate_status.st_mode):
-                raise PersistenceError("unsafe non-regular raw artifact found")
-            resolved_candidate = candidate.resolve(strict=True)
-            if not _is_relative_to(resolved_candidate, resolved_root):
-                raise PersistenceError("raw artifact resolves outside raw root")
-            candidates.append((candidate, candidate_status.st_mtime))
+) -> list[_PruneCandidate]:
+    candidates: list[_PruneCandidate] = []
+    pending: list[tuple[_PruneDirectory, ...]] = [()]
+    while pending:
+        directory_chain = pending.pop()
+        descriptor = _open_anchored_directory(
+            raw_root_descriptor,
+            directory_chain,
+        )
+        try:
+            with os.scandir(descriptor) as entries:
+                names = sorted(entry.name for entry in entries)
+            child_directories: list[tuple[_PruneDirectory, ...]] = []
+            for name in names:
+                status = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISLNK(status.st_mode):
+                    raise PersistenceError("unsafe symlink found below raw root")
+                if stat.S_ISDIR(status.st_mode):
+                    child = _PruneDirectory(
+                        name=name,
+                        device=status.st_dev,
+                        inode=status.st_ino,
+                        mode=status.st_mode,
+                    )
+                    _verify_child_directory(descriptor, child)
+                    child_directories.append(directory_chain + (child,))
+                    continue
+                if not name.endswith(".json"):
+                    continue
+                if not stat.S_ISREG(status.st_mode):
+                    raise PersistenceError("unsafe non-regular raw artifact found")
+                relative_parts = tuple(
+                    component.name for component in directory_chain
+                ) + (name,)
+                candidates.append(
+                    _PruneCandidate(
+                        directory_chain=directory_chain,
+                        name=name,
+                        device=status.st_dev,
+                        inode=status.st_ino,
+                        mode=status.st_mode,
+                        modified_at=status.st_mtime,
+                        modified_at_ns=status.st_mtime_ns,
+                        logical_path=raw_root.joinpath(*relative_parts),
+                    )
+                )
+            pending.extend(reversed(child_directories))
+        finally:
+            _close_descriptors((descriptor,))
     return candidates
 
 
-def _raise_walk_error(error: OSError) -> None:
-    raise error
+def _verify_child_directory(
+    parent_descriptor: int,
+    expected: _PruneDirectory,
+) -> None:
+    descriptor = os.open(
+        expected.name,
+        _directory_open_flags(),
+        dir_fd=parent_descriptor,
+    )
+    try:
+        actual = os.fstat(descriptor)
+        if not _same_frozen_directory(expected, actual):
+            raise PersistenceError("raw artifact directory changed during inspection")
+    finally:
+        _close_descriptors((descriptor,))
+
+
+def _open_anchored_directory(
+    raw_root_descriptor: int,
+    directory_chain: tuple[_PruneDirectory, ...],
+) -> int:
+    descriptors = [os.dup(raw_root_descriptor)]
+    try:
+        for expected in directory_chain:
+            descriptor = descriptors[-1]
+            visible = os.stat(
+                expected.name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            if not _same_frozen_directory(expected, visible):
+                raise PersistenceError("raw artifact directory changed during pruning")
+            child_descriptor = os.open(
+                expected.name,
+                _directory_open_flags(),
+                dir_fd=descriptor,
+            )
+            descriptors.append(child_descriptor)
+            actual = os.fstat(child_descriptor)
+            if not _same_frozen_directory(expected, actual):
+                raise PersistenceError(
+                    "raw artifact directory changed during pruning"
+                )
+        result = descriptors.pop()
+        return result
+    finally:
+        _close_descriptors(tuple(reversed(descriptors)))
+
+
+def _delete_prune_candidate(
+    raw_root_descriptor: int,
+    candidate: _PruneCandidate,
+) -> None:
+    parent_descriptor = _open_anchored_directory(
+        raw_root_descriptor,
+        candidate.directory_chain,
+    )
+    file_descriptor: int | None = None
+    try:
+        visible = os.stat(
+            candidate.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not _same_frozen_candidate(candidate, visible):
+            raise PersistenceError("raw artifact changed during pruning")
+        file_descriptor = os.open(
+            candidate.name,
+            _file_open_flags(),
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(file_descriptor)
+        if not _same_frozen_candidate(candidate, opened):
+            raise PersistenceError("raw artifact changed during pruning")
+        final_status = os.stat(
+            candidate.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not _same_frozen_candidate(candidate, final_status):
+            raise PersistenceError("raw artifact changed during pruning")
+        os.unlink(candidate.name, dir_fd=parent_descriptor)
+        _fsync_directory_descriptor(parent_descriptor)
+    finally:
+        descriptors = (
+            (file_descriptor, parent_descriptor)
+            if file_descriptor is not None
+            else (parent_descriptor,)
+        )
+        _close_descriptors(descriptors)
+
+
+def _directory_open_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _file_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _same_directory(expected: os.stat_result, actual: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(actual.st_mode)
+        and expected.st_dev == actual.st_dev
+        and expected.st_ino == actual.st_ino
+        and expected.st_mode == actual.st_mode
+    )
+
+
+def _same_frozen_directory(
+    expected: _PruneDirectory,
+    actual: os.stat_result,
+) -> bool:
+    return (
+        stat.S_ISDIR(actual.st_mode)
+        and expected.device == actual.st_dev
+        and expected.inode == actual.st_ino
+        and expected.mode == actual.st_mode
+    )
+
+
+def _same_frozen_candidate(
+    expected: _PruneCandidate,
+    actual: os.stat_result,
+) -> bool:
+    return (
+        stat.S_ISREG(actual.st_mode)
+        and expected.device == actual.st_dev
+        and expected.inode == actual.st_ino
+        and expected.mode == actual.st_mode
+        and expected.modified_at_ns == actual.st_mtime_ns
+    )
+
+
+def _fsync_directory_descriptor(descriptor: int) -> None:
+    unsupported_errors = {
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    }
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        if error.errno not in unsupported_errors:
+            raise
+
+
+def _close_descriptors(descriptors: Sequence[int]) -> None:
+    active_exception = sys.exc_info()[0] is not None
+    first_error: OSError | None = None
+    for descriptor in descriptors:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None and not active_exception:
+        raise first_error
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:

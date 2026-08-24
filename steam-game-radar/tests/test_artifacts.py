@@ -7,7 +7,6 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
-from typing import Callable, Iterator
 import unittest
 from unittest import mock
 
@@ -352,13 +351,105 @@ class ArtifactTests(unittest.TestCase):
             outside.write_text("{}", encoding="utf-8")
             raw_run = root / "data/raw/20260801T000000Z-1234abcd"
             raw_run.mkdir(parents=True)
-            (raw_run / "escape.json").symlink_to(outside)
+            safe_expired = raw_run / "a-safe-expired.json"
+            safe_expired.write_text("{}", encoding="utf-8")
+            expired_timestamp = (
+                datetime(2026, 8, 24, tzinfo=timezone.utc)
+                - timedelta(days=15)
+            ).timestamp()
+            os.utime(
+                safe_expired,
+                (expired_timestamp, expired_timestamp),
+            )
+            (raw_run / "z-escape.json").symlink_to(outside)
             config = RadarConfig(data_dir=root / "data")
 
             with self.assertRaises(PersistenceError):
                 prune_raw(config, datetime(2026, 8, 24, tzinfo=timezone.utc))
 
             self.assertTrue(outside.exists())
+            self.assertTrue(safe_expired.exists())
+
+            race_data = root / "race-data"
+            race_run = race_data / "raw/20260801T000000Z-abcdef12"
+            race_run.mkdir(parents=True)
+            expired = race_run / "victim.json"
+            expired.write_bytes(b"inside")
+            now = datetime(2026, 8, 24, tzinfo=timezone.utc)
+            expired_timestamp = (now - timedelta(days=15)).timestamp()
+            os.utime(expired, (expired_timestamp, expired_timestamp))
+            outside_run = root / "outside-run"
+            outside_run.mkdir()
+            outside_victim = outside_run / expired.name
+            outside_victim.write_bytes(b"outside-must-survive")
+            outside_identity = outside_victim.stat().st_ino
+            moved_run = race_run.with_name(f"{race_run.name}-moved")
+            real_candidates = __import__(
+                "steam_game_radar.artifacts",
+                fromlist=["_prune_candidates"],
+            )._prune_candidates
+
+            def replace_run_after_enumeration(
+                raw_root_descriptor: int,
+                raw_root: Path,
+            ) -> object:
+                candidates = real_candidates(raw_root_descriptor, raw_root)
+                race_run.rename(moved_run)
+                race_run.symlink_to(outside_run, target_is_directory=True)
+                return candidates
+
+            with mock.patch(
+                "steam_game_radar.artifacts._prune_candidates",
+                side_effect=replace_run_after_enumeration,
+            ):
+                try:
+                    prune_raw(
+                        RadarConfig(
+                            data_dir=race_data,
+                            raw_retention_days=14,
+                        ),
+                        now,
+                    )
+                except PersistenceError:
+                    pass
+
+            self.assertEqual(outside_victim.read_bytes(), b"outside-must-survive")
+            self.assertEqual(outside_victim.stat().st_ino, outside_identity)
+
+            missing_data = root / "missing-data"
+            self.assertEqual(
+                prune_raw(
+                    RadarConfig(data_dir=missing_data),
+                    datetime(2026, 8, 24, tzinfo=timezone.utc),
+                ),
+                [],
+            )
+
+            file_data = root / "file-data"
+            file_data.mkdir()
+            (file_data / "raw").write_text("not a directory", encoding="utf-8")
+            with self.assertRaises(PersistenceError):
+                prune_raw(
+                    RadarConfig(data_dir=file_data),
+                    datetime(2026, 8, 24, tzinfo=timezone.utc),
+                )
+
+            linked_data = root / "linked-data"
+            linked_data.mkdir()
+            outside_raw = root / "outside-raw"
+            outside_raw.mkdir()
+            linked_victim = outside_raw / "victim.json"
+            linked_victim.write_bytes(b"linked-outside")
+            (linked_data / "raw").symlink_to(
+                outside_raw,
+                target_is_directory=True,
+            )
+            with self.assertRaises(PersistenceError):
+                prune_raw(
+                    RadarConfig(data_dir=linked_data),
+                    datetime(2026, 8, 24, tzinfo=timezone.utc),
+                )
+            self.assertEqual(linked_victim.read_bytes(), b"linked-outside")
 
             broken_data = root / "broken-data"
             broken_data.mkdir()
@@ -392,24 +483,9 @@ class ArtifactTests(unittest.TestCase):
             expired_timestamp = (now - timedelta(days=15)).timestamp()
             os.utime(expired, (expired_timestamp, expired_timestamp))
 
-            def failing_walk(
-                top: object,
-                *,
-                topdown: bool,
-                onerror: Callable[[OSError], None],
-                followlinks: bool,
-            ) -> Iterator[tuple[str, list[str], list[str]]]:
-                del top, topdown, followlinks
-
-                def entries() -> Iterator[tuple[str, list[str], list[str]]]:
-                    yield str(run_dir), [], [expired.name]
-                    onerror(PermissionError("private traversal detail"))
-
-                return entries()
-
             with mock.patch(
-                "steam_game_radar.artifacts.os.walk",
-                side_effect=failing_walk,
+                "steam_game_radar.artifacts.os.scandir",
+                side_effect=PermissionError("private traversal detail"),
             ), self.assertRaises(PersistenceError) as captured:
                 prune_raw(config, now)
 
