@@ -214,8 +214,35 @@ class SkillDocumentationTests(unittest.TestCase):
         self.assertIn("not N per pool", workflow)
         self.assertIn("already limited by configured `enrichment_top_n`", workflow)
         self.assertIn("manifest field is authoritative", workflow)
-        self.assertIn("TZ=Asia/Shanghai", text)
-        self.assertIn("0 11 * * *", text)
+        cron_section = schedule[schedule.find("### Conventional cron") :]
+        cron_blocks = {
+            label: block
+            for label, block in re.findall(
+                r"#### (Repository checkout|Installed in the target project)\n\n```cron\n(.*?)\n```",
+                cron_section,
+                flags=re.DOTALL,
+            )
+        }
+        self.assertEqual(
+            cron_blocks,
+            {
+                "Repository checkout": (
+                    "TZ=Asia/Shanghai\n"
+                    "0 11 * * * cd /absolute/path/to/project && "
+                    "python3 steam-game-radar/scripts/steam_radar.py scan "
+                    "--config steam-game-radar/references/config.example.json"
+                ),
+                "Installed in the target project": (
+                    "TZ=Asia/Shanghai\n"
+                    "0 11 * * * cd /absolute/path/to/project && "
+                    "python3 .agent/skills/steam-game-radar/scripts/steam_radar.py scan "
+                    "--config .agent/skills/steam-game-radar/references/config.example.json"
+                ),
+            },
+        )
+        cron_flat = " ".join(cron_section.split())
+        self.assertIn("scan-only and preliminary-only", cron_flat)
+        self.assertIn("target project root", cron_flat)
         self.assertRegex(
             text,
             r"(?s)conventional cron.*?(?:preliminary-only|\u4ec5\u751f\u6210 preliminary).*?(?:\u72ec\u7acb Agent|separate agent)",
@@ -460,6 +487,8 @@ class SkillDocumentationTests(unittest.TestCase):
             "supplied YouTube or Reddit signals require source-matching evidence",
             "evidence URLs must use HTTPS",
             "file `run_id` must exactly match the preliminary manifest `run_id`",
+            "Evidence URLs must use HTTPS and reject credentials/userinfo, fragments, whitespace, and backslashes",
+            "An explicit port is allowed only when it is exactly 443",
         ):
             self.assertIn(contract, enrichment_section)
 

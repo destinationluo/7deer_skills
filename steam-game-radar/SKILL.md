@@ -106,15 +106,27 @@ stdout. A preliminary example is:
 6. Immediately capture and consume the final one-line manifest, including its
    report paths and warnings.
 
-For a host without agent scheduling, conventional cron is scan-only:
+### Conventional cron
+
+For a host without Agent scheduling, use either labeled form below from the
+target project root. These conventional cron forms are scan-only and
+preliminary-only; a separate agent must perform enrichment.
+
+#### Repository checkout
 
 ```cron
 TZ=Asia/Shanghai
 0 11 * * * cd /absolute/path/to/project && python3 steam-game-radar/scripts/steam_radar.py scan --config steam-game-radar/references/config.example.json
 ```
 
-This conventional cron is preliminary-only unless a separate agent performs
-enrichment. This Skill never edits cron or any scheduled task.
+#### Installed in the target project
+
+```cron
+TZ=Asia/Shanghai
+0 11 * * * cd /absolute/path/to/project && python3 .agent/skills/steam-game-radar/scripts/steam_radar.py scan --config .agent/skills/steam-game-radar/references/config.example.json
+```
+
+This Skill never edits cron or any scheduled task.
 
 ## Policy and outputs
 
