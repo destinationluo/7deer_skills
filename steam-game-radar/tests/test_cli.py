@@ -1117,6 +1117,62 @@ class CliTests(unittest.TestCase):
             ):
                 self.assertEqual(cli.main(["scan", "--config", "cfg.json"]), expected)
 
+        class ReleaseFailingRunLock(cli.RunLock):
+            def __exit__(
+                self,
+                exc_type: object,
+                exc: object,
+                traceback: object,
+            ) -> bool:
+                super().__exit__(exc_type, exc, traceback)
+                raise PersistenceError("run lock release failed")
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            self.write_config(root)
+            self.write_manual_csv(root)
+            emitted: list[str] = []
+            services = replace(
+                self.services(root),
+                lock_factory=ReleaseFailingRunLock,
+                emit_manifest=emitted.append,
+            )
+            with mock.patch.object(
+                cli,
+                "Services",
+                return_value=services,
+            ), mock.patch(
+                "sys.stderr",
+                new_callable=io.StringIO,
+            ) as stderr:
+                self.assertEqual(
+                    cli.main(
+                        [
+                            "import-steamdb",
+                            "--config",
+                            "radar.json",
+                            "--view",
+                            "wishlist_activity",
+                            "--input",
+                            "steamdb.csv",
+                        ]
+                    ),
+                    5,
+                )
+            self.assertEqual(emitted, [])
+            self.assertIn("PersistenceError: run lock release failed", stderr.getvalue())
+            self.assertTrue(
+                (
+                    root
+                    / "output"
+                    / "steam-radar"
+                    / f"{RUN_A}.preliminary.json"
+                ).exists()
+            )
+            self.assertFalse(
+                (root / "state" / "steam-radar" / ".run.lock").exists()
+            )
+
     def test_main_unexpected_exception_prints_traceback_and_returns_one(self) -> None:
         original = RuntimeError("unexpected sentinel")
         with mock.patch.object(

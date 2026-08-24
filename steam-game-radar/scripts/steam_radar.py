@@ -268,7 +268,7 @@ def run_scan(args: argparse.Namespace, services: Services) -> int:
 
         services.persist_snapshot(config, run_id, records, metadata)
         services.prune_raw(config, started_at)
-        _persist_preliminary(
+        manifest_line = _persist_preliminary(
             config=config,
             run_id=run_id,
             generated_at=observed_at,
@@ -282,6 +282,7 @@ def run_scan(args: argparse.Namespace, services: Services) -> int:
             services=services,
             use_history=True,
         )
+    services.emit_manifest(manifest_line)
     return 0
 
 
@@ -350,7 +351,7 @@ def run_import(args: argparse.Namespace, services: Services) -> int:
         )
         services.persist_snapshot(config, run_id, merged.records, metadata)
         services.prune_raw(config, started_at)
-        _persist_preliminary(
+        manifest_line = _persist_preliminary(
             config=config,
             run_id=run_id,
             generated_at=observed_at,
@@ -364,6 +365,7 @@ def run_import(args: argparse.Namespace, services: Services) -> int:
             services=services,
             use_history=merged.mode != "manual_baseline",
         )
+    services.emit_manifest(manifest_line)
     return 0
 
 
@@ -434,12 +436,12 @@ def run_enrich(args: argparse.Namespace, services: Services) -> int:
             rejected_rows=metadata["rejected_rows"],
         )
         report_paths = services.persist_report(config, report, lock)
-        _emit_run_manifest(
-            services,
+        manifest_line = _build_run_manifest_line(
             report,
             report_paths,
             enrichment_candidate_appids=(),
         )
+    services.emit_manifest(manifest_line)
     return 0
 
 
@@ -600,7 +602,7 @@ def _persist_preliminary(
     lock: RunLock,
     services: Services,
     use_history: bool,
-) -> None:
+) -> str:
     current_time = datetime.fromisoformat(generated_at[:-1] + "+00:00")
     analyzed = _analyze(records, history, current_time, services, use_history)
     scored = _score_analyzed(analyzed, services)
@@ -622,8 +624,7 @@ def _persist_preliminary(
         rejected_rows=rejected_rows,
     )
     report_paths = services.persist_report(config, report, lock)
-    _emit_run_manifest(
-        services,
+    return _build_run_manifest_line(
         report,
         report_paths,
         enrichment_candidate_appids=_enrichment_candidate_appids(
@@ -706,13 +707,12 @@ def _enrichment_candidate_appids(
     )
 
 
-def _emit_run_manifest(
-    services: Services,
+def _build_run_manifest_line(
     report: Mapping[str, object],
     report_paths: tuple[Path, Path],
     *,
     enrichment_candidate_appids: Sequence[int],
-) -> None:
+) -> str:
     json_path, markdown_path = report_paths
     manifest = {
         "schema_version": 1,
@@ -723,7 +723,7 @@ def _emit_run_manifest(
         "warnings": report["warnings"],
         "enrichment_candidate_appids": list(enrichment_candidate_appids),
     }
-    services.emit_manifest(_serialize_manifest(manifest))
+    return _serialize_manifest(manifest)
 
 
 def _serialize_manifest(value: object) -> str:
