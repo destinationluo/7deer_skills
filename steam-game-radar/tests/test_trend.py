@@ -10,7 +10,12 @@ import unittest
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
-from steam_game_radar.schemas import GameRecord, MetricObservation
+from steam_game_radar.errors import InputValidationError
+from steam_game_radar.schemas import (
+    GameRecord,
+    MAX_JSON_SAFE_INTEGER,
+    MetricObservation,
+)
 from steam_game_radar.trend import (
     AnalyzedCandidate,
     analyze_trends,
@@ -33,6 +38,8 @@ class TrendTests(unittest.TestCase):
         self,
         appid: int,
         metrics: dict[str, tuple[object, str, str]],
+        *,
+        source_kind: str = "steam_official",
     ) -> GameRecord:
         return GameRecord(
             schema_version=1,
@@ -44,7 +51,7 @@ class TrendTests(unittest.TestCase):
                 name: MetricObservation(
                     value=value,
                     source_id=source_id,
-                    source_kind="steam_official",
+                    source_kind=source_kind,
                     observed_at=observed_at,
                 )
                 for name, (value, source_id, observed_at) in metrics.items()
@@ -52,7 +59,12 @@ class TrendTests(unittest.TestCase):
             source_extra={"genres": ["Action"]},
         )
 
-    def snapshot(self, records: list[GameRecord]) -> Mapping[str, object]:
+    def snapshot(
+        self,
+        records: list[GameRecord],
+        *,
+        frozen: bool = True,
+    ) -> Mapping[str, object]:
         snapshot = {
             "schema_version": 1,
             "run_id": "20260823T120000Z-1234abcd",
@@ -60,9 +72,11 @@ class TrendTests(unittest.TestCase):
             "records": [record.to_dict() for record in records],
             "metadata": {},
         }
-        frozen = deep_freeze(snapshot)
-        self.assertIsInstance(frozen, Mapping)
-        return frozen
+        if not frozen:
+            return snapshot
+        frozen_snapshot = deep_freeze(snapshot)
+        self.assertIsInstance(frozen_snapshot, Mapping)
+        return frozen_snapshot
 
     def test_deltas_require_the_same_metric_name_and_source_id(self) -> None:
         current = self.record(
@@ -84,6 +98,58 @@ class TrendTests(unittest.TestCase):
                     [current], self.snapshot([historical]), None
                 )[0]
                 self.assertEqual(dict(candidate.deltas), {})
+
+        plain_snapshot = self.snapshot([wrong_source], frozen=False)
+        self.assertEqual(
+            dict(analyze_trends([current], plain_snapshot, None)[0].deltas),
+            {},
+        )
+
+        manual_current = self.record(
+            11,
+            {"current_players": (150, "steamdb_players", "2026-08-24T12:00:00Z")},
+            source_kind="steamdb_manual_import",
+        )
+        manual_history = self.record(
+            11,
+            {"current_players": (100, "steamdb_players", "2026-08-23T12:00:00Z")},
+            source_kind="steamdb_manual_import",
+        )
+        manual_candidate = analyze_trends(
+            [manual_current], self.snapshot([manual_history]), None
+        )[0]
+        self.assertEqual(
+            manual_candidate.deltas["current_players_1d_percent"],
+            50.0,
+        )
+
+        cycle: dict[str, object] = {}
+        cycle["self"] = cycle
+        too_deep: object = None
+        for _ in range(258):
+            too_deep = [too_deep]
+        invalid_metadata = (
+            {"bad": {"not", "json"}},
+            {"bad": object()},
+            {1: "non-string key"},
+            {"bad": float("nan")},
+            {"bad": float("inf")},
+            {"bad": MAX_JSON_SAFE_INTEGER + 1},
+            cycle,
+            {"bad": too_deep},
+        )
+        for metadata in invalid_metadata:
+            invalid = dict(plain_snapshot)
+            invalid["metadata"] = metadata
+            with self.subTest(metadata=type(metadata).__name__), self.assertRaises(
+                InputValidationError
+            ):
+                analyze_trends([current], invalid, None)
+
+        invalid_top_level = dict(plain_snapshot)
+        invalid_top_level["unexpected"] = {"bad": object()}
+        with self.assertRaises(InputValidationError):
+            analyze_trends([current], invalid_top_level, None)
 
     def test_one_day_percentage_is_exact_and_zero_baseline_is_omitted(self) -> None:
         current = [

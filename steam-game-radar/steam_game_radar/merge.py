@@ -5,12 +5,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 import json
+import math
 import re
 from typing import Literal, Mapping, Sequence, cast
 
 from .config import RadarConfig
 from .errors import InputValidationError
-from .schemas import GameRecord, MetricObservation, RejectedRow, WarningRecord
+from .schemas import (
+    GameRecord,
+    MAX_JSON_SAFE_INTEGER,
+    MIN_JSON_SAFE_INTEGER,
+    MetricObservation,
+    RejectedRow,
+    WarningRecord,
+)
 
 
 MergeMode = Literal["official_plus_manual", "manual_baseline"]
@@ -190,45 +198,65 @@ def _validate_imported(
 def _validate_official_snapshot(
     snapshot: Mapping[str, object],
 ) -> tuple[datetime, tuple[GameRecord, ...]]:
-    if not isinstance(snapshot, Mapping) or set(snapshot) != _SNAPSHOT_FIELDS:
-        raise InputValidationError("official snapshot has an invalid top-level schema")
-    version = snapshot["schema_version"]
-    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
-        raise InputValidationError("official snapshot schema_version must be exactly 1")
-    run_id = snapshot["run_id"]
-    if not isinstance(run_id, str) or _RUN_ID.fullmatch(run_id) is None:
-        raise InputValidationError("official snapshot has an invalid run ID")
-    observed_at = _parse_utc(snapshot["observed_at"], "official snapshot observed_at")
-    expected_time = datetime.strptime(run_id[:16], "%Y%m%dT%H%M%SZ").replace(
-        tzinfo=timezone.utc
+    observed_at, records = _validate_snapshot(
+        snapshot,
+        label="official snapshot",
     )
-    if observed_at != expected_time:
-        raise InputValidationError("official snapshot time does not match its run ID")
-    if not isinstance(snapshot["metadata"], Mapping):
-        raise InputValidationError("official snapshot metadata must be a mapping")
-
-    raw_records = snapshot["records"]
-    if isinstance(raw_records, (str, bytes)) or not isinstance(raw_records, Sequence):
-        raise InputValidationError("official snapshot records must be a sequence")
-    records: list[GameRecord] = []
-    appids: set[int] = set()
-    for raw_record in raw_records:
-        if isinstance(raw_record, GameRecord):
-            canonical = raw_record.to_dict()
-        elif isinstance(raw_record, Mapping):
-            canonical = _thaw_snapshot_value(raw_record)
-        else:
-            raise InputValidationError("official snapshot records are invalid")
-        if not isinstance(canonical, Mapping):  # pragma: no cover - guarded above
-            raise InputValidationError("official snapshot records are invalid")
-        record = GameRecord.from_dict(canonical)
-        if record.appid in appids:
-            raise InputValidationError("official snapshot contains duplicate AppIDs")
+    for record in records:
         if any(
             observation.source_kind != "steam_official"
             for observation in record.metrics.values()
         ):
             raise InputValidationError("official snapshot contains non-official metrics")
+    return observed_at, records
+
+
+def _validate_snapshot(
+    snapshot: Mapping[str, object],
+    *,
+    label: str = "snapshot",
+) -> tuple[datetime, tuple[GameRecord, ...]]:
+    """Validate and thaw one persisted Task 7 snapshot envelope.
+
+    The validator accepts JSON-native containers and Task 7's immutable
+    mapping-proxy/tuple representation. Nothing else is coerced.
+    """
+
+    try:
+        canonical = _thaw_snapshot_value(snapshot)
+    except RecursionError as error:
+        raise InputValidationError(f"{label} nesting is too deep") from error
+    if not isinstance(canonical, Mapping) or set(canonical) != _SNAPSHOT_FIELDS:
+        raise InputValidationError(f"{label} has an invalid top-level schema")
+    version = canonical["schema_version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        raise InputValidationError(f"{label} schema_version must be exactly 1")
+    run_id = canonical["run_id"]
+    if not isinstance(run_id, str) or _RUN_ID.fullmatch(run_id) is None:
+        raise InputValidationError(f"{label} has an invalid run ID")
+    observed_at = _parse_utc(canonical["observed_at"], f"{label} observed_at")
+    expected_time = datetime.strptime(run_id[:16], "%Y%m%dT%H%M%SZ").replace(
+        tzinfo=timezone.utc
+    )
+    if observed_at != expected_time:
+        raise InputValidationError(f"{label} time does not match its run ID")
+    if not isinstance(canonical["metadata"], Mapping):
+        raise InputValidationError(f"{label} metadata must be a mapping")
+
+    raw_records = canonical["records"]
+    if isinstance(raw_records, (str, bytes)) or not isinstance(raw_records, Sequence):
+        raise InputValidationError(f"{label} records must be a sequence")
+    records: list[GameRecord] = []
+    appids: set[int] = set()
+    for raw_record in raw_records:
+        if not isinstance(raw_record, Mapping):
+            raise InputValidationError(f"{label} records are invalid")
+        try:
+            record = GameRecord.from_dict(raw_record)
+        except RecursionError as error:
+            raise InputValidationError(f"{label} nesting is too deep") from error
+        if record.appid in appids:
+            raise InputValidationError(f"{label} contains duplicate AppIDs")
         appids.add(record.appid)
         records.append(record)
     return observed_at, tuple(records)
@@ -397,30 +425,44 @@ def _thaw_snapshot_value(
     depth: int = 0,
     active: set[int] | None = None,
 ) -> object:
-    """Convert Task 7's deep-frozen JSON shape back to JSON-native values."""
+    """Strictly validate JSON leaves while thawing Task 7 containers."""
 
     if depth > 256:
-        raise InputValidationError("official snapshot nesting is too deep")
+        raise InputValidationError("snapshot nesting is too deep")
     if active is None:
         active = set()
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        if value < MIN_JSON_SAFE_INTEGER or value > MAX_JSON_SAFE_INTEGER:
+            raise InputValidationError("snapshot integer is outside the JSON-safe range")
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise InputValidationError("snapshot numbers must be finite")
+        return value
     if isinstance(value, Mapping):
         identity = id(value)
         if identity in active:
-            raise InputValidationError("official snapshot must not contain cycles")
+            raise InputValidationError("snapshot must not contain cycles")
         active.add(identity)
         try:
-            return {
-                key: _thaw_snapshot_value(
+            thawed: dict[str, object] = {}
+            for key, nested in value.items():
+                if not isinstance(key, str):
+                    raise InputValidationError(
+                        "snapshot mappings must use string keys"
+                    )
+                thawed[key] = _thaw_snapshot_value(
                     nested, depth=depth + 1, active=active
                 )
-                for key, nested in value.items()
-            }
+            return thawed
         finally:
             active.remove(identity)
     if isinstance(value, (list, tuple)):
         identity = id(value)
         if identity in active:
-            raise InputValidationError("official snapshot must not contain cycles")
+            raise InputValidationError("snapshot must not contain cycles")
         active.add(identity)
         try:
             return [
@@ -429,4 +471,4 @@ def _thaw_snapshot_value(
             ]
         finally:
             active.remove(identity)
-    return value
+    raise InputValidationError("snapshot contains a non-JSON value")

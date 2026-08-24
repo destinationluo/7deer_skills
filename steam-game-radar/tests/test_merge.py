@@ -12,8 +12,14 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
 from steam_game_radar.config import RadarConfig
+from steam_game_radar.errors import InputValidationError
 from steam_game_radar.merge import merge_import_with_official
-from steam_game_radar.schemas import GameRecord, MetricObservation, RejectedRow
+from steam_game_radar.schemas import (
+    GameRecord,
+    MAX_JSON_SAFE_INTEGER,
+    MetricObservation,
+    RejectedRow,
+)
 
 
 UTC = timezone.utc
@@ -68,6 +74,8 @@ class MergeTests(unittest.TestCase):
         self,
         observed_at: datetime,
         records: list[GameRecord],
+        *,
+        frozen: bool = True,
     ) -> Mapping[str, object]:
         stamp = observed_at.astimezone(UTC)
         run_id = stamp.strftime("%Y%m%dT%H%M%SZ") + "-1234abcd"
@@ -78,9 +86,11 @@ class MergeTests(unittest.TestCase):
             "records": [record.to_dict() for record in records],
             "metadata": {"provider": "steam_official"},
         }
-        frozen = deep_freeze(snapshot)
-        self.assertIsInstance(frozen, Mapping)
-        return frozen
+        if not frozen:
+            return snapshot
+        frozen_snapshot = deep_freeze(snapshot)
+        self.assertIsInstance(frozen_snapshot, Mapping)
+        return frozen_snapshot
 
     def test_official_fallback_is_inclusive_at_72h_then_manual_only(self) -> None:
         official_time = NOW - timedelta(hours=72)
@@ -115,6 +125,39 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(expired.mode, "manual_baseline")
         self.assertEqual(expired.data_status, "manual_only")
         self.assertEqual([record.appid for record in expired.records], [20])
+
+        plain_snapshot = self.snapshot(official_time, [official], frozen=False)
+        self.assertEqual(
+            merge_import_with_official(
+                [manual], plain_snapshot, NOW, RadarConfig()
+            ).mode,
+            "official_plus_manual",
+        )
+
+        cycle: dict[str, object] = {}
+        cycle["self"] = cycle
+        too_deep: object = None
+        for _ in range(258):
+            too_deep = [too_deep]
+        invalid_metadata = (
+            {"bad": {"not", "json"}},
+            {"bad": object()},
+            {1: "non-string key"},
+            {"bad": float("nan")},
+            {"bad": float("inf")},
+            {"bad": MAX_JSON_SAFE_INTEGER + 1},
+            cycle,
+            {"bad": too_deep},
+        )
+        for metadata in invalid_metadata:
+            invalid = dict(plain_snapshot)
+            invalid["metadata"] = metadata
+            with self.subTest(metadata=type(metadata).__name__), self.assertRaises(
+                InputValidationError
+            ):
+                merge_import_with_official(
+                    [manual], invalid, NOW, RadarConfig()
+                )
 
     def test_newer_metric_observation_wins(self) -> None:
         official = self.record(

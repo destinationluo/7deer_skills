@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import Mapping, Sequence
 
 from .errors import InputValidationError
+from .merge import _validate_snapshot
 from .schemas import GameRecord, MetricObservation, WarningRecord
 
 
@@ -132,24 +133,8 @@ def _historical_records(
         return {}
     if not isinstance(snapshot, Mapping):
         raise InputValidationError(f"{label} snapshot must be a mapping")
-    raw_records = snapshot.get("records")
-    if isinstance(raw_records, (str, bytes)) or not isinstance(raw_records, Sequence):
-        raise InputValidationError(f"{label} snapshot records must be a sequence")
-    records: dict[int, GameRecord] = {}
-    for raw_record in raw_records:
-        if isinstance(raw_record, GameRecord):
-            canonical = raw_record.to_dict()
-        elif isinstance(raw_record, Mapping):
-            canonical = _thaw_snapshot_value(raw_record)
-        else:
-            raise InputValidationError(f"{label} snapshot contains an invalid record")
-        if not isinstance(canonical, Mapping):  # pragma: no cover - guarded above
-            raise InputValidationError(f"{label} snapshot contains an invalid record")
-        record = GameRecord.from_dict(canonical)
-        if record.appid in records:
-            raise InputValidationError(f"{label} snapshot contains duplicate AppIDs")
-        records[record.appid] = record
-    return records
+    _, records = _validate_snapshot(snapshot, label=f"{label} snapshot")
+    return {record.appid: record for record in records}
 
 
 def _add_window_deltas(
@@ -191,44 +176,3 @@ def _numeric(value: object) -> float | None:
         return None
     parsed = float(value)
     return parsed if math.isfinite(parsed) else None
-
-
-def _thaw_snapshot_value(
-    value: object,
-    *,
-    depth: int = 0,
-    active: set[int] | None = None,
-) -> object:
-    """Convert Task 7 mapping proxies/tuples into JSON-native containers."""
-
-    if depth > 256:
-        raise InputValidationError("historical snapshot nesting is too deep")
-    if active is None:
-        active = set()
-    if isinstance(value, Mapping):
-        identity = id(value)
-        if identity in active:
-            raise InputValidationError("historical snapshot must not contain cycles")
-        active.add(identity)
-        try:
-            return {
-                key: _thaw_snapshot_value(
-                    nested, depth=depth + 1, active=active
-                )
-                for key, nested in value.items()
-            }
-        finally:
-            active.remove(identity)
-    if isinstance(value, (list, tuple)):
-        identity = id(value)
-        if identity in active:
-            raise InputValidationError("historical snapshot must not contain cycles")
-        active.add(identity)
-        try:
-            return [
-                _thaw_snapshot_value(item, depth=depth + 1, active=active)
-                for item in value
-            ]
-        finally:
-            active.remove(identity)
-    return value
