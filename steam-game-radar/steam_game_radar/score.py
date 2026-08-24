@@ -103,6 +103,10 @@ class ScoredCandidate:
             raise InputValidationError(f"invalid action: {self.action!r}")
         if not isinstance(self.confidence, str) or self.confidence not in _CONFIDENCES:
             raise InputValidationError(f"invalid confidence: {self.confidence!r}")
+        if self.confidence in {"A", "B"} and seo is None:
+            raise InputValidationError(
+                "confidence A/B requires valid SEO/community enrichment"
+            )
         if final is not None:
             if steam_heat is None or seo is None or self.action not in _FINAL_ACTIONS:
                 raise InputValidationError(

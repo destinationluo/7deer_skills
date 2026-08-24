@@ -513,6 +513,11 @@ class ScoreTests(unittest.TestCase):
                 seo_opportunity_score=80,
                 confidence="A",
             )
+        for confidence in ("A", "B"):
+            with self.subTest(
+                confidence_without_seo=confidence
+            ), self.assertRaises(InputValidationError):
+                replace(self.preliminary(80), confidence=confidence)
         for field in ("warnings", "evidence"):
             with self.subTest(field=field), self.assertRaises(InputValidationError):
                 replace(self.preliminary(80), **{field: None})
