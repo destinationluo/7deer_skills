@@ -114,12 +114,15 @@ class ScoredCandidate:
                 )
             if self.confidence not in {"A", "B"}:
                 raise InputValidationError("confidence C candidates cannot have final scores")
-            combined = 0.60 * steam_heat + 0.40 * seo
-            if final != _rounded_score(combined):
+            expected_final, combined_hundredths = _combine_scores(
+                steam_heat,
+                seo,
+            )
+            if final != expected_final:
                 raise InputValidationError(
                     "final score does not match its weighted component scores"
                 )
-            if self.action != _action_for_raw_score(combined):
+            if self.action != _action_for_combined_score(combined_hundredths):
                 raise InputValidationError("final action does not match final score")
         elif steam_heat is None and self.action != "insufficient_data":
             raise InputValidationError("missing Steam heat requires insufficient_data")
@@ -150,6 +153,12 @@ class ScoredCandidate:
         evidence = tuple(self.evidence)
         if not all(isinstance(item, Evidence) for item in evidence):
             raise InputValidationError("evidence must contain Evidence values")
+        if (
+            seo is not None or self.confidence in {"A", "B"}
+        ) and not any(item.source == "google" for item in evidence):
+            raise InputValidationError(
+                "SEO scores and confidence A/B require Google evidence"
+            )
         if isinstance(self.recommended_content_types, (str, bytes)) or not isinstance(
             self.recommended_content_types,
             Sequence,
@@ -212,22 +221,26 @@ def score_released(candidate: AnalyzedCandidate) -> ScoredCandidate:
 
     _candidate_for_status(candidate, "released")
     raw_scores: dict[str, float] = {}
+    players = _non_negative_metric(candidate.record, "current_players")
     growth = None
-    if _steam_observation(candidate.record, "current_players") is not None:
+    if players is not None:
         growth = _largest_delta(
             candidate,
             ("current_players_1d_percent", "current_players_7d_percent"),
         )
     if growth is not None:
         raw_scores["player_growth"] = interpolate(_GROWTH_POINTS, max(growth, 0.0))
-    players = _non_negative_metric(candidate.record, "current_players")
     if players is not None:
         raw_scores["current_player_scale"] = interpolate(
             _CURRENT_PLAYER_POINTS,
             players,
         )
     improvement = _select_historical_rank_improvement(candidate)
-    if improvement is None:
+    if (
+        improvement is None
+        and _positive_metric(candidate.record, "most_played_rank") is not None
+        and _positive_metric(candidate.record, "previous_rank") is not None
+    ):
         provider_candidate = AnalyzedCandidate(
             record=candidate.record,
             deltas={},
@@ -359,9 +372,11 @@ def apply_final_score(
     elif seo_score is None or confidence == "C":
         action = "needs_seo_enrichment"
     else:
-        combined = 0.60 * candidate.steam_heat_score + 0.40 * seo_score
-        final_score = _rounded_score(combined)
-        action = _action_for_raw_score(combined)
+        final_score, combined_hundredths = _combine_scores(
+            candidate.steam_heat_score,
+            seo_score,
+        )
+        action = _action_for_combined_score(combined_hundredths)
 
     return ScoredCandidate(
         record=candidate.record,
@@ -466,7 +481,7 @@ def _select_historical_rank_improvement(
             for metric_name in sorted(candidate.record.metrics)
             if metric_name != "previous_rank"
             and (metric_name == "rank" or metric_name.endswith("_rank"))
-            and _steam_observation(candidate.record, metric_name) is not None
+            and _positive_metric(candidate.record, metric_name) is not None
             for key in (f"{metric_name}_{window}_change",)
             if key in candidate.deltas
         )
@@ -557,12 +572,22 @@ def _recommended_content_types(record: EnrichmentRecord) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _action_for_raw_score(value: float) -> Action:
-    if value >= 80:
+def _combine_scores(steam_heat: float, seo: float) -> tuple[float, int]:
+    """Combine one-decimal components exactly using integer tenths."""
+
+    heat_tenths = int(round(steam_heat * 10))
+    seo_tenths = int(round(seo * 10))
+    combined_hundredths = 6 * heat_tenths + 4 * seo_tenths
+    persisted_tenths = (combined_hundredths + 5) // 10
+    return persisted_tenths / 10.0, combined_hundredths
+
+
+def _action_for_combined_score(value_hundredths: int) -> Action:
+    if value_hundredths >= 8_000:
         return "immediate_action"
-    if value >= 65:
+    if value_hundredths >= 6_500:
         return "worth_positioning"
-    if value >= 50:
+    if value_hundredths >= 5_000:
         return "watch"
     return "skip"
 

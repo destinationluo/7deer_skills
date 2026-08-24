@@ -163,6 +163,24 @@ class ScoreTests(unittest.TestCase):
         )
         self.assertNotIn("player_growth", pseudo.metric_scores)
         self.assertNotIn("current_player_scale", pseudo.metric_scores)
+        for invalid in ("not-a-number", "nan", "inf", -1):
+            with self.subTest(invalid_current_players=invalid):
+                invalid_current = score_released(
+                    self.candidate(
+                        metrics={
+                            "current_players": self.observation(
+                                invalid,
+                                "players",
+                            )
+                        },
+                        deltas={"current_players_1d_percent": 60},
+                    )
+                )
+                self.assertNotIn("player_growth", invalid_current.metric_scores)
+                self.assertNotIn(
+                    "current_player_scale",
+                    invalid_current.metric_scores,
+                )
 
     def test_released_rank_uses_seven_day_then_one_day_then_provider(self) -> None:
         metrics = {
@@ -200,6 +218,55 @@ class ScoreTests(unittest.TestCase):
             )
         )
         self.assertNotIn("rank_improvement", pseudo.metric_scores)
+        for invalid in ("not-a-rank", "nan", 0, -1):
+            with self.subTest(invalid_current_rank=invalid):
+                invalid_history = score_released(
+                    self.candidate(
+                        metrics={"rank": self.observation(invalid, "rank")},
+                        deltas={"rank_7d_change": 50},
+                    )
+                )
+                self.assertNotIn(
+                    "rank_improvement",
+                    invalid_history.metric_scores,
+                )
+
+                invalid_provider = score_released(
+                    self.candidate(
+                        metrics={
+                            "most_played_rank": self.observation(
+                                invalid,
+                                "steam_most_played_rank",
+                            ),
+                            "previous_rank": self.observation(
+                                60,
+                                "steam_previous_rank",
+                            ),
+                        }
+                    )
+                )
+                self.assertNotIn(
+                    "rank_improvement",
+                    invalid_provider.metric_scores,
+                )
+                invalid_previous = score_released(
+                    self.candidate(
+                        metrics={
+                            "most_played_rank": self.observation(
+                                10,
+                                "steam_most_played_rank",
+                            ),
+                            "previous_rank": self.observation(
+                                invalid,
+                                "steam_previous_rank",
+                            ),
+                        }
+                    )
+                )
+                self.assertNotIn(
+                    "rank_improvement",
+                    invalid_previous.metric_scores,
+                )
 
     def test_released_recency_uses_release_observation_utc_date(self) -> None:
         cases = (("2026-08-24", 100), ("2026-08-17", 100), ("2026-08-16", 70), ("2026-07-25", 70), ("2026-07-24", 40), ("2026-05-26", 40), ("2026-05-25", 0))
@@ -224,21 +291,24 @@ class ScoreTests(unittest.TestCase):
         self.assertNotIn("release_recency", pseudo.metric_scores)
 
     def test_released_gate_uses_available_weighted_average(self) -> None:
-        count_failure = score_released(
+        numeric_growth = score_released(
             self.candidate(
                 metrics={
                     "current_players": self.observation(
-                        "not-a-number",
+                        0,
                         "players",
                     )
                 },
                 deltas={"current_players_1d_percent": 60},
             )
         )
-        self.assertEqual(tuple(count_failure.metric_scores), ("player_growth",))
-        self.assertIsNone(count_failure.steam_heat_score)
-        self.assertEqual(count_failure.action, "insufficient_data")
-        self.assertEqual(count_failure.confidence, "C")
+        self.assertEqual(
+            set(numeric_growth.metric_scores),
+            {"current_player_scale", "player_growth"},
+        )
+        self.assertEqual(numeric_growth.steam_heat_score, 71.4)
+        self.assertEqual(numeric_growth.action, "needs_seo_enrichment")
+        self.assertEqual(numeric_growth.confidence, "C")
 
         weight_failure = score_released(
             self.candidate(
@@ -324,6 +394,28 @@ class ScoreTests(unittest.TestCase):
         )
         self.assertNotIn("upcoming_rank_improvement", pseudo.metric_scores)
         self.assertNotIn("coming_soon_visibility", pseudo.metric_scores)
+        for invalid in ("not-a-rank", "nan", 0, -1):
+            with self.subTest(invalid_upcoming_rank=invalid):
+                invalid_history = score_unreleased(
+                    self.candidate(
+                        release_status="unreleased",
+                        metrics={
+                            "coming_soon_rank": self.observation(
+                                invalid,
+                                "coming_soon",
+                            )
+                        },
+                        deltas={"coming_soon_rank_7d_change": 50},
+                    )
+                )
+                self.assertNotIn(
+                    "upcoming_rank_improvement",
+                    invalid_history.metric_scores,
+                )
+                self.assertNotIn(
+                    "coming_soon_visibility",
+                    invalid_history.metric_scores,
+                )
 
     def test_unreleased_uses_larger_wishlist_or_follower_gain(self) -> None:
         gain_cases = ((0, 0), (50, 10), (100, 20), (550, 40), (1000, 60), (3000, 72.5), (5000, 85), (12_500, 92.5), (20_000, 100), (30_000, 100))
@@ -444,6 +536,19 @@ class ScoreTests(unittest.TestCase):
 
     def test_final_score_actions_confidence_evidence_and_content_are_exact(self) -> None:
         record = self.enrichment(youtube=25, reddit=25, reddit_upvotes=20)
+        google_evidence = (
+            Evidence("google", "https://google.example/search?q=game"),
+        )
+        exact_threshold = replace(
+            self.preliminary(99.6),
+            seo_opportunity_score=13.1,
+            final_score=65.0,
+            action="worth_positioning",
+            confidence="B",
+            evidence=google_evidence,
+        )
+        self.assertEqual(exact_threshold.final_score, 65.0)
+        self.assertEqual(exact_threshold.action, "worth_positioning")
         for heat, expected_score, action in (
             (0.0, 40.0, "skip"),
             (16.6, 50.0, "skip"),
@@ -490,6 +595,7 @@ class ScoreTests(unittest.TestCase):
                 final_score=80,
                 action="watch",
                 confidence="B",
+                evidence=google_evidence,
             )
         with self.assertRaises(InputValidationError):
             replace(
@@ -498,6 +604,7 @@ class ScoreTests(unittest.TestCase):
                 final_score=80,
                 action="immediate_action",
                 confidence="C",
+                evidence=google_evidence,
             )
         with self.assertRaises(InputValidationError):
             replace(
@@ -506,18 +613,40 @@ class ScoreTests(unittest.TestCase):
                 final_score=79.9,
                 action="worth_positioning",
                 confidence="A",
+                evidence=google_evidence,
             )
         with self.assertRaises(InputValidationError):
             replace(
                 self.preliminary(80),
                 seo_opportunity_score=80,
                 confidence="A",
+                evidence=google_evidence,
             )
         for confidence in ("A", "B"):
             with self.subTest(
                 confidence_without_seo=confidence
             ), self.assertRaises(InputValidationError):
                 replace(self.preliminary(80), confidence=confidence)
+        for evidence in (
+            (),
+            (Evidence("youtube", "https://youtube.example/results"),),
+        ):
+            with self.subTest(
+                invalid_scored_evidence=evidence
+            ), self.assertRaises(InputValidationError):
+                replace(
+                    self.preliminary(80),
+                    seo_opportunity_score=80,
+                    final_score=80,
+                    action="immediate_action",
+                    confidence="B",
+                    evidence=evidence,
+                )
+        with self.assertRaises(InputValidationError):
+            replace(
+                self.preliminary(80),
+                seo_opportunity_score=80,
+            )
         for field in ("warnings", "evidence"):
             with self.subTest(field=field), self.assertRaises(InputValidationError):
                 replace(self.preliminary(80), **{field: None})
@@ -539,6 +668,7 @@ class ScoreTests(unittest.TestCase):
                 final_score=primary,
                 action="immediate_action" if primary >= 80 else "watch",
                 confidence=confidence,
+                evidence=(Evidence("google", "https://google.example/search"),),
             )  # type: ignore[arg-type]
 
         values = [
