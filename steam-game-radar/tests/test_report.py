@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import fcntl
 import json
 import multiprocessing
 import os
@@ -55,6 +56,33 @@ def _file_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int
         metadata.st_size,
         metadata.st_mtime_ns,
     )
+
+
+def _open_file_descriptor_count() -> int:
+    for candidate in ("/dev/fd", "/proc/self/fd"):
+        if os.path.isdir(candidate):
+            return len(os.listdir(candidate))
+    raise RuntimeError("this test requires an inspectable file-descriptor table")
+
+
+def _try_publication_gate_lock(gate_text: str, outcomes: Any) -> None:
+    descriptor = os.open(
+        gate_text,
+        os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+    )
+    outcome = "acquired"
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            outcome = "blocked"
+        except OSError as error:
+            outcome = f"{type(error).__name__}:{error}"
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+    outcomes.put(outcome)
 
 
 def _concurrent_report_process(
@@ -689,6 +717,47 @@ class ReportTests(unittest.TestCase):
             self.assertTrue((displaced / f"{RUN_A}.preliminary.json").exists())
             self.assertTrue((displaced / f"{RUN_A}.preliminary.md").exists())
 
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            ancestor = root / "outer"
+            config = RadarConfig(report_dir=ancestor / "reports")
+            report = self.report()
+            real_persist_pair = report_module._persist_immutable_pair
+            displaced_ancestor = root / "outer-displaced"
+
+            def replace_report_ancestor(
+                directory_descriptor: int,
+                json_name: str,
+                json_data: bytes,
+                markdown_name: str,
+                markdown_data: bytes,
+            ) -> None:
+                real_persist_pair(
+                    directory_descriptor,
+                    json_name,
+                    json_data,
+                    markdown_name,
+                    markdown_data,
+                )
+                ancestor.rename(displaced_ancestor)
+                config.report_dir.mkdir(parents=True, mode=0o700)
+                config.report_dir.chmod(0o700)
+
+            with self.lock(root, RUN_A) as lock, mock.patch.object(
+                report_module,
+                "_persist_immutable_pair",
+                side_effect=replace_report_ancestor,
+            ), self.assertRaises(PersistenceError):
+                persist_report(config, report, lock)
+            self.assertEqual(list(config.report_dir.iterdir()), [])
+            displaced_reports = displaced_ancestor / "reports"
+            self.assertTrue(
+                (displaced_reports / f"{RUN_A}.preliminary.json").exists()
+            )
+            self.assertTrue(
+                (displaced_reports / f"{RUN_A}.preliminary.md").exists()
+            )
+
     def test_same_run_preliminary_to_final_advances_latest_pair(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             root = Path(directory)
@@ -1034,6 +1103,61 @@ class ReportTests(unittest.TestCase):
             self.assertFalse((config.report_dir / f"{RUN_A}.preliminary.json").exists())
             self.assertFalse((config.report_dir / f"{RUN_A}.preliminary.md").exists())
 
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            config = RadarConfig(report_dir=root / "reports")
+            report = self.report()
+            real_publish = report_module._publish_no_replace
+            real_remove = report_module._remove_expected_name
+
+            def fail_primary_after_json(
+                directory_descriptor: int,
+                source_name: str,
+                destination_name: str,
+            ) -> None:
+                if destination_name.endswith(".md"):
+                    raise RuntimeError("primary immutable publisher failure")
+                real_publish(directory_descriptor, source_name, destination_name)
+
+            def fail_immutable_json_rollback(
+                directory_descriptor: int,
+                name: str,
+                expected_inode: tuple[int, int],
+            ) -> None:
+                if name == f"{RUN_A}.preliminary.json":
+                    raise OSError("rollback unlink diagnostic")
+                real_remove(directory_descriptor, name, expected_inode)
+
+            with self.lock(root, RUN_A) as lock, mock.patch.object(
+                report_module,
+                "_publish_no_replace",
+                side_effect=fail_primary_after_json,
+            ), mock.patch.object(
+                report_module,
+                "_remove_expected_name",
+                side_effect=fail_immutable_json_rollback,
+            ), self.assertRaisesRegex(
+                RuntimeError,
+                "primary immutable publisher failure",
+            ) as caught:
+                persist_report(config, report, lock)
+
+            diagnostics = "\n".join(getattr(caught.exception, "__notes__", ()))
+            self.assertIn("recovery", diagnostics.lower())
+            self.assertIn("rollback unlink diagnostic", diagnostics)
+            if not hasattr(caught.exception, "add_note"):
+                self.assertIsNotNone(caught.exception.__context__)
+                self.assertIn(
+                    "recovery",
+                    str(caught.exception.__context__).lower(),
+                )
+            self.assertTrue(
+                (config.report_dir / f"{RUN_A}.preliminary.json").exists()
+            )
+            self.assertFalse(
+                (config.report_dir / f"{RUN_A}.preliminary.md").exists()
+            )
+
     def test_persist_requires_owned_matching_lock_and_rejects_symlinked_report_path(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             root = Path(directory)
@@ -1138,6 +1262,90 @@ class ReportTests(unittest.TestCase):
             with self.lock(root, RUN_A) as lock, self.assertRaises(PersistenceError):
                 persist_report(config, self.report(), lock)
             self.assertEqual(stat.S_IMODE(report_dir.stat().st_mode), 0o777)
+
+        if "fork" not in multiprocessing.get_all_start_methods():
+            self.skipTest("requires multiprocessing fork and fcntl")
+        for injected in (KeyboardInterrupt(), SystemExit(19)):
+            with self.subTest(gate_cleanup=type(injected).__name__), tempfile.TemporaryDirectory(
+                dir=SAFE_TEMP_DIR
+            ) as directory:
+                root = Path(directory)
+                config = RadarConfig(report_dir=root / "reports")
+                report = self.report()
+                real_validate = report_module._validate_report_directory_binding
+                validate_calls = 0
+
+                def interrupt_after_gate_lock(
+                    report_directory: object,
+                    *,
+                    error: BaseException = injected,
+                ) -> None:
+                    nonlocal validate_calls
+                    validate_calls += 1
+                    real_validate(report_directory)  # type: ignore[arg-type]
+                    if validate_calls == 2:
+                        raise error
+
+                before_descriptors = _open_file_descriptor_count()
+                with self.lock(root, RUN_A) as lock, mock.patch.object(
+                    report_module,
+                    "_validate_report_directory_binding",
+                    side_effect=interrupt_after_gate_lock,
+                ), self.assertRaises(type(injected)):
+                    persist_report(config, report, lock)
+                after_descriptors = _open_file_descriptor_count()
+
+                context = multiprocessing.get_context("fork")
+                outcomes = context.Queue()
+                process = context.Process(
+                    target=_try_publication_gate_lock,
+                    args=(
+                        str(
+                            config.report_dir
+                            / ".steam-radar-report-publication.gate"
+                        ),
+                        outcomes,
+                    ),
+                )
+                process.start()
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+                gate_outcome = outcomes.get(timeout=2)
+                outcomes.close()
+                outcomes.join_thread()
+                self.assertEqual(process.exitcode, 0)
+                self.assertEqual(
+                    (after_descriptors, gate_outcome),
+                    (before_descriptors, "acquired"),
+                )
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            gate = Path(directory) / "publication.gate"
+            gate.write_bytes(b"")
+            gate.chmod(0o600)
+            descriptor = os.open(gate, os.O_RDWR)
+            real_close = os.close
+            close_attempted = False
+
+            def observe_close(candidate: int) -> None:
+                nonlocal close_attempted
+                if candidate == descriptor:
+                    close_attempted = True
+                real_close(candidate)
+
+            with mock.patch.object(
+                report_module.fcntl,
+                "flock",
+                side_effect=OSError("unlock could not be confirmed"),
+            ), mock.patch.object(
+                report_module.os,
+                "close",
+                side_effect=observe_close,
+            ), self.assertRaises(PersistenceError):
+                report_module._release_publication_gate(descriptor)
+            self.assertTrue(close_attempted)
 
 
 if __name__ == "__main__":

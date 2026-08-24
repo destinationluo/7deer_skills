@@ -100,11 +100,21 @@ class _StagedFile:
 
 
 @dataclass(frozen=True)
-class _ReportDirectory:
+class _DirectoryComponent:
     descriptor: int
-    parent_descriptor: int
     name: str
     inode: tuple[int, int]
+    require_owner: bool
+
+
+@dataclass(frozen=True)
+class _ReportDirectory:
+    anchor_descriptor: int
+    components: tuple[_DirectoryComponent, ...]
+
+    @property
+    def descriptor(self) -> int:
+        return self.components[-1].descriptor
 
 
 def build_report(
@@ -294,17 +304,27 @@ def persist_report(
                 existing is not None,
             )
         _validate_report_directory_binding(report_directory)
-        _release_publication_gate(publication_gate)
+        released_gate = publication_gate
         publication_gate = None
+        _release_publication_gate(released_gate)
         _validate_report_directory_binding(report_directory)
     except (InputValidationError, PersistenceError):
         raise
     except OSError as error:
         raise PersistenceError("unable to persist report pair safely") from error
     finally:
+        active_error = sys.exc_info()[1]
+        release_error: BaseException | None = None
         if publication_gate is not None:
-            _release_publication_gate(publication_gate)
+            try:
+                _release_publication_gate(publication_gate)
+            except BaseException as error:
+                release_error = error
         _close_report_directory(report_directory)
+        if release_error is not None:
+            if active_error is None:
+                raise release_error
+            _add_recovery_note(active_error, release_error)
     return report_root / json_name, report_root / markdown_name
 
 
@@ -803,60 +823,50 @@ def _open_report_directory(path: Path) -> _ReportDirectory:
         raise InputValidationError("report path must not traverse parent directories")
     try:
         if path.is_absolute():
-            descriptor = os.open(os.path.sep, _directory_flags())
+            anchor_descriptor = os.open(os.path.sep, _directory_flags())
             components = path.parts[1:]
         else:
-            descriptor = os.open(".", _directory_flags())
+            anchor_descriptor = os.open(".", _directory_flags())
             components = path.parts
     except OSError as error:
         raise PersistenceError("unable to open trusted report-path root") from error
-    report_descriptor: int | None = None
+    opened_components: list[_DirectoryComponent] = []
     try:
         meaningful = tuple(
             component for component in components if component not in {"", "."}
         )
         if not meaningful:
             raise InputValidationError("report path must name a child directory")
-        for component in meaningful[:-1]:
+        parent_descriptor = anchor_descriptor
+        for index, component in enumerate(meaningful):
+            require_owner = index == len(meaningful) - 1
             next_descriptor = _open_report_child(
-                descriptor,
+                parent_descriptor,
                 component,
-                require_owner=False,
+                require_owner=require_owner,
             )
-            old_descriptor = descriptor
             try:
-                os.close(old_descriptor)
-            except OSError as error:
+                opened = os.fstat(next_descriptor)
+            except BaseException:
                 _close_descriptor(next_descriptor)
-                descriptor = -1
-                raise PersistenceError("unable to close traversed report directory") from error
-            descriptor = next_descriptor
-        report_name = meaningful[-1]
-        report_descriptor = _open_report_child(
-            descriptor,
-            report_name,
-            require_owner=True,
-        )
-        opened = os.fstat(report_descriptor)
-        named = os.stat(
-            report_name,
-            dir_fd=descriptor,
-            follow_symlinks=False,
-        )
-        _validate_directory(opened, require_owner=True, exact_mode=None)
-        _validate_directory(named, require_owner=True, exact_mode=None)
-        if _inode(opened) != _inode(named):
-            raise PersistenceError("report directory binding changed during open")
+                raise
+            opened_components.append(
+                _DirectoryComponent(
+                    descriptor=next_descriptor,
+                    name=component,
+                    inode=_inode(opened),
+                    require_owner=require_owner,
+                )
+            )
+            parent_descriptor = next_descriptor
         return _ReportDirectory(
-            descriptor=report_descriptor,
-            parent_descriptor=descriptor,
-            name=report_name,
-            inode=_inode(opened),
+            anchor_descriptor=anchor_descriptor,
+            components=tuple(opened_components),
         )
-    except Exception as error:
-        if report_descriptor is not None:
-            _close_descriptor(report_descriptor)
-        _close_descriptor(descriptor)
+    except BaseException as error:
+        for component in reversed(opened_components):
+            _close_descriptor(component.descriptor)
+        _close_descriptor(anchor_descriptor)
         if isinstance(error, (InputValidationError, PersistenceError)):
             raise
         if isinstance(error, OSError):
@@ -914,7 +924,7 @@ def _open_report_child(
             if _inode(named) != _inode(opened):
                 raise PersistenceError("report directory binding changed")
         return descriptor
-    except Exception:
+    except BaseException:
         _close_descriptor(descriptor)
         raise
 
@@ -946,27 +956,44 @@ def _validate_directory(
 
 def _validate_report_directory_binding(directory: _ReportDirectory) -> None:
     try:
-        opened = os.fstat(directory.descriptor)
-        parent = os.fstat(directory.parent_descriptor)
-        named = os.stat(
-            directory.name,
-            dir_fd=directory.parent_descriptor,
-            follow_symlinks=False,
-        )
-        _validate_directory(parent, require_owner=False, exact_mode=None)
-        _validate_directory(opened, require_owner=True, exact_mode=None)
-        _validate_directory(named, require_owner=True, exact_mode=None)
+        anchor = os.fstat(directory.anchor_descriptor)
+        _validate_directory(anchor, require_owner=False, exact_mode=None)
+        parent_descriptor = directory.anchor_descriptor
+        for component in directory.components:
+            opened = os.fstat(component.descriptor)
+            named = os.stat(
+                component.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            _validate_directory(
+                opened,
+                require_owner=component.require_owner,
+                exact_mode=None,
+            )
+            _validate_directory(
+                named,
+                require_owner=component.require_owner,
+                exact_mode=None,
+            )
+            if (
+                _inode(opened) != component.inode
+                or _inode(named) != component.inode
+            ):
+                raise PersistenceError(
+                    "report directory ancestor name or identity changed"
+                )
+            parent_descriptor = component.descriptor
     except PersistenceError:
         raise
     except OSError as error:
         raise PersistenceError("unable to validate report directory binding") from error
-    if _inode(opened) != directory.inode or _inode(named) != directory.inode:
-        raise PersistenceError("report directory name or identity changed")
 
 
 def _close_report_directory(directory: _ReportDirectory) -> None:
-    _close_descriptor(directory.descriptor)
-    _close_descriptor(directory.parent_descriptor)
+    for component in reversed(directory.components):
+        _close_descriptor(component.descriptor)
+    _close_descriptor(directory.anchor_descriptor)
 
 
 def _acquire_publication_gate(directory: _ReportDirectory) -> int:
@@ -1035,8 +1062,11 @@ def _acquire_publication_gate(directory: _ReportDirectory) -> int:
             raise PersistenceError("report publication gate changed before lock")
         _validate_report_directory_binding(directory)
         return descriptor
-    except Exception:
-        _close_descriptor(descriptor)
+    except BaseException as error:
+        try:
+            _release_publication_gate(descriptor)
+        except BaseException as recovery_error:
+            _add_recovery_note(error, recovery_error)
         raise
 
 
@@ -1062,13 +1092,37 @@ def _validate_publication_gate(
 
 
 def _release_publication_gate(descriptor: int) -> None:
+    errors: list[BaseException] = []
     try:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        except OSError:
-            pass
-    finally:
-        _close_descriptor(descriptor)
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    except OSError as error:
+        wrapped = PersistenceError("unable to confirm publication-gate unlock")
+        wrapped.__cause__ = error
+        errors.append(wrapped)
+    except BaseException as error:
+        errors.append(error)
+    try:
+        os.close(descriptor)
+    except OSError as error:
+        wrapped = PersistenceError("unable to confirm publication-gate close")
+        wrapped.__cause__ = error
+        errors.append(wrapped)
+    except BaseException as error:
+        errors.append(error)
+    if errors:
+        primary = next(
+            (
+                error
+                for error in errors
+                if not isinstance(error, PersistenceError)
+            ),
+            errors[0],
+        )
+        for recovery_error in errors:
+            if recovery_error is primary:
+                continue
+            _add_recovery_note(primary, recovery_error)
+        raise primary
 
 
 def _persist_immutable_pair(
@@ -1129,19 +1183,22 @@ def _persist_immutable_pair(
                 directory_descriptor,
                 published,
             )
-            recovery_error = recovery_error or rollback_error
+            recovery_error = _merge_recovery_errors(
+                recovery_error,
+                rollback_error,
+            )
         cleanup_errors = [_cleanup_staged(directory_descriptor, json_stage)]
         if markdown_stage is not None:
             cleanup_errors.append(_cleanup_staged(directory_descriptor, markdown_stage))
         for cleanup_error in cleanup_errors:
-            recovery_error = recovery_error or cleanup_error
+            recovery_error = _merge_recovery_errors(
+                recovery_error,
+                cleanup_error,
+            )
         _close_descriptor(json_stage.descriptor)
         if markdown_stage is not None:
             _close_descriptor(markdown_stage.descriptor)
-        if recovery_error is not None and _may_override_with_domain_error(
-            active_error
-        ):
-            raise recovery_error
+        _surface_recovery_error(active_error, recovery_error)
 
 
 def _publish_no_replace(
@@ -1224,12 +1281,12 @@ def _update_latest_pair(
             if stage is None:
                 continue
             cleanup_error = _cleanup_staged(directory_descriptor, stage)
-            cleanup_failure = cleanup_failure or cleanup_error
+            cleanup_failure = _merge_recovery_errors(
+                cleanup_failure,
+                cleanup_error,
+            )
             _close_descriptor(stage.descriptor)
-        if cleanup_failure is not None and _may_override_with_domain_error(
-            active_error
-        ):
-            raise cleanup_failure
+        _surface_recovery_error(active_error, cleanup_failure)
 
 
 def _publish_new_latest(
@@ -1278,11 +1335,11 @@ def _publish_new_latest(
                 directory_descriptor,
                 published,
             )
-            recovery_error = recovery_error or rollback_error
-        if recovery_error is not None and _may_override_with_domain_error(
-            active_error
-        ):
-            raise recovery_error
+            recovery_error = _merge_recovery_errors(
+                recovery_error,
+                rollback_error,
+            )
+        _surface_recovery_error(active_error, recovery_error)
 
 
 def _replace_existing_latest(
@@ -1354,16 +1411,19 @@ def _replace_existing_latest(
             if recovery_error is None
             else None
         )
-        recovery_error = recovery_error or cleanup_error
+        recovery_error = _merge_recovery_errors(
+            recovery_error,
+            cleanup_error,
+        )
         sync_error = _fsync_directory_error(
             directory_descriptor,
             "unable to sync latest report publication",
         )
-        recovery_error = recovery_error or sync_error
-        if recovery_error is not None and _may_override_with_domain_error(
-            active_error
-        ):
-            raise recovery_error
+        recovery_error = _merge_recovery_errors(
+            recovery_error,
+            sync_error,
+        )
+        _surface_recovery_error(active_error, recovery_error)
 
 
 def _replace_staged_latest(
@@ -1415,14 +1475,14 @@ def _restore_previous_latest(
                 expected_links=None,
             )
         except (OSError, PersistenceError) as error:
-            if first_error is None:
-                if isinstance(error, PersistenceError):
-                    first_error = error
-                else:
-                    first_error = PersistenceError(
-                        "unable to restore previous latest report pair"
-                    )
-                    first_error.__cause__ = error
+            if isinstance(error, PersistenceError):
+                recovery_error = error
+            else:
+                recovery_error = PersistenceError(
+                    "unable to restore previous latest report pair"
+                )
+                recovery_error.__cause__ = error
+            first_error = _merge_recovery_errors(first_error, recovery_error)
     return first_error
 
 
@@ -1469,10 +1529,7 @@ def _create_staged_file(
                 else None
             )
             _close_descriptor(descriptor)
-            if recovery_error is not None and _may_override_with_domain_error(
-                active_error
-            ):
-                raise recovery_error
+            _surface_recovery_error(active_error, recovery_error)
 
 
 def _cleanup_staged(
@@ -1509,12 +1566,12 @@ def _rollback_new_names(
                 raise PersistenceError("published report name changed during rollback")
             _remove_expected_name(directory_descriptor, name, inode)
         except (OSError, PersistenceError) as error:
-            if first_error is None:
-                if isinstance(error, PersistenceError):
-                    first_error = error
-                else:
-                    first_error = PersistenceError("unable to roll back report pair")
-                    first_error.__cause__ = error
+            if isinstance(error, PersistenceError):
+                recovery_error = error
+            else:
+                recovery_error = PersistenceError("unable to roll back report pair")
+                recovery_error.__cause__ = error
+            first_error = _merge_recovery_errors(first_error, recovery_error)
     return first_error
 
 
@@ -1527,7 +1584,7 @@ def _rollback_names_and_sync(
         directory_descriptor,
         "unable to sync rolled-back report pair",
     )
-    return rollback_error or sync_error
+    return _merge_recovery_errors(rollback_error, sync_error)
 
 
 def _fsync_directory_error(
@@ -1543,8 +1600,59 @@ def _fsync_directory_error(
     return None
 
 
-def _may_override_with_domain_error(error: object | None) -> bool:
-    return error is None or isinstance(error, (OSError, PersistenceError))
+def _merge_recovery_errors(
+    current: PersistenceError | None,
+    additional: PersistenceError | None,
+) -> PersistenceError | None:
+    if current is None:
+        return additional
+    if additional is not None:
+        _add_recovery_note(current, additional)
+    return current
+
+
+def _surface_recovery_error(
+    active_error: BaseException | None,
+    recovery_error: PersistenceError | None,
+) -> None:
+    if recovery_error is None:
+        return
+    if active_error is None or isinstance(
+        active_error,
+        (OSError, PersistenceError),
+    ):
+        raise recovery_error
+    _add_recovery_note(active_error, recovery_error)
+
+
+def _add_recovery_note(
+    primary_error: BaseException,
+    recovery_error: BaseException,
+) -> None:
+    note = "Report recovery failure: " + _recovery_error_diagnostic(
+        recovery_error
+    )
+    add_note = getattr(primary_error, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+        return
+    notes = list(getattr(primary_error, "__notes__", ()))
+    notes.append(note)
+    setattr(primary_error, "__notes__", notes)
+    if primary_error.__context__ is None:
+        diagnostic_context = PersistenceError(note)
+        diagnostic_context.__suppress_context__ = True
+        primary_error.__context__ = diagnostic_context
+
+
+def _recovery_error_diagnostic(error: BaseException) -> str:
+    parts = [f"{type(error).__name__}: {error}"]
+    cause = error.__cause__
+    if cause is not None:
+        parts.append(f"caused by {type(cause).__name__}: {cause}")
+    notes = getattr(error, "__notes__", ())
+    parts.extend(str(note) for note in notes)
+    return "; ".join(parts)
 
 
 def _reconcile_published_names(
