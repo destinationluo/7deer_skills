@@ -19,6 +19,7 @@ if str(SKILL_ROOT) not in sys.path:
 
 from steam_game_radar.config import RadarConfig
 from steam_game_radar.enrichment import load_enrichment
+from steam_game_radar.errors import InputValidationError
 from steam_game_radar.http_client import ALLOWED_HOSTS, USER_AGENT
 from steam_game_radar.official_provider import (
     APPDETAILS_URL,
@@ -475,6 +476,22 @@ class SkillDocumentationTests(unittest.TestCase):
                 path,
                 expected_run_id=enrichment_example["run_id"],
             )
+            for suffix in (" ", "\x01"):
+                invalid = json.loads(json.dumps(enrichment_example))
+                invalid["games"][0]["evidence"][0]["url"] += suffix
+                path.write_text(json.dumps(invalid), encoding="utf-8")
+                with self.assertRaises(InputValidationError):
+                    load_enrichment(
+                        path,
+                        expected_run_id=enrichment_example["run_id"],
+                    )
+            unicode_whitespace = json.loads(json.dumps(enrichment_example))
+            unicode_whitespace["games"][0]["evidence"][0]["url"] += "\u00a0"
+            path.write_text(json.dumps(unicode_whitespace), encoding="utf-8")
+            load_enrichment(
+                path,
+                expected_run_id=enrichment_example["run_id"],
+            )
         self.assertEqual(bundle.schema_version, 1)
         self.assertEqual(set(bundle.games), {123456})
         enrichment_section = " ".join(
@@ -487,10 +504,11 @@ class SkillDocumentationTests(unittest.TestCase):
             "supplied YouTube or Reddit signals require source-matching evidence",
             "evidence URLs must use HTTPS",
             "file `run_id` must exactly match the preliminary manifest `run_id`",
-            "Evidence URLs must use HTTPS and reject credentials/userinfo, fragments, whitespace, and backslashes",
+            "Evidence URLs must use HTTPS and reject credentials/userinfo, fragments, ASCII control characters and ASCII whitespace, and backslashes",
             "An explicit port is allowed only when it is exactly 443",
         ):
             self.assertIn(contract, enrichment_section)
+        self.assertNotIn("Unicode whitespace", enrichment_section)
 
         self.assertEqual(_combine_scores(50.0, 49.9), (50.0, 4_996))
         self.assertEqual(_action_for_combined_score(4_996), "skip")

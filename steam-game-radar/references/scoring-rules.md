@@ -100,9 +100,10 @@ YouTube/Reddit counts are null or non-negative integers. Google evidence is
 required; supplied YouTube or Reddit signals require source-matching evidence.
 Evidence `source` is only `google`, `youtube`, or `reddit`. Typed evidence URLs
 must use HTTPS. Evidence URLs must use HTTPS and reject credentials/userinfo,
-fragments, whitespace, and backslashes. An explicit port is allowed only when
-it is exactly 443. The loader rejects unknown fields, duplicate AppIDs,
-invalid types, and mismatched run IDs without making network requests.
+fragments, ASCII control characters and ASCII whitespace, and backslashes. An
+explicit port is allowed only when it is exactly 443. The loader rejects
+unknown fields, duplicate AppIDs, invalid types, and mismatched run IDs without
+making network requests.
 
 ## Combination, actions, and confidence
 
