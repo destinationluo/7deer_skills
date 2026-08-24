@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -1218,6 +1219,39 @@ class CliTests(unittest.TestCase):
                     1,
                 )
                 self.assertIn("RuntimeError: stdout unavailable", stderr.getvalue())
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            self.write_config(root)
+            self.write_manual_csv(root)
+            read_fd, write_fd = os.pipe()
+            os.close(read_fd)
+            try:
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(SCRIPT_PATH),
+                        "import-steamdb",
+                        "--config",
+                        "radar.json",
+                        "--view",
+                        "wishlist_activity",
+                        "--input",
+                        "steamdb.csv",
+                    ],
+                    cwd=root,
+                    stdout=write_fd,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+            finally:
+                os.close(write_fd)
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            self.assertIn("Traceback", completed.stderr)
+            self.assertIn("BrokenPipeError", completed.stderr)
+            self.assertNotIn("Exception ignored", completed.stderr)
 
     def test_delayed_older_enrichment_writes_final_without_replacing_latest(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:

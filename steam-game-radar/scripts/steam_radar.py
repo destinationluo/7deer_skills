@@ -119,9 +119,31 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _write_manifest_stdout(line: str) -> None:
-    written = sys.stdout.write(line)
-    if written != len(line):
-        raise OSError("stdout accepted only part of the run manifest")
+    encoded = line.encode("utf-8", errors="strict")
+    stream = sys.stdout
+    try:
+        descriptor = stream.fileno()
+    except (AttributeError, OSError, TypeError, ValueError):
+        try:
+            written = stream.write(line)
+            if written != len(line):
+                raise OSError("stdout accepted only part of the run manifest")
+            stream.flush()
+        except BaseException:
+            if sys.stdout is stream:
+                sys.stdout = None
+            raise
+        return
+
+    remaining = memoryview(encoded)
+    while remaining:
+        try:
+            written = os.write(descriptor, remaining)
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise OSError("stdout accepted only part of the run manifest")
+        remaining = remaining[written:]
 
 
 @dataclass(frozen=True)
