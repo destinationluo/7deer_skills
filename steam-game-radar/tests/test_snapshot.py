@@ -84,7 +84,8 @@ class SnapshotTests(unittest.TestCase):
 
     def test_same_day_snapshot_names_are_immutable(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
-            config = RadarConfig(data_dir=Path(directory))
+            root = Path(directory)
+            config = RadarConfig(data_dir=root)
             first_run = "20260824T030405Z-1234abcd"
             second_run = "20260824T030405Z-fedcba98"
 
@@ -101,113 +102,101 @@ class SnapshotTests(unittest.TestCase):
                 persist_snapshot(config, first_run, [], {"run": "replacement"})
             self.assertEqual(first.read_bytes(), original)
 
-            staged = first.parent / ".snapshot-0123456789abcdef01234567.staged"
-            os.link(first, staged)
-            self.assertEqual(first.stat().st_nlink, 2)
-            recovered = load_snapshots(config)
-            self.assertEqual(len(recovered), 2)
-            self.assertFalse(staged.exists())
-            self.assertEqual(first.stat().st_nlink, 1)
+            victim = root / "victim.bin"
+            victim.write_bytes(b"external-victim")
+            quarantine = (
+                first.parent / f".quarantine-{'d' * 48}.holding"
+            )
+            os.link(victim, quarantine)
+            self.assertEqual(victim.stat().st_nlink, 2)
+            with mock.patch(
+                "secrets.token_hex",
+                side_effect=lambda size: "d" * (size * 2),
+            ), self.assertRaises(PersistenceError):
+                persist_snapshot(config, first_run, [], {"run": "collision"})
+            self.assertEqual(victim.read_bytes(), b"external-victim")
+            self.assertEqual(victim.stat().st_nlink, 2)
+            self.assertTrue(quarantine.exists())
 
-            competitor = b"competitor-must-survive"
-            real_stat = os.stat
-            real_rename = os.rename
+            journal = first.parent / ".journal"
+            for run_id, final in ((first_run, first), (second_run, second)):
+                journal_entry = journal / f"{run_id}.json"
+                self.assertTrue(journal_entry.exists())
+                self.assertEqual(final.stat().st_ino, journal_entry.stat().st_ino)
+                self.assertEqual(final.stat().st_nlink, 2)
+                self.assertEqual(stat.S_IMODE(final.stat().st_mode), 0o600)
+
+            second.unlink()
+            recovered = persist_snapshot(
+                config,
+                second_run,
+                [self.record()],
+                {"run": 2},
+            )
+            self.assertEqual(recovered, second)
+            orphan = journal / "20260824T030406Z-eeeeeeee.json"
+            orphan.write_bytes(b"incomplete journal entry")
+            self.assertEqual(len(load_snapshots(config)), 2)
+
+    def test_persist_snapshot_atomically_publishes_valid_json(self) -> None:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            config = RadarConfig(data_dir=Path(directory))
+            run_id = "20260824T030404Z-99999999"
+            persist_snapshot(config, run_id, [self.record()], {"run": 1})
+            replacement = b"replacement-must-survive"
             real_open = os.open
-            staged_stats = 0
+            real_rename = os.rename
+            real_unlink = os.unlink
             raced = False
 
-            def install_competitor(name: str, dir_fd: int) -> None:
-                nonlocal raced
-                backup = ".owner-backup.staged"
-                real_rename(
-                    name,
-                    backup,
-                    src_dir_fd=dir_fd,
-                    dst_dir_fd=dir_fd,
-                )
-                descriptor = real_open(
-                    name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                    dir_fd=dir_fd,
-                )
-                try:
-                    os.fchmod(descriptor, 0o600)
-                    os.write(descriptor, competitor)
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
-                raced = True
-
-            def racing_stat(
+            def racing_unlink(
                 name: object,
                 *,
                 dir_fd: int | None = None,
-                follow_symlinks: bool = True,
-            ) -> os.stat_result:
-                nonlocal staged_stats
-                result = real_stat(
-                    name,
-                    dir_fd=dir_fd,
-                    follow_symlinks=follow_symlinks,
-                )
+            ) -> None:
+                nonlocal raced
                 if (
                     isinstance(name, str)
-                    and name.startswith(".snapshot-")
-                    and name.endswith(".staged")
+                    and name.startswith(".quarantine-")
                     and dir_fd is not None
-                ):
-                    staged_stats += 1
-                    if staged_stats == 2 and not raced:
-                        install_competitor(name, dir_fd)
-                return result
-
-            def racing_rename(
-                source: object,
-                destination: object,
-                *,
-                src_dir_fd: int | None = None,
-                dst_dir_fd: int | None = None,
-            ) -> None:
-                if (
-                    isinstance(source, str)
-                    and source.startswith(".snapshot-")
-                    and source.endswith(".staged")
-                    and isinstance(destination, str)
-                    and ".quarantine-" in destination
-                    and src_dir_fd is not None
                     and not raced
                 ):
-                    install_competitor(source, src_dir_fd)
-                real_rename(
-                    source,
-                    destination,
-                    src_dir_fd=src_dir_fd,
-                    dst_dir_fd=dst_dir_fd,
-                )
+                    real_rename(
+                        name,
+                        ".verified-owner-backup.holding",
+                        src_dir_fd=dir_fd,
+                        dst_dir_fd=dir_fd,
+                    )
+                    descriptor = real_open(
+                        name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=dir_fd,
+                    )
+                    try:
+                        os.fchmod(descriptor, 0o600)
+                        os.write(descriptor, replacement)
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    raced = True
+                real_unlink(name, dir_fd=dir_fd)
 
             with mock.patch(
-                "steam_game_radar.snapshot.os.stat",
-                side_effect=racing_stat,
-            ), mock.patch(
-                "steam_game_radar.snapshot.os.rename",
-                side_effect=racing_rename,
+                "steam_game_radar.snapshot.os.unlink",
+                side_effect=racing_unlink,
             ), self.assertRaises(PersistenceError):
-                persist_snapshot(config, first_run, [], {"run": "collision"})
+                persist_snapshot(config, run_id, [], {"run": "collision"})
 
-            self.assertTrue(raced)
-            surviving_values = []
-            for candidate in first.parent.iterdir():
+            survivors = []
+            for candidate in (config.data_dir / "snapshots").iterdir():
                 try:
                     if candidate.is_file():
-                        surviving_values.append(candidate.read_bytes())
+                        survivors.append(candidate.read_bytes())
                 except OSError:
                     continue
-            self.assertIn(competitor, surviving_values)
-            self.assertTrue(first.exists())
-            self.assertEqual(first.read_bytes(), original)
+            self.assertTrue(not raced or replacement in survivors)
 
-    def test_persist_snapshot_atomically_publishes_valid_json(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             config = RadarConfig(data_dir=Path(directory))
             run_id = "20260824T030405Z-1234abcd"
@@ -244,8 +233,22 @@ class SnapshotTests(unittest.TestCase):
                 run_id,
             )
             self.assertEqual(
-                [entry.name for entry in path.parent.iterdir()],
-                [f"{run_id}.json"],
+                sorted(entry.name for entry in path.parent.iterdir()),
+                [".journal", f"{run_id}.json"],
+            )
+            journal_entry = path.parent / ".journal" / path.name
+            self.assertEqual(path.stat().st_ino, journal_entry.stat().st_ino)
+            self.assertEqual(path.stat().st_nlink, 2)
+            self.assertEqual(stat.S_IMODE(journal_entry.stat().st_mode), 0o600)
+            self.assertEqual(
+                stat.S_IMODE(journal_entry.parent.stat().st_mode),
+                0o700,
+            )
+            self.assertFalse(
+                any(
+                    entry.name.startswith((".snapshot-", ".quarantine-"))
+                    for entry in path.parent.iterdir()
+                )
             )
 
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:

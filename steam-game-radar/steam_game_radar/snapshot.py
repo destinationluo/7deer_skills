@@ -3,8 +3,9 @@
 Snapshot I/O stays anchored to an opened directory descriptor. Absolute paths
 must use canonical, non-symlink components; relative paths are resolved from an
 opened descriptor for the active working directory. Callers serialize snapshot
-operations with the project ``RunLock``; orphan-stage recovery is nevertheless
-idempotent if it overlaps a publisher after the final hard link exists.
+operations with the project ``RunLock``. New snapshots are journaled before
+publication and keep the journal link permanently, so recovery never needs a
+name-based delete or rename.
 """
 
 from __future__ import annotations
@@ -14,8 +15,6 @@ import errno
 import json
 import os
 from pathlib import Path
-import re
-import secrets
 import stat
 from typing import Mapping, Sequence
 
@@ -41,13 +40,8 @@ _SNAPSHOT_FIELDS = {
 }
 _MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
 _MAX_JSON_NESTING = 128
-_TEMP_ATTEMPTS = 8
 _READ_CHUNK_BYTES = 64 * 1024
-_STAGED_NAME = re.compile(r"\.snapshot-[0-9a-f]{24}\.staged\Z", re.ASCII)
-_QUARANTINE_NAME = re.compile(
-    r"\.quarantine-[0-9a-f]{48}\.holding\Z",
-    re.ASCII,
-)
+_JOURNAL_DIRECTORY = ".journal"
 
 
 def make_run_id(now: datetime, entropy: bytes) -> str:
@@ -81,11 +75,21 @@ def persist_snapshot(
     if directory_descriptor is None:  # pragma: no cover - create=True contract
         raise PersistenceError("unable to create snapshot directory")
     try:
-        _write_immutable(
+        journal_descriptor = _open_journal_directory(
             directory_descriptor,
-            f"{run_id}.json",
-            serialized,
+            create=True,
         )
+        if journal_descriptor is None:  # pragma: no cover - create=True contract
+            raise PersistenceError("unable to create snapshot journal")
+        try:
+            _write_immutable(
+                directory_descriptor,
+                journal_descriptor,
+                f"{run_id}.json",
+                serialized,
+            )
+        finally:
+            _close_descriptor(journal_descriptor)
     finally:
         _close_descriptor(directory_descriptor)
     return snapshot_root / f"{run_id}.json"
@@ -98,16 +102,23 @@ def load_snapshots(config: RadarConfig) -> Sequence[Mapping[str, object]]:
     directory_descriptor = _open_directory(snapshot_root, create=False)
     if directory_descriptor is None:
         return ()
+    journal_descriptor: int | None = None
     try:
-        entries = os.listdir(directory_descriptor)
-        _recover_orphaned_stages(directory_descriptor, entries)
+        journal_descriptor = _open_journal_directory(
+            directory_descriptor,
+            create=False,
+        )
         names = sorted(
             name
             for name in os.listdir(directory_descriptor)
             if name.endswith(".json")
         )
         loaded = [
-            _load_snapshot(directory_descriptor, name)
+            _load_snapshot(
+                directory_descriptor,
+                journal_descriptor,
+                name,
+            )
             for name in names
         ]
     except PersistenceError:
@@ -115,6 +126,8 @@ def load_snapshots(config: RadarConfig) -> Sequence[Mapping[str, object]]:
     except OSError as error:
         raise PersistenceError("unable to enumerate snapshots safely") from error
     finally:
+        if journal_descriptor is not None:
+            _close_descriptor(journal_descriptor)
         _close_descriptor(directory_descriptor)
     loaded.sort(
         key=lambda snapshot: (
@@ -158,16 +171,12 @@ def select_comparison(
 def _open_directory(path: Path, *, create: bool) -> int | None:
     if ".." in path.parts:
         raise InputValidationError("snapshot path must not traverse parent directories")
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_DIRECTORY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_CLOEXEC", 0)
     try:
         if path.is_absolute():
-            descriptor = os.open(os.path.sep, flags)
+            descriptor = os.open(os.path.sep, _directory_flags())
             components = path.parts[1:]
         else:
-            descriptor = os.open(".", flags)
+            descriptor = os.open(".", _directory_flags())
             components = path.parts
     except OSError as error:
         raise PersistenceError("unable to open trusted snapshot-path root") from error
@@ -176,90 +185,15 @@ def _open_directory(path: Path, *, create: bool) -> int | None:
         for component in components:
             if component in {"", "."}:
                 continue
-            created_directory_identity: tuple[int, int] | None = None
-            try:
-                next_descriptor = os.open(component, flags, dir_fd=descriptor)
-            except FileNotFoundError:
-                if not create:
-                    _close_descriptor(descriptor)
-                    return None
-                try:
-                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
-                except FileExistsError:
-                    pass
-                except OSError as error:
-                    raise PersistenceError(
-                        "unable to create snapshot directory component"
-                    ) from error
-                else:
-                    try:
-                        created_status = os.stat(
-                            component,
-                            dir_fd=descriptor,
-                            follow_symlinks=False,
-                        )
-                        if not stat.S_ISDIR(created_status.st_mode):
-                            raise PersistenceError(
-                                "new snapshot path component is not a directory"
-                            )
-                        if (
-                            hasattr(os, "geteuid")
-                            and created_status.st_uid != os.geteuid()
-                        ):
-                            raise PersistenceError(
-                                "new snapshot directory has an unexpected owner"
-                            )
-                        created_directory_identity = _inode(created_status)
-                        os.chmod(
-                            component,
-                            0o700,
-                            dir_fd=descriptor,
-                            follow_symlinks=False,
-                        )
-                        secured_status = os.stat(
-                            component,
-                            dir_fd=descriptor,
-                            follow_symlinks=False,
-                        )
-                        if (
-                            _inode(secured_status) != created_directory_identity
-                            or stat.S_IMODE(secured_status.st_mode) != 0o700
-                        ):
-                            raise PersistenceError(
-                                "new snapshot directory changed during setup"
-                            )
-                    except PersistenceError:
-                        raise
-                    except OSError as error:
-                        raise PersistenceError(
-                            "unable to secure snapshot directory component"
-                        ) from error
-                try:
-                    next_descriptor = os.open(component, flags, dir_fd=descriptor)
-                except OSError as error:
-                    raise PersistenceError(
-                        "unable to securely open snapshot directory component"
-                    ) from error
-            except OSError as error:
-                raise PersistenceError(
-                    "unable to securely open snapshot directory component"
-                ) from error
-            try:
-                opened_status = os.fstat(next_descriptor)
-                if not stat.S_ISDIR(opened_status.st_mode):
-                    raise PersistenceError(
-                        "snapshot path component is not a directory"
-                    )
-                if (
-                    created_directory_identity is not None
-                    and _inode(opened_status) != created_directory_identity
-                ):
-                    raise PersistenceError(
-                        "new snapshot directory changed before open"
-                    )
-            except Exception:
-                _close_descriptor(next_descriptor)
-                raise
+            next_descriptor = _open_child_directory(
+                descriptor,
+                component,
+                create=create,
+                require_mode=False,
+            )
+            if next_descriptor is None:
+                _close_descriptor(descriptor)
+                return None
             old_descriptor = descriptor
             try:
                 os.close(old_descriptor)
@@ -281,153 +215,250 @@ def _open_directory(path: Path, *, create: bool) -> int | None:
         raise PersistenceError("unable to securely traverse snapshot path") from error
 
 
+def _open_journal_directory(
+    snapshots_descriptor: int,
+    *,
+    create: bool,
+) -> int | None:
+    return _open_child_directory(
+        snapshots_descriptor,
+        _JOURNAL_DIRECTORY,
+        create=create,
+        require_mode=True,
+    )
+
+
+def _directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _open_child_directory(
+    parent_descriptor: int,
+    name: str,
+    *,
+    create: bool,
+    require_mode: bool,
+) -> int | None:
+    created_identity: tuple[int, int] | None = None
+    try:
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        if not create:
+            return None
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise PersistenceError("unable to create snapshot directory") from error
+        else:
+            try:
+                created = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                _validate_directory(created, exact_mode=None)
+                created_identity = _inode(created)
+                os.chmod(
+                    name,
+                    0o700,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                secured = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                _validate_directory(secured, exact_mode=0o700)
+                if _inode(secured) != created_identity:
+                    raise PersistenceError(
+                        "snapshot directory changed while it was secured"
+                    )
+            except PersistenceError:
+                raise
+            except OSError as error:
+                raise PersistenceError(
+                    "unable to secure snapshot directory"
+                ) from error
+        try:
+            descriptor = os.open(name, _directory_flags(), dir_fd=parent_descriptor)
+        except OSError as error:
+            raise PersistenceError("unable to open snapshot directory") from error
+    except OSError as error:
+        raise PersistenceError("unable to open snapshot directory") from error
+
+    try:
+        opened = os.fstat(descriptor)
+        _validate_directory(
+            opened,
+            exact_mode=0o700 if require_mode else None,
+            require_owner=require_mode or created_identity is not None,
+        )
+        if created_identity is not None and _inode(opened) != created_identity:
+            raise PersistenceError("new snapshot directory changed before open")
+        if require_mode:
+            named = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            _validate_directory(named, exact_mode=0o700)
+            if _inode(opened) != _inode(named):
+                raise PersistenceError("snapshot journal changed while it was opened")
+        return descriptor
+    except (OSError, PersistenceError) as error:
+        _close_descriptor(descriptor)
+        if isinstance(error, PersistenceError):
+            raise
+        raise PersistenceError("unable to verify snapshot directory") from error
+
+
+def _validate_directory(
+    metadata: os.stat_result,
+    *,
+    exact_mode: int | None,
+    require_owner: bool = True,
+) -> None:
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise PersistenceError("snapshot artifact is not a directory")
+    if exact_mode is not None and stat.S_IMODE(metadata.st_mode) != exact_mode:
+        raise PersistenceError("snapshot directory must use mode 0700")
+    if (
+        require_owner
+        and hasattr(os, "geteuid")
+        and metadata.st_uid != os.geteuid()
+    ):
+        raise PersistenceError("snapshot directory has an unexpected owner")
+
+
 def _write_immutable(
-    directory_descriptor: int,
+    snapshots_descriptor: int,
+    journal_descriptor: int,
     destination_name: str,
     serialized: bytes,
 ) -> None:
     if len(serialized) > _MAX_SNAPSHOT_BYTES:
         raise PersistenceError("snapshot exceeds the safe size limit")
-    temporary_name, descriptor = _create_temporary(directory_descriptor)
-    created_identity: tuple[int, int] | None = None
-    published = False
+    if _optional_name_metadata(snapshots_descriptor, destination_name) is not None:
+        raise PersistenceError("snapshot already exists")
+
+    created = _create_journal_entry(
+        journal_descriptor,
+        destination_name,
+        serialized,
+    )
+    if not created:
+        existing, _ = _read_named_file(
+            journal_descriptor,
+            destination_name,
+            expected_links=1,
+        )
+        if existing != serialized:
+            raise PersistenceError(
+                "snapshot journal conflicts with the requested payload"
+            )
+
+    journal = _name_metadata(journal_descriptor, destination_name)
+    _validate_regular(
+        journal,
+        expected_links=1,
+        expected_size=len(serialized),
+    )
+    if _optional_name_metadata(snapshots_descriptor, destination_name) is not None:
+        raise PersistenceError("snapshot already exists")
     try:
-        before = os.fstat(descriptor)
-        _validate_regular(before, expected_links=1, expected_size=0)
-        created_identity = _inode(before)
+        os.link(
+            destination_name,
+            destination_name,
+            src_dir_fd=journal_descriptor,
+            dst_dir_fd=snapshots_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        if error.errno == errno.EEXIST:
+            raise PersistenceError("snapshot already exists") from error
+        raise PersistenceError("unable to atomically publish snapshot") from error
+
+    published = _name_metadata(snapshots_descriptor, destination_name)
+    journal_after = _name_metadata(journal_descriptor, destination_name)
+    _validate_regular(
+        published,
+        expected_links=2,
+        expected_size=len(serialized),
+    )
+    _validate_regular(
+        journal_after,
+        expected_links=2,
+        expected_size=len(serialized),
+    )
+    if _inode(published) != _inode(journal_after):
+        raise PersistenceError("published snapshot does not match its journal")
+    try:
+        os.fsync(snapshots_descriptor)
+    except OSError as error:
+        raise PersistenceError("unable to sync published snapshot") from error
+
+
+def _create_journal_entry(
+    journal_descriptor: int,
+    name: str,
+    serialized: bytes,
+) -> bool:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(
+            name,
+            flags,
+            0o600,
+            dir_fd=journal_descriptor,
+        )
+    except FileExistsError:
+        return False
+    except OSError as error:
+        raise PersistenceError("unable to create snapshot journal entry") from error
+
+    try:
+        os.fchmod(descriptor, 0o600)
+        created = os.fstat(descriptor)
+        _validate_regular(created, expected_links=1, expected_size=0)
+        identity = _inode(created)
+        named = _name_metadata(journal_descriptor, name)
+        _validate_regular(named, expected_links=1, expected_size=0)
+        if _inode(named) != identity:
+            raise PersistenceError("snapshot journal entry changed during creation")
         _write_all(descriptor, serialized)
         os.fsync(descriptor)
         written = os.fstat(descriptor)
+        named_after = _name_metadata(journal_descriptor, name)
         _validate_regular(
             written,
             expected_links=1,
             expected_size=len(serialized),
         )
-        if _inode(written) != created_identity:
-            raise PersistenceError("snapshot temporary file changed during write")
-        named_temporary = _name_metadata(directory_descriptor, temporary_name)
         _validate_regular(
-            named_temporary,
+            named_after,
             expected_links=1,
             expected_size=len(serialized),
         )
-        if _inode(named_temporary) != created_identity:
-            raise PersistenceError("snapshot temporary name changed before publish")
-
-        try:
-            os.link(
-                temporary_name,
-                destination_name,
-                src_dir_fd=directory_descriptor,
-                dst_dir_fd=directory_descriptor,
-                follow_symlinks=False,
-            )
-        except OSError as error:
-            if error.errno == errno.EEXIST:
-                raise PersistenceError("snapshot already exists") from error
-            raise PersistenceError("unable to atomically publish snapshot") from error
-        published = True
-
-        named_destination = _name_metadata(directory_descriptor, destination_name)
-        _validate_regular(
-            named_destination,
-            expected_links=2,
-            expected_size=len(serialized),
-        )
-        if _inode(named_destination) != created_identity:
-            raise PersistenceError("published snapshot has an unexpected identity")
-        temporary_after_link = _name_metadata(
-            directory_descriptor,
-            temporary_name,
-        )
-        if _inode(temporary_after_link) != created_identity:
-            raise PersistenceError("snapshot temporary name changed during publish")
-
-        _quarantine_remove_expected(
-            directory_descriptor,
-            temporary_name,
-            created_identity,
-            missing_ok=True,
-        )
-        temporary_name = ""
-        final = _name_metadata(directory_descriptor, destination_name)
-        _validate_regular(
-            final,
-            expected_links=1,
-            expected_size=len(serialized),
-        )
-        if _inode(final) != created_identity:
-            raise PersistenceError("published snapshot changed before completion")
-        os.fsync(directory_descriptor)
-    except (InputValidationError, PersistenceError, OSError) as error:
-        if published and created_identity is not None:
-            _quarantine_remove_expected(
-                directory_descriptor,
-                destination_name,
-                created_identity,
-                missing_ok=True,
-            )
-        if isinstance(error, (InputValidationError, PersistenceError)):
-            raise
-        raise PersistenceError("unable to persist immutable snapshot") from error
+        if _inode(written) != identity or _inode(named_after) != identity:
+            raise PersistenceError("snapshot journal entry changed during write")
+        os.fsync(journal_descriptor)
+        return True
+    except PersistenceError:
+        raise
+    except OSError as error:
+        raise PersistenceError("unable to write snapshot journal entry") from error
     finally:
         _close_descriptor(descriptor)
-        if temporary_name and created_identity is not None:
-            _quarantine_remove_expected(
-                directory_descriptor,
-                temporary_name,
-                created_identity,
-                missing_ok=True,
-            )
-
-
-def _create_temporary(directory_descriptor: int) -> tuple[str, int]:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    for _ in range(_TEMP_ATTEMPTS):
-        name = f".snapshot-{secrets.token_hex(12)}.staged"
-        try:
-            descriptor = os.open(
-                name,
-                flags,
-                0o600,
-                dir_fd=directory_descriptor,
-            )
-        except FileExistsError:
-            continue
-        except OSError as error:
-            raise PersistenceError(
-                "unable to create snapshot temporary file"
-            ) from error
-        identity: tuple[int, int] | None = None
-        try:
-            os.fchmod(descriptor, 0o600)
-            metadata = os.fstat(descriptor)
-            identity = _inode(metadata)
-            _validate_regular(metadata, expected_links=1, expected_size=0)
-            named = _name_metadata(directory_descriptor, name)
-            _validate_regular(named, expected_links=1, expected_size=0)
-            if _inode(named) != identity:
-                raise PersistenceError(
-                    "snapshot temporary name changed during creation"
-                )
-        except (OSError, PersistenceError) as error:
-            _close_descriptor(descriptor)
-            if identity is not None:
-                _quarantine_remove_expected(
-                    directory_descriptor,
-                    name,
-                    identity,
-                    missing_ok=True,
-                )
-            if isinstance(error, PersistenceError):
-                raise
-            raise PersistenceError(
-                "unable to secure snapshot temporary file"
-            ) from error
-        return name, descriptor
-    raise PersistenceError("unable to allocate snapshot temporary file")
 
 
 def _write_all(descriptor: int, value: bytes) -> None:
@@ -440,7 +471,8 @@ def _write_all(descriptor: int, value: bytes) -> None:
 
 
 def _load_snapshot(
-    directory_descriptor: int,
+    snapshots_descriptor: int,
+    journal_descriptor: int | None,
     name: str,
 ) -> Mapping[str, object]:
     if not isinstance(name, str) or not name.endswith(".json"):
@@ -451,27 +483,22 @@ def _load_snapshot(
     except InputValidationError as error:
         raise PersistenceError("snapshot filename has an invalid run ID") from error
 
-    before = _name_metadata(directory_descriptor, name)
-    _validate_regular(before, expected_links=1)
-    descriptor = _open_snapshot_file(directory_descriptor, name)
-    try:
-        opened = os.fstat(descriptor)
-        _validate_regular(opened, expected_links=1)
-        if _file_identity(before) != _file_identity(opened):
-            raise PersistenceError("snapshot changed while it was opened")
-        data = _read_exact(descriptor, opened.st_size)
-        after_read = os.fstat(descriptor)
-        if _file_identity(after_read) != _file_identity(opened):
-            raise PersistenceError("snapshot changed while it was read")
-        named_after = _name_metadata(directory_descriptor, name)
-        if _file_identity(named_after) != _file_identity(opened):
-            raise PersistenceError("snapshot name changed while it was read")
-    except PersistenceError:
-        raise
-    except OSError as error:
-        raise PersistenceError("unable to safely read snapshot") from error
-    finally:
-        _close_descriptor(descriptor)
+    before = _name_metadata(snapshots_descriptor, name)
+    _validate_regular(before, expected_links=None)
+    if before.st_nlink not in {1, 2}:
+        raise PersistenceError("snapshot artifact has an unexpected link count")
+    if before.st_nlink == 2:
+        _validate_journal_link(journal_descriptor, name, before)
+
+    data, opened = _read_named_file(
+        snapshots_descriptor,
+        name,
+        expected_links=before.st_nlink,
+    )
+    if _file_identity(opened) != _file_identity(before):
+        raise PersistenceError("snapshot changed before it was read")
+    if opened.st_nlink == 2:
+        _validate_journal_link(journal_descriptor, name, opened)
 
     raw = _parse_snapshot_json(data)
     canonical = _validate_snapshot(raw, name)
@@ -482,6 +509,55 @@ def _load_snapshot(
     if not isinstance(frozen, Mapping):  # pragma: no cover - canonical is a dict
         raise PersistenceError("snapshot has an invalid canonical shape")
     return frozen
+
+
+def _validate_journal_link(
+    journal_descriptor: int | None,
+    name: str,
+    final: os.stat_result,
+) -> None:
+    if journal_descriptor is None:
+        raise PersistenceError("linked snapshot does not have a journal")
+    journal = _name_metadata(journal_descriptor, name)
+    _validate_regular(
+        journal,
+        expected_links=2,
+        expected_size=final.st_size,
+    )
+    if _file_identity(journal) != _file_identity(final):
+        raise PersistenceError("snapshot journal does not match its final link")
+
+
+def _read_named_file(
+    directory_descriptor: int,
+    name: str,
+    *,
+    expected_links: int,
+) -> tuple[bytes, os.stat_result]:
+    before = _name_metadata(directory_descriptor, name)
+    _validate_regular(before, expected_links=expected_links)
+    descriptor = _open_snapshot_file(directory_descriptor, name)
+    try:
+        opened = os.fstat(descriptor)
+        _validate_regular(opened, expected_links=expected_links)
+        if _file_identity(before) != _file_identity(opened):
+            raise PersistenceError("snapshot changed while it was opened")
+        data = _read_exact(descriptor, opened.st_size)
+        after_read = os.fstat(descriptor)
+        _validate_regular(after_read, expected_links=expected_links)
+        if _file_identity(after_read) != _file_identity(opened):
+            raise PersistenceError("snapshot changed while it was read")
+        named_after = _name_metadata(directory_descriptor, name)
+        _validate_regular(named_after, expected_links=expected_links)
+        if _file_identity(named_after) != _file_identity(opened):
+            raise PersistenceError("snapshot name changed while it was read")
+        return data, after_read
+    except PersistenceError:
+        raise
+    except OSError as error:
+        raise PersistenceError("unable to safely read snapshot") from error
+    finally:
+        _close_descriptor(descriptor)
 
 
 def _open_snapshot_file(directory_descriptor: int, name: str) -> int:
@@ -606,177 +682,20 @@ def _name_metadata(directory_descriptor: int, name: str) -> os.stat_result:
         raise PersistenceError("unable to inspect snapshot artifact name") from error
 
 
-def _recover_orphaned_stages(
-    directory_descriptor: int,
-    entries: Sequence[str],
-) -> None:
-    final_names = [name for name in entries if _is_final_name(name)]
-    for staged_name in sorted(
-        name
-        for name in entries
-        if _STAGED_NAME.fullmatch(name) is not None
-        or _QUARANTINE_NAME.fullmatch(name) is not None
-    ):
-        staged = _name_metadata(directory_descriptor, staged_name)
-        if (
-            staged.st_nlink != 2
-            and _QUARANTINE_NAME.fullmatch(staged_name) is not None
-        ):
-            continue
-        _validate_regular(staged, expected_links=2)
-        identity = _inode(staged)
-        matching_finals: list[tuple[str, os.stat_result]] = []
-        for final_name in final_names:
-            final = _name_metadata(directory_descriptor, final_name)
-            if _inode(final) == identity:
-                matching_finals.append((final_name, final))
-        if len(matching_finals) != 1:
-            raise PersistenceError(
-                "orphan snapshot stage does not have exactly one final link"
-            )
-        final_name, final_before = matching_finals[0]
-        _validate_regular(
-            final_before,
-            expected_links=2,
-            expected_size=staged.st_size,
-        )
-        _quarantine_remove_expected(
-            directory_descriptor,
-            staged_name,
-            identity,
-            missing_ok=True,
-        )
-        final_after = _name_metadata(directory_descriptor, final_name)
-        _validate_regular(
-            final_after,
-            expected_links=1,
-            expected_size=staged.st_size,
-        )
-        if _inode(final_after) != identity:
-            raise PersistenceError(
-                "recovered snapshot final changed identity"
-            )
-        os.fsync(directory_descriptor)
-
-
-def _is_final_name(name: str) -> bool:
-    if not isinstance(name, str) or not name.endswith(".json"):
-        return False
-    try:
-        _validate_run_id(name[:-5])
-    except InputValidationError:
-        return False
-    return True
-
-
-def _quarantine_remove_expected(
+def _optional_name_metadata(
     directory_descriptor: int,
     name: str,
-    expected_identity: tuple[int, int],
-    *,
-    missing_ok: bool,
-) -> bool:
-    quarantine = f".quarantine-{secrets.token_hex(24)}.holding"
+) -> os.stat_result | None:
     try:
-        os.rename(
-            name,
-            quarantine,
-            src_dir_fd=directory_descriptor,
-            dst_dir_fd=directory_descriptor,
-        )
-    except FileNotFoundError:
-        if missing_ok:
-            return False
-        raise PersistenceError("snapshot cleanup target disappeared")
-    except OSError as error:
-        raise PersistenceError("unable to quarantine snapshot artifact") from error
-
-    descriptor: int | None = None
-    try:
-        descriptor = _open_snapshot_file(directory_descriptor, quarantine)
-        opened = os.fstat(descriptor)
-        named = _name_metadata(directory_descriptor, quarantine)
-        if _inode(opened) != _inode(named):
-            raise PersistenceError("snapshot quarantine changed during open")
-        if _inode(opened) != expected_identity:
-            _close_descriptor(descriptor)
-            descriptor = None
-            _restore_quarantine(
-                directory_descriptor,
-                quarantine,
-                name,
-            )
-            raise PersistenceError(
-                "snapshot cleanup refused a competing inode"
-            )
-        _validate_regular(opened, expected_links=None)
-        _validate_regular(
-            named,
-            expected_links=opened.st_nlink,
-            expected_size=opened.st_size,
-        )
-        os.unlink(quarantine, dir_fd=directory_descriptor)
-        os.fsync(directory_descriptor)
-        return True
-    except (PersistenceError, OSError) as error:
-        if _name_exists(directory_descriptor, quarantine):
-            _restore_quarantine(
-                directory_descriptor,
-                quarantine,
-                name,
-            )
-        if isinstance(error, PersistenceError):
-            raise
-        raise PersistenceError("unable to remove quarantined snapshot") from error
-    finally:
-        if descriptor is not None:
-            _close_descriptor(descriptor)
-
-
-def _restore_quarantine(
-    directory_descriptor: int,
-    quarantine: str,
-    original_name: str,
-) -> None:
-    try:
-        os.link(
-            quarantine,
-            original_name,
-            src_dir_fd=directory_descriptor,
-            dst_dir_fd=directory_descriptor,
-            follow_symlinks=False,
-        )
-    except OSError as error:
-        raise PersistenceError(
-            "unable to restore competing snapshot artifact; quarantine retained"
-        ) from error
-    quarantine_metadata = _name_metadata(directory_descriptor, quarantine)
-    restored_metadata = _name_metadata(directory_descriptor, original_name)
-    if _inode(quarantine_metadata) != _inode(restored_metadata):
-        raise PersistenceError(
-            "restored snapshot artifact has an unexpected identity"
-        )
-    try:
-        os.unlink(quarantine, dir_fd=directory_descriptor)
-        os.fsync(directory_descriptor)
-    except OSError as error:
-        raise PersistenceError(
-            "unable to finalize competing snapshot restoration"
-        ) from error
-
-
-def _name_exists(directory_descriptor: int, name: str) -> bool:
-    try:
-        os.stat(
+        return os.stat(
             name,
             dir_fd=directory_descriptor,
             follow_symlinks=False,
         )
     except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    return True
+        return None
+    except OSError as error:
+        raise PersistenceError("unable to inspect snapshot artifact name") from error
 
 
 def _inode(metadata: os.stat_result) -> tuple[int, int]:
@@ -784,7 +703,6 @@ def _inode(metadata: os.stat_result) -> tuple[int, int]:
 
 
 def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
-    _validate_regular(metadata, expected_links=1)
     return (
         metadata.st_dev,
         metadata.st_ino,
