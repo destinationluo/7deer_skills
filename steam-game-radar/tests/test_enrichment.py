@@ -6,6 +6,7 @@ import sys
 import tempfile
 from types import MappingProxyType
 import unittest
+from unittest import mock
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -19,6 +20,7 @@ from steam_game_radar.enrichment import (
 )
 from steam_game_radar.errors import InputValidationError
 from steam_game_radar.schemas import MAX_JSON_SAFE_INTEGER, MAX_STEAM_APPID
+import steam_game_radar.enrichment as enrichment_module
 
 
 RUN_ID = "20260824T030000Z-a1b2c3d4"
@@ -124,12 +126,24 @@ class EnrichmentTests(unittest.TestCase):
     def test_evidence_requires_safe_https_urls(self) -> None:
         valid = Evidence("google", "https://example.com/search?q=game")
         self.assertEqual(valid.url, "https://example.com/search?q=game")
+        self.assertEqual(
+            Evidence("google", "https://[2001:db8::1]:443/search").url,
+            "https://[2001:db8::1]:443/search",
+        )
+        self.assertEqual(
+            Evidence("google", "https://example.com:443/search").url,
+            "https://example.com:443/search",
+        )
         for url in (
             "http://example.com/",
             "https:///missing-host",
             "https://user:pass@example.com/",
             "https://example.com/path#fragment",
             "https://example.com/white space",
+            "https://example.com:+443/path",
+            "https://example.com:0443/path",
+            "https://example.com:80/path",
+            "https://example.com:/path",
         ):
             with self.subTest(url=url), self.assertRaises(InputValidationError):
                 Evidence("google", url)
@@ -199,6 +213,44 @@ class EnrichmentTests(unittest.TestCase):
                 load_enrichment(symlink, RUN_ID)
             with self.assertRaises(InputValidationError):
                 load_enrichment(root, RUN_ID)
+
+            raced = root / "raced.json"
+            displaced = root / "raced-original.json"
+            raced.write_text(json.dumps(self.payload()), encoding="utf-8")
+            replacement = self.payload(google_competition_gap_score=99)
+            real_read = enrichment_module.os.read
+            swapped = False
+
+            def replace_name_before_first_read(
+                descriptor: int,
+                byte_count: int,
+            ) -> bytes:
+                nonlocal swapped
+                if not swapped:
+                    raced.rename(displaced)
+                    raced.write_text(json.dumps(replacement), encoding="utf-8")
+                    swapped = True
+                return real_read(descriptor, byte_count)
+
+            with mock.patch.object(
+                enrichment_module.os,
+                "read",
+                side_effect=replace_name_before_first_read,
+            ), self.assertRaises(InputValidationError):
+                load_enrichment(raced, RUN_ID)
+            self.assertTrue(swapped)
+            self.assertEqual(
+                json.loads(raced.read_text(encoding="utf-8"))["games"][0][
+                    "google_competition_gap_score"
+                ],
+                99,
+            )
+            self.assertEqual(
+                json.loads(displaced.read_text(encoding="utf-8"))["games"][0][
+                    "google_competition_gap_score"
+                ],
+                80,
+            )
 
             malformed = {
                 "duplicate.json": '{"schema_version":1,"schema_version":1}',

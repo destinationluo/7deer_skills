@@ -122,14 +122,20 @@ class ScoreTests(unittest.TestCase):
         ):
             with self.subTest(points=bad_points), self.assertRaises(InputValidationError):
                 interpolate(bad_points, value)
-        for value in (True, float("nan"), float("inf")):
+        for value in (True, float("nan"), float("inf"), 10**400):
             with self.subTest(value=value), self.assertRaises(InputValidationError):
                 interpolate(points, value)
 
     def test_released_player_growth_and_current_scale_transforms(self) -> None:
         growth_cases = ((-10, 0), (0, 0), (2.5, 12.5), (5, 25), (10, 37.5), (15, 50), (22.5, 62.5), (30, 75), (45, 87.5), (60, 100), (100, 100))
         for growth, expected in growth_cases:
-            candidate = self.candidate(deltas={"current_players_1d_percent": growth, "current_players_7d_percent": growth - 1})
+            candidate = self.candidate(
+                metrics={"current_players": self.observation(0, "players")},
+                deltas={
+                    "current_players_1d_percent": growth,
+                    "current_players_7d_percent": growth - 1,
+                },
+            )
             with self.subTest(growth=growth):
                 self.assertEqual(score_released(candidate).metric_scores["player_growth"], expected)
 
@@ -138,6 +144,25 @@ class ScoreTests(unittest.TestCase):
             candidate = self.candidate(metrics={"current_players": self.observation(players, "players")})
             with self.subTest(players=players):
                 self.assertEqual(score_released(candidate).metric_scores["current_player_scale"], expected)
+
+        orphan = score_released(
+            self.candidate(deltas={"current_players_1d_percent": 60})
+        )
+        self.assertNotIn("player_growth", orphan.metric_scores)
+        pseudo = score_released(
+            self.candidate(
+                metrics={
+                    "current_players": self.observation(
+                        100_000,
+                        "seo_players",
+                        kind="seo_enrichment",
+                    )
+                },
+                deltas={"current_players_1d_percent": 60},
+            )
+        )
+        self.assertNotIn("player_growth", pseudo.metric_scores)
+        self.assertNotIn("current_player_scale", pseudo.metric_scores)
 
     def test_released_rank_uses_seven_day_then_one_day_then_provider(self) -> None:
         metrics = {
@@ -162,6 +187,19 @@ class ScoreTests(unittest.TestCase):
                     )
                 )
                 self.assertEqual(scored.metric_scores["rank_improvement"], expected)
+        pseudo = score_released(
+            self.candidate(
+                metrics={
+                    "rank": self.observation(
+                        10,
+                        "seo_rank",
+                        kind="seo_enrichment",
+                    )
+                },
+                deltas={"rank_7d_change": 50},
+            )
+        )
+        self.assertNotIn("rank_improvement", pseudo.metric_scores)
 
     def test_released_recency_uses_release_observation_utc_date(self) -> None:
         cases = (("2026-08-24", 100), ("2026-08-17", 100), ("2026-08-16", 70), ("2026-07-25", 70), ("2026-07-24", 40), ("2026-05-26", 40), ("2026-05-25", 0))
@@ -172,10 +210,30 @@ class ScoreTests(unittest.TestCase):
                 self.assertEqual(scored.metric_scores["release_recency"], expected)
         future = score_released(self.candidate(metrics={"release_date": self.observation("2026-08-25", "release")}))
         self.assertNotIn("release_recency", future.metric_scores)
+        pseudo = score_released(
+            self.candidate(
+                metrics={
+                    "release_date": self.observation(
+                        "2026-08-24",
+                        "seo_release",
+                        kind="seo_enrichment",
+                    )
+                }
+            )
+        )
+        self.assertNotIn("release_recency", pseudo.metric_scores)
 
     def test_released_gate_uses_available_weighted_average(self) -> None:
         count_failure = score_released(
-            self.candidate(deltas={"current_players_1d_percent": 60})
+            self.candidate(
+                metrics={
+                    "current_players": self.observation(
+                        "not-a-number",
+                        "players",
+                    )
+                },
+                deltas={"current_players_1d_percent": 60},
+            )
         )
         self.assertEqual(tuple(count_failure.metric_scores), ("player_growth",))
         self.assertIsNone(count_failure.steam_heat_score)
@@ -251,6 +309,21 @@ class ScoreTests(unittest.TestCase):
             )
         )
         self.assertNotIn("upcoming_rank_improvement", provider_only.metric_scores)
+        pseudo = score_unreleased(
+            self.candidate(
+                release_status="unreleased",
+                metrics={
+                    "coming_soon_rank": self.observation(
+                        10,
+                        "seo_rank",
+                        kind="seo_enrichment",
+                    )
+                },
+                deltas={"coming_soon_rank_7d_change": 50},
+            )
+        )
+        self.assertNotIn("upcoming_rank_improvement", pseudo.metric_scores)
+        self.assertNotIn("coming_soon_visibility", pseudo.metric_scores)
 
     def test_unreleased_uses_larger_wishlist_or_follower_gain(self) -> None:
         gain_cases = ((0, 0), (50, 10), (100, 20), (550, 40), (1000, 60), (3000, 72.5), (5000, 85), (12_500, 92.5), (20_000, 100), (30_000, 100))
@@ -262,6 +335,24 @@ class ScoreTests(unittest.TestCase):
             with self.subTest(gain=gain):
                 scored = score_unreleased(self.candidate(release_status="unreleased", metrics=metrics))
                 self.assertEqual(scored.metric_scores["wishlist_or_follower_gain"], expected)
+        pseudo = score_unreleased(
+            self.candidate(
+                release_status="unreleased",
+                metrics={
+                    "wishlist_gain_7d": self.observation(
+                        20_000,
+                        "seo_gain",
+                        kind="seo_enrichment",
+                    ),
+                    "follower_gain_7d": self.observation(
+                        20_000,
+                        "seo_followers",
+                        kind="seo_enrichment",
+                    ),
+                },
+            )
+        )
+        self.assertNotIn("wishlist_or_follower_gain", pseudo.metric_scores)
 
     def test_unreleased_proximity_and_visibility_exact_ranges(self) -> None:
         proximity = (("2026-08-24", 100), ("2026-09-07", 100), ("2026-09-08", 80), ("2026-09-23", 80), ("2026-09-24", 60), ("2026-11-22", 60), ("2026-11-23", 30), ("2027-02-20", 30), ("2027-02-21", 0))
@@ -273,6 +364,25 @@ class ScoreTests(unittest.TestCase):
             with self.subTest(rank=rank):
                 scored = score_unreleased(self.candidate(release_status="unreleased", metrics={"coming_soon_rank": self.observation(rank, "coming_soon")}))
                 self.assertEqual(scored.metric_scores["coming_soon_visibility"], expected)
+        pseudo = score_unreleased(
+            self.candidate(
+                release_status="unreleased",
+                metrics={
+                    "release_date": self.observation(
+                        "2026-08-24",
+                        "seo_release",
+                        kind="seo_enrichment",
+                    ),
+                    "coming_soon_rank": self.observation(
+                        1,
+                        "seo_coming_soon",
+                        kind="seo_enrichment",
+                    ),
+                },
+            )
+        )
+        self.assertNotIn("release_proximity", pseudo.metric_scores)
+        self.assertNotIn("coming_soon_visibility", pseudo.metric_scores)
 
     def test_unreleased_gate_uses_available_weighted_average(self) -> None:
         insufficient = score_unreleased(self.candidate(release_status="unreleased", metrics={"release_date": self.observation("2026-08-30", "release")}))
@@ -336,8 +446,11 @@ class ScoreTests(unittest.TestCase):
         record = self.enrichment(youtube=25, reddit=25, reddit_upvotes=20)
         for heat, expected_score, action in (
             (0.0, 40.0, "skip"),
+            (16.6, 50.0, "skip"),
             (16.7, 50.0, "watch"),
+            (41.6, 65.0, "watch"),
             (41.7, 65.0, "worth_positioning"),
+            (66.6, 80.0, "worth_positioning"),
             (66.7, 80.0, "immediate_action"),
             (100.0, 100.0, "immediate_action"),
         ):
@@ -386,6 +499,23 @@ class ScoreTests(unittest.TestCase):
                 action="immediate_action",
                 confidence="C",
             )
+        with self.assertRaises(InputValidationError):
+            replace(
+                self.preliminary(80),
+                seo_opportunity_score=80,
+                final_score=79.9,
+                action="worth_positioning",
+                confidence="A",
+            )
+        with self.assertRaises(InputValidationError):
+            replace(
+                self.preliminary(80),
+                seo_opportunity_score=80,
+                confidence="A",
+            )
+        for field in ("warnings", "evidence"):
+            with self.subTest(field=field), self.assertRaises(InputValidationError):
+                replace(self.preliminary(80), **{field: None})
         with self.assertRaises(InputValidationError):
             self.preliminary(float("nan"))
 

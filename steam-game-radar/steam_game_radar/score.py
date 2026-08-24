@@ -10,7 +10,7 @@ from typing import Collection, Literal, Mapping, Sequence
 
 from .enrichment import EnrichmentRecord, Evidence
 from .errors import InputValidationError
-from .schemas import GameRecord, WarningRecord
+from .schemas import GameRecord, MetricObservation, WarningRecord
 from .trend import AnalyzedCandidate, select_rank_improvement
 
 
@@ -40,6 +40,7 @@ _PROVENANCE_TOKENS = {
     "historical_comparison",
 }
 _CONFIDENCE_ORDER = {"A": 0, "B": 1, "C": 2}
+_STEAM_SOURCE_KINDS = {"steam_official", "steamdb_manual_import"}
 
 _RELEASED_WEIGHTS = {
     "player_growth": 25,
@@ -109,16 +110,39 @@ class ScoredCandidate:
                 )
             if self.confidence not in {"A", "B"}:
                 raise InputValidationError("confidence C candidates cannot have final scores")
-            if self.action != _action_for_score(final):
+            combined = 0.60 * steam_heat + 0.40 * seo
+            if final != _rounded_score(combined):
+                raise InputValidationError(
+                    "final score does not match its weighted component scores"
+                )
+            if self.action != _action_for_raw_score(combined):
                 raise InputValidationError("final action does not match final score")
         elif steam_heat is None and self.action != "insufficient_data":
             raise InputValidationError("missing Steam heat requires insufficient_data")
         elif steam_heat is not None and self.action != "needs_seo_enrichment":
             raise InputValidationError("preliminary candidates require needs_seo_enrichment")
+        elif (
+            steam_heat is not None
+            and seo is not None
+            and self.confidence in {"A", "B"}
+        ):
+            raise InputValidationError(
+                "confidence A/B candidates with both components require a final score"
+            )
 
+        if isinstance(self.warnings, (str, bytes)) or not isinstance(
+            self.warnings,
+            Sequence,
+        ):
+            raise InputValidationError("warnings must be a sequence")
         warnings = tuple(self.warnings)
         if not all(isinstance(item, WarningRecord) for item in warnings):
             raise InputValidationError("warnings must contain WarningRecord values")
+        if isinstance(self.evidence, (str, bytes)) or not isinstance(
+            self.evidence,
+            Sequence,
+        ):
+            raise InputValidationError("evidence must be a sequence")
         evidence = tuple(self.evidence)
         if not all(isinstance(item, Evidence) for item in evidence):
             raise InputValidationError("evidence must contain Evidence values")
@@ -184,10 +208,12 @@ def score_released(candidate: AnalyzedCandidate) -> ScoredCandidate:
 
     _candidate_for_status(candidate, "released")
     raw_scores: dict[str, float] = {}
-    growth = _largest_delta(
-        candidate,
-        ("current_players_1d_percent", "current_players_7d_percent"),
-    )
+    growth = None
+    if _steam_observation(candidate.record, "current_players") is not None:
+        growth = _largest_delta(
+            candidate,
+            ("current_players_1d_percent", "current_players_7d_percent"),
+        )
     if growth is not None:
         raw_scores["player_growth"] = interpolate(_GROWTH_POINTS, max(growth, 0.0))
     players = _non_negative_metric(candidate.record, "current_players")
@@ -196,7 +222,15 @@ def score_released(candidate: AnalyzedCandidate) -> ScoredCandidate:
             _CURRENT_PLAYER_POINTS,
             players,
         )
-    improvement = select_rank_improvement(candidate)
+    improvement = _select_historical_rank_improvement(candidate)
+    if improvement is None:
+        provider_candidate = AnalyzedCandidate(
+            record=candidate.record,
+            deltas={},
+            newly_observed=candidate.newly_observed,
+            warnings=candidate.warnings,
+        )
+        improvement = select_rank_improvement(provider_candidate)
     if improvement is not None:
         raw_scores["rank_improvement"] = interpolate(
             _RANK_POINTS,
@@ -321,10 +355,9 @@ def apply_final_score(
     elif seo_score is None or confidence == "C":
         action = "needs_seo_enrichment"
     else:
-        final_score = _rounded_score(
-            0.60 * candidate.steam_heat_score + 0.40 * seo_score
-        )
-        action = _action_for_score(final_score)
+        combined = 0.60 * candidate.steam_heat_score + 0.40 * seo_score
+        final_score = _rounded_score(combined)
+        action = _action_for_raw_score(combined)
 
     return ScoredCandidate(
         record=candidate.record,
@@ -429,6 +462,7 @@ def _select_historical_rank_improvement(
             for metric_name in sorted(candidate.record.metrics)
             if metric_name != "previous_rank"
             and (metric_name == "rank" or metric_name.endswith("_rank"))
+            and _steam_observation(candidate.record, metric_name) is not None
             for key in (f"{metric_name}_{window}_change",)
             if key in candidate.deltas
         )
@@ -438,7 +472,7 @@ def _select_historical_rank_improvement(
 
 
 def _non_negative_metric(record: GameRecord, name: str) -> float | None:
-    observation = record.metrics.get(name)
+    observation = _steam_observation(record, name)
     if observation is None:
         return None
     value = observation.value
@@ -456,7 +490,7 @@ def _positive_metric(record: GameRecord, name: str) -> float | None:
 
 
 def _release_day_distance(record: GameRecord) -> int | None:
-    observation = record.metrics.get("release_date")
+    observation = _steam_observation(record, "release_date")
     if observation is None or not isinstance(observation.value, str):
         return None
     try:
@@ -519,7 +553,7 @@ def _recommended_content_types(record: EnrichmentRecord) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _action_for_score(value: float) -> Action:
+def _action_for_raw_score(value: float) -> Action:
     if value >= 80:
         return "immediate_action"
     if value >= 65:
@@ -532,10 +566,23 @@ def _action_for_score(value: float) -> Action:
 def _finite_number(value: object, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise InputValidationError(f"{name} must be a finite number")
-    parsed = float(value)
+    try:
+        parsed = float(value)
+    except (OverflowError, ValueError) as error:
+        raise InputValidationError(f"{name} must be a finite number") from error
     if not math.isfinite(parsed):
         raise InputValidationError(f"{name} must be a finite number")
     return parsed
+
+
+def _steam_observation(
+    record: GameRecord,
+    name: str,
+) -> MetricObservation | None:
+    observation = record.metrics.get(name)
+    if observation is None or observation.source_kind not in _STEAM_SOURCE_KINDS:
+        return None
+    return observation
 
 
 def _rounded_score(value: object) -> float:

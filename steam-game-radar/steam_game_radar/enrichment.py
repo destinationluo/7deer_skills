@@ -204,43 +204,71 @@ def _evidence_from_json(value: object) -> Evidence:
 
 def _read_local_text(path: Path) -> str:
     descriptor: int | None = None
+    parent_descriptor: int | None = None
     try:
         nofollow = getattr(os, "O_NOFOLLOW", 0)
-        before = None
-        if not nofollow:
-            before = path.lstat()
-            if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-                raise InputValidationError(
-                    "enrichment input must be a regular non-symlink file"
-                )
+        parent_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        parent_flags |= getattr(os, "O_DIRECTORY", 0) | nofollow
+        parent_descriptor = os.open(path.parent, parent_flags)
+        opened_parent = os.fstat(parent_descriptor)
+        named_parent = path.parent.lstat()
+        if (
+            not stat.S_ISDIR(opened_parent.st_mode)
+            or stat.S_ISLNK(named_parent.st_mode)
+            or not stat.S_ISDIR(named_parent.st_mode)
+            or _directory_identity(named_parent)
+            != _directory_identity(opened_parent)
+        ):
+            raise InputValidationError("enrichment parent directory changed")
+        before = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise InputValidationError(
+                "enrichment input must be a regular non-symlink file"
+            )
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= nofollow | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
-        descriptor = os.open(path, flags)
+        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             raise InputValidationError(
                 "enrichment input must be a regular non-symlink file"
             )
-        if before is not None:
-            after = path.lstat()
-            identities = {
-                (before.st_dev, before.st_ino),
-                (opened.st_dev, opened.st_ino),
-                (after.st_dev, after.st_ino),
-            }
-            if stat.S_ISLNK(after.st_mode) or len(identities) != 1:
-                raise InputValidationError("enrichment input changed while opening")
+        expected = _file_fingerprint(opened)
+        if _file_fingerprint(before) != expected:
+            raise InputValidationError("enrichment input changed while opening")
         if opened.st_size > _MAX_INPUT_BYTES:
             raise InputValidationError("enrichment input exceeds the 5 MiB limit")
         raw = bytearray()
-        while len(raw) <= _MAX_INPUT_BYTES:
-            remaining = _MAX_INPUT_BYTES + 1 - len(raw)
+        while len(raw) < opened.st_size:
+            remaining = opened.st_size - len(raw)
             chunk = os.read(descriptor, min(65_536, remaining))
             if not chunk:
-                break
+                raise InputValidationError("enrichment input changed while reading")
             raw.extend(chunk)
-        if len(raw) > _MAX_INPUT_BYTES:
-            raise InputValidationError("enrichment input exceeds the 5 MiB limit")
+        if os.read(descriptor, 1):
+            raise InputValidationError("enrichment input changed while reading")
+        after = os.fstat(descriptor)
+        name_after = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        parent_after = path.parent.lstat()
+        if (
+            not stat.S_ISREG(name_after.st_mode)
+            or stat.S_ISLNK(parent_after.st_mode)
+            or not stat.S_ISDIR(parent_after.st_mode)
+            or _directory_identity(parent_after)
+            != _directory_identity(opened_parent)
+            or _file_fingerprint(after) != expected
+            or _file_fingerprint(name_after) != expected
+            or len(raw) != opened.st_size
+        ):
+            raise InputValidationError("enrichment input changed while reading")
         return bytes(raw).decode("utf-8-sig", errors="strict")
     except InputValidationError:
         raise
@@ -252,6 +280,25 @@ def _read_local_text(path: Path) -> str:
                 os.close(descriptor)
             except OSError:
                 pass
+        if parent_descriptor is not None:
+            try:
+                os.close(parent_descriptor)
+            except OSError:
+                pass
+
+
+def _file_fingerprint(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _directory_identity(value: os.stat_result) -> tuple[int, int]:
+    return (value.st_dev, value.st_ino)
 
 
 def _parse_json(text: str) -> object:
@@ -386,10 +433,9 @@ def _https_url(value: object) -> str:
         raise InputValidationError("evidence URL must be a valid HTTPS URL")
     try:
         parsed = urlsplit(value)
-        port = parsed.port
+        parsed.port
     except ValueError as error:
         raise InputValidationError("evidence URL must be a valid HTTPS URL") from error
-    del port
     if (
         parsed.scheme != "https"
         or not parsed.hostname
@@ -400,4 +446,21 @@ def _https_url(value: object) -> str:
         raise InputValidationError(
             "evidence URL must use HTTPS without credentials or fragments"
         )
+    authority = parsed.netloc
+    if authority.startswith("["):
+        closing = authority.find("]")
+        if closing <= 1:
+            raise InputValidationError("evidence URL has an invalid IPv6 authority")
+        suffix = authority[closing + 1 :]
+        if suffix not in {"", ":443"}:
+            raise InputValidationError(
+                "evidence URL explicit port must be exactly 443"
+            )
+    else:
+        if authority.count(":") > 1:
+            raise InputValidationError("evidence URL IPv6 hosts must use brackets")
+        if ":" in authority and authority.rsplit(":", 1)[1] != "443":
+            raise InputValidationError(
+                "evidence URL explicit port must be exactly 443"
+            )
     return value
