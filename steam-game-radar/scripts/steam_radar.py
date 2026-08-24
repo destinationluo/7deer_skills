@@ -508,8 +508,7 @@ def _newest_official_fallback(
     services: Services,
 ) -> tuple[Mapping[str, object], MergeResult] | None:
     for snapshot in reversed(tuple(snapshots)):
-        metadata = snapshot.get("metadata")
-        if not isinstance(metadata, Mapping) or metadata.get("provider") != "steam_official":
+        if not _is_complete_official_snapshot(snapshot):
             continue
         try:
             merged = services.merge_import((), snapshot, now, config)
@@ -518,6 +517,29 @@ def _newest_official_fallback(
         if merged.mode == "official_plus_manual":
             return snapshot, merged
     return None
+
+
+def _is_complete_official_snapshot(
+    snapshot: Mapping[str, object],
+) -> bool:
+    metadata = snapshot.get("metadata")
+    records = snapshot.get("records")
+    if (
+        not isinstance(metadata, Mapping)
+        or metadata.get("provider") != "steam_official"
+        or metadata.get("mode") != "official_scan"
+        or metadata.get("data_status") != "fresh"
+        or isinstance(records, (str, bytes))
+        or not isinstance(records, Sequence)
+        or not records
+    ):
+        return False
+    capabilities = metadata.get("capabilities")
+    return (
+        isinstance(capabilities, Mapping)
+        and set(capabilities) == set(_OFFICIAL_CAPABILITIES)
+        and all(capabilities[name] is True for name in _OFFICIAL_CAPABILITIES)
+    )
 
 
 def _snapshot_metadata(

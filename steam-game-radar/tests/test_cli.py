@@ -405,6 +405,187 @@ class CliTests(unittest.TestCase):
                 [warning["code"] for warning in report["warnings"]],
             )
 
+        valid_capabilities = {
+            "most_played": True,
+            "featured_categories": True,
+            "appdetails": True,
+            "current_players": True,
+        }
+
+        def persist_fallback_candidate(
+            root: Path,
+            *,
+            age_hours: int,
+            entropy: str,
+            appid: int,
+            metadata: dict[str, object],
+            include_record: bool = True,
+        ) -> None:
+            observed = NOW - timedelta(hours=age_hours)
+            run_id = observed.strftime("%Y%m%dT%H%M%SZ") + f"-{entropy}"
+            records = (
+                (self.official_record(appid, observed=observed),)
+                if include_record
+                else ()
+            )
+            persist_snapshot(
+                self.config(root),
+                run_id,
+                records,
+                metadata,
+            )
+
+        valid_metadata: dict[str, object] = {
+            "provider": "steam_official",
+            "mode": "official_scan",
+            "data_status": "fresh",
+            "warnings": [],
+            "rejected_rows": [],
+            "capabilities": valid_capabilities,
+        }
+        invalid_metadata: tuple[tuple[int, str, int, dict[str, object], bool], ...] = (
+            (
+                20,
+                "20202020",
+                120,
+                {key: value for key, value in valid_metadata.items() if key != "capabilities"},
+                True,
+            ),
+            (
+                19,
+                "19191919",
+                119,
+                {
+                    **valid_metadata,
+                    "capabilities": {
+                        **valid_capabilities,
+                        "current_players": False,
+                    },
+                },
+                True,
+            ),
+            (
+                18,
+                "18181818",
+                118,
+                {**valid_metadata, "capabilities": "not-a-mapping"},
+                True,
+            ),
+            (17, "17171717", 117, valid_metadata, False),
+            (
+                16,
+                "16161616",
+                116,
+                {**valid_metadata, "mode": "official_plus_manual"},
+                True,
+            ),
+            (
+                15,
+                "15151515",
+                115,
+                {**valid_metadata, "data_status": "stale"},
+                True,
+            ),
+            (
+                14,
+                "14141414",
+                114,
+                {**valid_metadata, "provider": "steamdb_manual_import"},
+                True,
+            ),
+            (
+                13,
+                "13131313",
+                113,
+                {
+                    **valid_metadata,
+                    "provider": "steam_official_plus_manual",
+                    "mode": "official_plus_manual",
+                },
+                True,
+            ),
+        )
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            persist_fallback_candidate(
+                root,
+                age_hours=24,
+                entropy="24242424",
+                appid=10,
+                metadata=valid_metadata,
+            )
+            for age, entropy, appid, metadata, include_record in invalid_metadata:
+                persist_fallback_candidate(
+                    root,
+                    age_hours=age,
+                    entropy=entropy,
+                    appid=appid,
+                    metadata=metadata,
+                    include_record=include_record,
+                )
+            services = replace(
+                self.services(root),
+                collect_official=lambda *_args: (_ for _ in ()).throw(
+                    ProviderUnavailableError("offline")
+                ),
+            )
+            args = cli.build_parser().parse_args(
+                ["scan", "--config", "radar.json"]
+            )
+            self.assertEqual(cli.run_scan(args, services), 0)
+            self.assertEqual(
+                [candidate["appid"] for candidate in self.latest(root)["released"]],
+                [10],
+            )
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            missing_capabilities = invalid_metadata[0]
+            persist_fallback_candidate(
+                root,
+                age_hours=missing_capabilities[0],
+                entropy=missing_capabilities[1],
+                appid=missing_capabilities[2],
+                metadata=missing_capabilities[3],
+            )
+            scan_services = replace(
+                self.services(root),
+                collect_official=lambda *_args: (_ for _ in ()).throw(
+                    ProviderUnavailableError("offline")
+                ),
+            )
+            scan_args = cli.build_parser().parse_args(
+                ["scan", "--config", "radar.json"]
+            )
+            with self.assertRaises(ProviderUnavailableError):
+                cli.run_scan(scan_args, scan_services)
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            missing_capabilities = invalid_metadata[0]
+            persist_fallback_candidate(
+                root,
+                age_hours=missing_capabilities[0],
+                entropy=missing_capabilities[1],
+                appid=missing_capabilities[2],
+                metadata=missing_capabilities[3],
+            )
+            self.write_manual_csv(root)
+            import_args = cli.build_parser().parse_args(
+                [
+                    "import-steamdb",
+                    "--config",
+                    "radar.json",
+                    "--view",
+                    "wishlist_activity",
+                    "--input",
+                    "steamdb.csv",
+                ]
+            )
+            self.assertEqual(cli.run_import(import_args, self.services(root)), 0)
+            self.assertEqual(self.latest(root)["mode"], "manual_baseline")
+
     def test_scan_provider_failure_uses_stale_official_fallback_with_warning(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             root = Path(directory)
