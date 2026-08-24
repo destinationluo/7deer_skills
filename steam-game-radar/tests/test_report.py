@@ -146,6 +146,18 @@ class ReportTests(unittest.TestCase):
             rejected_rows=(RejectedRow(2, "bad_row", "Rejected", 99),),
         )
 
+    def report_with_metric_value(self, value: object) -> dict[str, object]:
+        report = self.report()
+        candidate = dict(report["released"][0])
+        metrics = dict(candidate["observed_metrics"])
+        observation = dict(metrics["current_players"])
+        observation["value"] = value
+        metrics["current_players"] = observation
+        candidate["observed_metrics"] = metrics
+        changed = dict(report)
+        changed["released"] = [candidate]
+        return changed
+
     def lock(self, root: Path, run_id: str) -> RunLock:
         return RunLock(
             path=root / "state" / ".run.lock",
@@ -233,6 +245,22 @@ class ReportTests(unittest.TestCase):
                     [],
                     [],
                 )
+
+        cyclic_warnings: list[object] = []
+        cyclic_warnings.append(cyclic_warnings)
+        with self.assertRaises(InputValidationError):
+            build_report(
+                RUN_A,
+                "preliminary",
+                "official_scan",
+                GENERATED_AT,
+                "fresh",
+                [],
+                [],
+                [],
+                cyclic_warnings,  # type: ignore[arg-type]
+                [],
+            )
 
     def test_candidate_schema_preserves_observations_provenance_scores_evidence_and_content(self) -> None:
         candidate = self.candidate(final=True, confidence="B")
@@ -390,6 +418,24 @@ class ReportTests(unittest.TestCase):
                 [],
             )
 
+        reversed_released = dict(result)
+        reversed_released["released"] = list(reversed(result["released"]))
+        with self.assertRaises(InputValidationError):
+            render_markdown(reversed_released)
+        with self.assertRaises(InputValidationError):
+            should_publish_latest(reversed_released, None)
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            config = RadarConfig(report_dir=root / "reports")
+            with self.lock(root, RUN_A) as lock, self.assertRaises(InputValidationError):
+                persist_report(config, reversed_released, lock)
+            self.assertFalse(config.report_dir.exists())
+
+        reversed_unreleased = dict(result)
+        reversed_unreleased["unreleased"] = list(reversed(result["unreleased"]))
+        with self.assertRaises(InputValidationError):
+            render_markdown(reversed_unreleased)
+
     def test_markdown_uses_canonical_json_order_and_values_without_rescoring(self) -> None:
         result = build_report(
             RUN_A,
@@ -407,12 +453,7 @@ class ReportTests(unittest.TestCase):
             [],
         )
 
-        with mock.patch.object(
-            report_module,
-            "candidate_sort_key",
-            side_effect=AssertionError("Markdown must not sort"),
-        ):
-            markdown = render_markdown(result)
+        markdown = render_markdown(result)
 
         self.assertLess(markdown.index("First & Best"), markdown.index("Second"))
         self.assertLess(markdown.index("Second"), markdown.index("Future"))
@@ -617,6 +658,43 @@ class ReportTests(unittest.TestCase):
             with self.lock(root, RUN_A) as lock, self.assertRaises(PersistenceError):
                 persist_report(escaped, report, lock)
             self.assertEqual(list(outside.iterdir()), [])
+
+            cycle: list[object] = []
+            cycle.append(cycle)
+            cyclic_report = self.report_with_metric_value(cycle)
+            deep: object = 0
+            for _ in range(1_100):
+                deep = [deep]
+            deep_report = self.report_with_metric_value(deep)
+            for invalid_report in (cyclic_report, deep_report):
+                with self.subTest(structure="cycle" if invalid_report is cyclic_report else "deep"):
+                    with self.assertRaises(InputValidationError):
+                        render_markdown(invalid_report)
+                    with self.assertRaises(InputValidationError):
+                        should_publish_latest(invalid_report, None)
+                    with self.lock(root, RUN_A) as lock, self.assertRaises(InputValidationError):
+                        persist_report(config, invalid_report, lock)
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            config = RadarConfig(report_dir=root / "reports")
+            config.report_dir.mkdir(parents=True)
+            canonical_text = json.dumps(
+                self.report(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            deep_json_value = "[" * 1_100 + "0" + "]" * 1_100
+            existing_json = canonical_text.replace('"value":1000', f'"value":{deep_json_value}')
+            latest_json = config.report_dir / "latest.json"
+            latest_markdown = config.report_dir / "latest.md"
+            latest_json.write_text(existing_json, encoding="utf-8")
+            latest_markdown.write_text("invalid deep latest\n", encoding="utf-8")
+            latest_json.chmod(0o600)
+            latest_markdown.chmod(0o600)
+            with self.lock(root, RUN_A) as lock, self.assertRaises(PersistenceError):
+                persist_report(config, report, lock)
 
 
 if __name__ == "__main__":

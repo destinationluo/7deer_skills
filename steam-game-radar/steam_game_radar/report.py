@@ -105,6 +105,35 @@ def build_report(
 ) -> dict[str, object]:
     """Build a fresh canonical report without mutating pipeline objects."""
 
+    try:
+        return _build_report(
+            run_id,
+            phase,
+            mode,
+            generated_at,
+            data_status,
+            released,
+            unreleased,
+            newly_observed,
+            warnings,
+            rejected_rows,
+        )
+    except RecursionError as error:
+        raise InputValidationError("report input nesting is too deep") from error
+
+
+def _build_report(
+    run_id: str,
+    phase: ReportPhase,
+    mode: ReportMode,
+    generated_at: str,
+    data_status: DataStatus,
+    released: Sequence[ScoredCandidate],
+    unreleased: Sequence[ScoredCandidate],
+    newly_observed: Sequence[int],
+    warnings: Sequence[WarningRecord],
+    rejected_rows: Sequence[RejectedRow],
+) -> dict[str, object]:
     _validate_run_id(run_id)
     parsed_phase = _literal(phase, _PHASES, "phase")
     parsed_mode = _literal(mode, _MODES, "mode")
@@ -300,6 +329,15 @@ def _candidate_to_dict(candidate: ScoredCandidate) -> dict[str, object]:
 
 
 def _canonical_report(report: Mapping[str, object]) -> dict[str, object]:
+    try:
+        return _canonical_report_unchecked(report)
+    except RecursionError as error:
+        raise InputValidationError("report input nesting is too deep") from error
+
+
+def _canonical_report_unchecked(
+    report: Mapping[str, object],
+) -> dict[str, object]:
     if not isinstance(report, Mapping) or set(report) != _REPORT_FIELD_SET:
         raise InputValidationError("report has an invalid top-level schema")
     version = report["report_schema_version"]
@@ -362,7 +400,12 @@ def _canonical_candidate_array(
             raise InputValidationError("report candidate is not canonical")
         canonical.append(rendered)
         candidates.append(parsed)
-    return canonical, tuple(candidates)
+    candidate_tuple = tuple(candidates)
+    if candidate_tuple != tuple(sorted(candidate_tuple, key=candidate_sort_key)):
+        raise InputValidationError(
+            f"report {release_status} candidates are not in canonical order"
+        )
+    return canonical, candidate_tuple
 
 
 def _candidate_from_json(value: object, release_status: str) -> ScoredCandidate:
@@ -876,7 +919,13 @@ def _load_latest_pair(directory_descriptor: int) -> dict[str, object] | None:
         canonical = _canonical_report(cast(Mapping[str, object], parsed))
         expected_json = _serialize_json(canonical).encode("utf-8")
         expected_markdown = render_markdown(canonical).encode("utf-8")
-    except (InputValidationError, TypeError, ValueError, UnicodeError) as error:
+    except (
+        InputValidationError,
+        TypeError,
+        ValueError,
+        UnicodeError,
+        RecursionError,
+    ) as error:
         raise PersistenceError("latest report JSON is invalid") from error
     if json_data != expected_json:
         raise PersistenceError("latest report JSON is not canonical")
