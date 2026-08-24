@@ -15,7 +15,17 @@ SKILL_ROOT = ROOT / "steam-game-radar"
 if str(SKILL_ROOT) not in sys.path:
     sys.path.insert(0, str(SKILL_ROOT))
 
+from steam_game_radar.config import RadarConfig
+from steam_game_radar.http_client import ALLOWED_HOSTS, USER_AGENT
+from steam_game_radar.official_provider import (
+    APPDETAILS_URL,
+    CURRENT_PLAYERS_URL,
+    FEATURED_CATEGORIES_URL,
+    MOST_PLAYED_URL,
+    _CAPABILITY_NAMES,
+)
 from steam_game_radar.report import _CANDIDATE_FIELDS, _REPORT_FIELDS
+from steam_game_radar.score import _RELEASED_WEIGHTS, _UNRELEASED_WEIGHTS
 from steam_game_radar.steamdb_import import _ALIASES, _ALLOWED_VIEWS
 
 
@@ -87,10 +97,26 @@ class SkillDocumentationTests(unittest.TestCase):
         self.assertIn("reports/steam-game-radar/{run_id}.preliminary.json", text)
         self.assertIn("reports/steam-game-radar/{run_id}.final.json", text)
         self.assertIn("references/report-template.md", text)
-        for code in range(7):
-            if code == 1:
-                continue
-            self.assertRegex(text, rf"\b{code}\b")
+        exit_section = text[text.find("## Exit codes") : text.find("## References")]
+        exit_rows = {
+            int(code): meaning.strip()
+            for code, meaning in re.findall(
+                r"(?m)^\|\s*([0-6])\s*\|\s*([^|]+?)\s*\|$",
+                exit_section,
+            )
+        }
+        self.assertEqual(
+            exit_rows,
+            {
+                0: "Success, including stale fallback no older than 72 hours",
+                1: "Unexpected failure; traceback is emitted",
+                2: "Input or schema validation failure",
+                3: "Provider failure with no usable fallback",
+                4: "Configuration failure",
+                5: "Snapshot or report persistence failure",
+                6: "Another run holds the project lock",
+            },
+        )
 
     def test_agent_schedule_and_preliminary_only_cron(self) -> None:
         text = _read(SKILL_ROOT / "SKILL.md")
@@ -123,27 +149,63 @@ class SkillDocumentationTests(unittest.TestCase):
 
     def test_data_sources_reference_is_complete(self) -> None:
         text = _read(SKILL_ROOT / "references/data-sources.md")
-        endpoints = (
-            "https://api.steampowered.com/ISteamChartsService/GetMostPlayedGames/v1/",
-            "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/?appid={appid}",
-            "https://store.steampowered.com/api/featuredcategories?cc={country}&l={language}",
-            "https://store.steampowered.com/api/appdetails?appids={appid}&cc={country}&l={language}",
+        endpoint_rows = {
+            capability: endpoint
+            for capability, endpoint in re.findall(
+                r"(?m)^\| `([^`]+)` \| `([^`]+)` \|",
+                text,
+            )
+        }
+        self.assertEqual(
+            endpoint_rows,
+            {
+                "most_played": MOST_PLAYED_URL,
+                "current_players": CURRENT_PLAYERS_URL,
+                "featured_categories": FEATURED_CATEGORIES_URL,
+                "appdetails": APPDETAILS_URL,
+            },
         )
-        for endpoint in endpoints:
-            self.assertIn(endpoint, text)
-        self.assertIn("api.steampowered.com", text)
-        self.assertIn("store.steampowered.com", text)
+        self.assertEqual(set(endpoint_rows), set(_CAPABILITY_NAMES))
+        self.assertEqual(
+            {urlsplit(url).hostname for url in endpoint_rows.values()},
+            set(ALLOWED_HOSTS),
+        )
+        flattened = " ".join(text.split())
+        config = RadarConfig()
+        self.assertIn("HTTPS-only", text)
+        self.assertIn(
+            "allows only `api.steampowered.com` and `store.steampowered.com`",
+            flattened,
+        )
+        self.assertIn(
+            "rejects userinfo and every explicit port, including `:443`",
+            flattened,
+        )
         self.assertRegex(text.casefold(), r"(?:no authentication|no api key|\u65e0\u9700\u8ba4\u8bc1).*(?:no api key|\u65e0\u9700 api key)")
         self.assertRegex(text.casefold(), r"(?:redirects disabled|no redirects|\u7981\u7528\u91cd\u5b9a\u5411)")
-        for token in ("1.0", "15", "3", "50", "5 MiB"):
-            self.assertIn(token, text)
-        for capability in (
-            "most_played",
-            "featured_categories",
-            "appdetails",
-            "current_players",
+        for token in (
+            str(config.minimum_request_interval_seconds),
+            str(int(config.request_timeout_seconds)),
+            str(config.max_retries),
+            str(config.released_candidate_limit),
+            "5 MiB",
         ):
-            self.assertIn(f"`{capability}`", text)
+            self.assertIn(token, text)
+        self.assertIn(
+            f"`max_retries={config.max_retries}` means {config.max_retries + 1} total attempts",
+            flattened,
+        )
+        self.assertIn(
+            "Retries apply only to timeouts, HTTP 429, and HTTP 5xx",
+            flattened,
+        )
+        self.assertIn(f"`User-Agent: {USER_AGENT}`", flattened)
+        self.assertIn(
+            "sends no credentials, cookies, authorization, API keys, or other secret headers",
+            flattened,
+        )
+        self.assertIn("36 hours produces a stale warning", flattened)
+        self.assertIn("72 hours inclusive", flattened)
         self.assertRegex(text.casefold(), r"capability.*(?:warning|\u8b66\u544a).*(?:fallback|\u964d\u7ea7)")
 
     def test_steamdb_import_reference_matches_implementation(self) -> None:
@@ -167,6 +229,20 @@ class SkillDocumentationTests(unittest.TestCase):
     def test_scoring_reference_contains_exact_rules(self) -> None:
         text = _read(SKILL_ROOT / "references/scoring-rules.md")
         flattened = " ".join(text.split())
+        released_section = text[
+            text.find("## Released Steam heat") : text.find("## Unreleased Steam heat")
+        ]
+        unreleased_section = text[
+            text.find("## Unreleased Steam heat") : text.find("## SEO opportunity")
+        ]
+        confidence_section = " ".join(
+            text[
+                text.find("## Combination, actions, and confidence") : text.find("## Stable ordering")
+            ].split()
+        )
+        ordering_section = " ".join(
+            text[text.find("## Stable ordering") :].split()
+        )
         required_rows = (
             "| Player growth | 25 | `(0,0)`, `(5,25)`, `(15,50)`, `(30,75)`, `(60,100)` |",
             "| Current player scale | 10 | `(0,0)`, `(100,20)`, `(1000,50)`, `(10000,80)`, `(100000,100)` |",
@@ -179,6 +255,18 @@ class SkillDocumentationTests(unittest.TestCase):
         )
         for row in required_rows:
             self.assertIn(row, text)
+        self.assertIn(
+            f"| Release recency | {_RELEASED_WEIGHTS['release_recency']} | age 0-7: 100; 8-30: 70; 31-90: 40; older: 0 |",
+            released_section,
+        )
+        self.assertIn(
+            f"| Release proximity | {_UNRELEASED_WEIGHTS['release_proximity']} | 0-14 days: 100; 15-30: 80; 31-90: 60; 91-180: 30; later/TBA: 0 |",
+            unreleased_section,
+        )
+        self.assertIn(
+            f"| Coming-soon visibility | {_UNRELEASED_WEIGHTS['coming_soon_visibility']} | rank 1: 100; 2-5: 80; 6-20: 50; 21-50: 20; lower/unranked: 0 |",
+            unreleased_section,
+        )
         for rule in (
             "7d same-source -> 1d same-source -> provider previous_rank - current_rank",
             "7d same-source -> 1d same-source; provider previous_rank is not allowed",
@@ -198,8 +286,20 @@ class SkillDocumentationTests(unittest.TestCase):
             self.assertIn(rule, flattened)
         for action in ("immediate_action", "worth_positioning", "watch", "skip"):
             self.assertIn(f"`{action}`", text)
-        for ordering in range(1, 6):
-            self.assertRegex(text, rf"(?m)^{ordering}\. ")
+        for definition in (
+            "confidence A: official values + valid history + manual SteamDB confirmation + valid SEO/community enrichment.",
+            "confidence B: official or manual SteamDB values + valid history + valid SEO/community enrichment.",
+            "confidence C: baseline, missing history, or incomplete enrichment. C never receives a final score/action",
+        ):
+            self.assertIn(definition, confidence_section)
+        for criterion in (
+            "1. Final score descending when present, otherwise Steam heat descending.",
+            "2. Confidence A, B, C.",
+            "3. Current players descending for released; wishlist/follower gain descending for unreleased.",
+            "4. Case-folded name ascending.",
+            "5. AppID ascending.",
+        ):
+            self.assertIn(criterion, ordering_section)
 
     def test_report_template_lists_the_canonical_schema(self) -> None:
         text = _read(SKILL_ROOT / "references/report-template.md")

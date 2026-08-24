@@ -72,8 +72,21 @@ CSV/JSON export explicitly supplied by a human（人工提供）.
 Preliminary output starts at
 `reports/steam-game-radar/{run_id}.preliminary.json`; final output starts at
 `reports/steam-game-radar/{run_id}.final.json`, each paired with Markdown and
-monotonic `latest.*`. Exit codes: 0 success, 2 input, 3 provider, 4 config,
-5 persistence, 6 busy; unexpected failures use 1.
+monotonic `latest.*`.
+
+## Exit codes
+
+| Code | Meaning |
+|---:|---|
+| 0 | Success, including stale fallback no older than 72 hours |
+| 1 | Unexpected failure; traceback is emitted |
+| 2 | Input or schema validation failure |
+| 3 | Provider failure with no usable fallback |
+| 4 | Configuration failure |
+| 5 | Snapshot or report persistence failure |
+| 6 | Another run holds the project lock |
+
+## References
 
 Load details only when needed:
 
