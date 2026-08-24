@@ -1,0 +1,185 @@
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+from types import MappingProxyType
+from typing import Mapping
+import unittest
+
+
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_DIR))
+
+from steam_game_radar.schemas import GameRecord, MetricObservation
+from steam_game_radar.trend import (
+    AnalyzedCandidate,
+    analyze_trends,
+    select_rank_improvement,
+)
+
+
+def deep_freeze(value: object) -> object:
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {key: deep_freeze(nested) for key, nested in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(deep_freeze(item) for item in value)
+    return value
+
+
+class TrendTests(unittest.TestCase):
+    def record(
+        self,
+        appid: int,
+        metrics: dict[str, tuple[object, str, str]],
+    ) -> GameRecord:
+        return GameRecord(
+            schema_version=1,
+            appid=appid,
+            name=f"Game {appid}",
+            release_status="released",
+            store_url=f"https://store.steampowered.com/app/{appid}/",
+            metrics={
+                name: MetricObservation(
+                    value=value,
+                    source_id=source_id,
+                    source_kind="steam_official",
+                    observed_at=observed_at,
+                )
+                for name, (value, source_id, observed_at) in metrics.items()
+            },
+            source_extra={"genres": ["Action"]},
+        )
+
+    def snapshot(self, records: list[GameRecord]) -> Mapping[str, object]:
+        snapshot = {
+            "schema_version": 1,
+            "run_id": "20260823T120000Z-1234abcd",
+            "observed_at": "2026-08-23T12:00:00Z",
+            "records": [record.to_dict() for record in records],
+            "metadata": {},
+        }
+        frozen = deep_freeze(snapshot)
+        self.assertIsInstance(frozen, Mapping)
+        return frozen
+
+    def test_deltas_require_the_same_metric_name_and_source_id(self) -> None:
+        current = self.record(
+            10,
+            {"current_players": (150, "steam_current_players", "2026-08-24T12:00:00Z")},
+        )
+        wrong_source = self.record(
+            10,
+            {"current_players": (100, "steamdb_players", "2026-08-23T12:00:00Z")},
+        )
+        wrong_name = self.record(
+            10,
+            {"peak_players": (100, "steam_current_players", "2026-08-23T12:00:00Z")},
+        )
+
+        for historical in (wrong_source, wrong_name):
+            with self.subTest(metrics=tuple(historical.metrics)):
+                candidate = analyze_trends(
+                    [current], self.snapshot([historical]), None
+                )[0]
+                self.assertEqual(dict(candidate.deltas), {})
+
+    def test_one_day_percentage_is_exact_and_zero_baseline_is_omitted(self) -> None:
+        current = [
+            self.record(
+                20,
+                {"current_players": (125, "players", "2026-08-24T12:00:00Z")},
+            ),
+            self.record(
+                21,
+                {"current_players": (10, "players", "2026-08-24T12:00:00Z")},
+            ),
+        ]
+        historical = [
+            self.record(
+                20,
+                {"current_players": (100, "players", "2026-08-23T12:00:00Z")},
+            ),
+            self.record(
+                21,
+                {"current_players": (0, "players", "2026-08-23T12:00:00Z")},
+            ),
+        ]
+
+        analyzed = analyze_trends(current, self.snapshot(historical), None)
+
+        self.assertEqual(
+            analyzed[0].deltas["current_players_1d_percent"], 25.0
+        )
+        self.assertNotIn("current_players_1d_percent", analyzed[1].deltas)
+
+    def test_seven_day_rank_delta_is_old_rank_minus_current_rank(self) -> None:
+        current = self.record(
+            30,
+            {"most_played_rank": (20, "chart_rank", "2026-08-24T12:00:00Z")},
+        )
+        historical = self.record(
+            30,
+            {"most_played_rank": (38, "chart_rank", "2026-08-17T12:00:00Z")},
+        )
+
+        candidate = analyze_trends(
+            [current], None, self.snapshot([historical])
+        )[0]
+
+        self.assertEqual(candidate.deltas["most_played_rank_7d_change"], 18.0)
+
+    def test_no_history_omits_deltas_and_newly_observed_uses_appid_presence(self) -> None:
+        current = self.record(
+            40,
+            {"current_players": (100, "players", "2026-08-24T12:00:00Z")},
+        )
+        no_history = analyze_trends([current], None, None)[0]
+        incompatible_history = self.record(
+            40,
+            {"peak_players": (100, "peak", "2026-08-23T12:00:00Z")},
+        )
+        previously_seen = analyze_trends(
+            [current], self.snapshot([incompatible_history]), None
+        )[0]
+
+        self.assertEqual(dict(no_history.deltas), {})
+        self.assertTrue(no_history.newly_observed)
+        self.assertEqual(dict(previously_seen.deltas), {})
+        self.assertFalse(previously_seen.newly_observed)
+
+    def test_rank_improvement_prefers_7d_then_1d_then_provider_previous(self) -> None:
+        record = self.record(
+            50,
+            {
+                "most_played_rank": (
+                    20,
+                    "steam_most_played_rank",
+                    "2026-08-24T12:00:00Z",
+                ),
+                "previous_rank": (
+                    27,
+                    "steam_previous_rank",
+                    "2026-08-24T12:00:00Z",
+                ),
+            },
+        )
+        cases = (
+            ({"most_played_rank_7d_change": 11.0, "most_played_rank_1d_change": 8.0}, 11.0),
+            ({"most_played_rank_1d_change": 8.0}, 8.0),
+            ({}, 7.0),
+        )
+        for deltas, expected in cases:
+            with self.subTest(deltas=deltas):
+                candidate = AnalyzedCandidate(
+                    record=record,
+                    deltas=deltas,
+                    newly_observed=False,
+                    warnings=(),
+                )
+                self.assertEqual(select_rank_improvement(candidate), expected)
+
+
+if __name__ == "__main__":
+    unittest.main()
