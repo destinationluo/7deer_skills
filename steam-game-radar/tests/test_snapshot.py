@@ -18,6 +18,7 @@ sys.path.insert(0, str(PROJECT_DIR))
 from steam_game_radar.artifacts import atomic_write_json, persist_raw, prune_raw
 from steam_game_radar.config import RadarConfig
 from steam_game_radar.errors import InputValidationError, PersistenceError
+import steam_game_radar.snapshot as snapshot_module
 from steam_game_radar.schemas import (
     GameRecord,
     MAX_JSON_SAFE_INTEGER,
@@ -102,21 +103,40 @@ class SnapshotTests(unittest.TestCase):
                 persist_snapshot(config, first_run, [], {"run": "replacement"})
             self.assertEqual(first.read_bytes(), original)
 
-            victim = root / "victim.bin"
-            victim.write_bytes(b"external-victim")
-            quarantine = (
-                first.parent / f".quarantine-{'d' * 48}.holding"
-            )
-            os.link(victim, quarantine)
-            self.assertEqual(victim.stat().st_nlink, 2)
-            with mock.patch(
-                "secrets.token_hex",
-                side_effect=lambda size: "d" * (size * 2),
+            entry_replaced = False
+            real_create_entry = snapshot_module._create_journal_entry
+
+            def replace_created_entry(
+                journal_descriptor: int,
+                name: str,
+                serialized: bytes,
+            ) -> object:
+                nonlocal entry_replaced
+                result = real_create_entry(
+                    journal_descriptor,
+                    name,
+                    serialized,
+                )
+                entry = first.parent / ".journal" / name
+                original_inode = entry.stat().st_ino
+                evil = json.loads(entry.read_text(encoding="utf-8"))
+                evil["metadata"]["run"] = 9
+                atomic_write_json(entry, evil)
+                entry.chmod(0o600)
+                self.assertNotEqual(entry.stat().st_ino, original_inode)
+                self.assertEqual(len(entry.read_bytes()), len(serialized))
+                entry_replaced = True
+                return result
+
+            replaced_run = "20260824T030406Z-dddddddd"
+            with mock.patch.object(
+                snapshot_module,
+                "_create_journal_entry",
+                side_effect=replace_created_entry,
             ), self.assertRaises(PersistenceError):
-                persist_snapshot(config, first_run, [], {"run": "collision"})
-            self.assertEqual(victim.read_bytes(), b"external-victim")
-            self.assertEqual(victim.stat().st_nlink, 2)
-            self.assertTrue(quarantine.exists())
+                persist_snapshot(config, replaced_run, [], {"run": 1})
+            self.assertTrue(entry_replaced)
+            self.assertFalse((first.parent / f"{replaced_run}.json").exists())
 
             journal = first.parent / ".journal"
             for run_id, final in ((first_run, first), (second_run, second)):
@@ -140,62 +160,38 @@ class SnapshotTests(unittest.TestCase):
 
     def test_persist_snapshot_atomically_publishes_valid_json(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
-            config = RadarConfig(data_dir=Path(directory))
+            root = Path(directory)
+            config = RadarConfig(data_dir=root)
             run_id = "20260824T030404Z-99999999"
-            persist_snapshot(config, run_id, [self.record()], {"run": 1})
-            replacement = b"replacement-must-survive"
-            real_open = os.open
-            real_rename = os.rename
-            real_unlink = os.unlink
-            raced = False
+            journal_swapped = False
+            real_create_entry = snapshot_module._create_journal_entry
 
-            def racing_unlink(
-                name: object,
-                *,
-                dir_fd: int | None = None,
-            ) -> None:
-                nonlocal raced
-                if (
-                    isinstance(name, str)
-                    and name.startswith(".quarantine-")
-                    and dir_fd is not None
-                    and not raced
-                ):
-                    real_rename(
-                        name,
-                        ".verified-owner-backup.holding",
-                        src_dir_fd=dir_fd,
-                        dst_dir_fd=dir_fd,
-                    )
-                    descriptor = real_open(
-                        name,
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                        0o600,
-                        dir_fd=dir_fd,
-                    )
-                    try:
-                        os.fchmod(descriptor, 0o600)
-                        os.write(descriptor, replacement)
-                        os.fsync(descriptor)
-                    finally:
-                        os.close(descriptor)
-                    raced = True
-                real_unlink(name, dir_fd=dir_fd)
+            def swap_journal_directory(
+                journal_descriptor: int,
+                name: str,
+                serialized: bytes,
+            ) -> object:
+                nonlocal journal_swapped
+                result = real_create_entry(
+                    journal_descriptor,
+                    name,
+                    serialized,
+                )
+                visible = root / "snapshots" / ".journal"
+                visible.rename(root / "snapshots" / ".journal-displaced")
+                visible.mkdir(mode=0o700)
+                visible.chmod(0o700)
+                journal_swapped = True
+                return result
 
-            with mock.patch(
-                "steam_game_radar.snapshot.os.unlink",
-                side_effect=racing_unlink,
+            with mock.patch.object(
+                snapshot_module,
+                "_create_journal_entry",
+                side_effect=swap_journal_directory,
             ), self.assertRaises(PersistenceError):
-                persist_snapshot(config, run_id, [], {"run": "collision"})
-
-            survivors = []
-            for candidate in (config.data_dir / "snapshots").iterdir():
-                try:
-                    if candidate.is_file():
-                        survivors.append(candidate.read_bytes())
-                except OSError:
-                    continue
-            self.assertTrue(not raced or replacement in survivors)
+                persist_snapshot(config, run_id, [], {"run": 1})
+            self.assertTrue(journal_swapped)
+            self.assertFalse((root / "snapshots" / f"{run_id}.json").exists())
 
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             config = RadarConfig(data_dir=Path(directory))

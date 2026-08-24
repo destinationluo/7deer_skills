@@ -10,6 +10,7 @@ name-based delete or rename.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import errno
 import json
@@ -42,6 +43,16 @@ _MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
 _MAX_JSON_NESTING = 128
 _READ_CHUNK_BYTES = 64 * 1024
 _JOURNAL_DIRECTORY = ".journal"
+
+
+@dataclass(frozen=True)
+class _ArtifactState:
+    device: int
+    inode: int
+    owner: int
+    mode: int
+    size: int
+    links: int
 
 
 def make_run_id(now: datetime, entropy: bytes) -> str:
@@ -346,33 +357,51 @@ def _write_immutable(
 ) -> None:
     if len(serialized) > _MAX_SNAPSHOT_BYTES:
         raise PersistenceError("snapshot exceeds the safe size limit")
+    try:
+        snapshots_status = os.fstat(snapshots_descriptor)
+        journal_status = os.fstat(journal_descriptor)
+        _validate_directory(
+            snapshots_status,
+            exact_mode=None,
+            require_owner=False,
+        )
+        _validate_directory(journal_status, exact_mode=0o700)
+    except PersistenceError:
+        raise
+    except OSError as error:
+        raise PersistenceError("unable to inspect snapshot directories") from error
+    snapshots_identity = _inode(snapshots_status)
+    journal_identity = _inode(journal_status)
     if _optional_name_metadata(snapshots_descriptor, destination_name) is not None:
         raise PersistenceError("snapshot already exists")
 
-    created = _create_journal_entry(
+    expected_entry = _create_journal_entry(
         journal_descriptor,
         destination_name,
         serialized,
     )
-    if not created:
-        existing, _ = _read_named_file(
-            journal_descriptor,
-            destination_name,
-            expected_links=1,
-        )
-        if existing != serialized:
-            raise PersistenceError(
-                "snapshot journal conflicts with the requested payload"
-            )
-
-    journal = _name_metadata(journal_descriptor, destination_name)
-    _validate_regular(
-        journal,
-        expected_links=1,
-        expected_size=len(serialized),
+    _validate_journal_directory_binding(
+        snapshots_descriptor,
+        journal_descriptor,
+        snapshots_identity,
+        journal_identity,
     )
+    journal_data, journal = _read_named_file(
+        journal_descriptor,
+        destination_name,
+        expected_links=1,
+    )
+    _require_artifact_state(journal, expected_entry, expected_links=1)
+    if journal_data != serialized:
+        raise PersistenceError("snapshot journal payload changed before publish")
     if _optional_name_metadata(snapshots_descriptor, destination_name) is not None:
         raise PersistenceError("snapshot already exists")
+    _validate_journal_directory_binding(
+        snapshots_descriptor,
+        journal_descriptor,
+        snapshots_identity,
+        journal_identity,
+    )
     try:
         os.link(
             destination_name,
@@ -386,31 +415,49 @@ def _write_immutable(
             raise PersistenceError("snapshot already exists") from error
         raise PersistenceError("unable to atomically publish snapshot") from error
 
-    published = _name_metadata(snapshots_descriptor, destination_name)
-    journal_after = _name_metadata(journal_descriptor, destination_name)
-    _validate_regular(
-        published,
-        expected_links=2,
-        expected_size=len(serialized),
+    _validate_journal_directory_binding(
+        snapshots_descriptor,
+        journal_descriptor,
+        snapshots_identity,
+        journal_identity,
     )
-    _validate_regular(
-        journal_after,
+    journal_after = _inspect_named_file(
+        journal_descriptor,
+        destination_name,
         expected_links=2,
-        expected_size=len(serialized),
     )
-    if _inode(published) != _inode(journal_after):
-        raise PersistenceError("published snapshot does not match its journal")
+    _require_artifact_state(journal_after, expected_entry, expected_links=2)
+    published_data, published = _read_named_file(
+        snapshots_descriptor,
+        destination_name,
+        expected_links=2,
+    )
+    _require_artifact_state(published, expected_entry, expected_links=2)
+    if published_data != serialized:
+        raise PersistenceError("published snapshot payload changed")
+    _validate_journal_directory_binding(
+        snapshots_descriptor,
+        journal_descriptor,
+        snapshots_identity,
+        journal_identity,
+    )
     try:
         os.fsync(snapshots_descriptor)
     except OSError as error:
         raise PersistenceError("unable to sync published snapshot") from error
+    _validate_journal_directory_binding(
+        snapshots_descriptor,
+        journal_descriptor,
+        snapshots_identity,
+        journal_identity,
+    )
 
 
 def _create_journal_entry(
     journal_descriptor: int,
     name: str,
     serialized: bytes,
-) -> bool:
+) -> _ArtifactState:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_CLOEXEC", 0)
@@ -422,7 +469,16 @@ def _create_journal_entry(
             dir_fd=journal_descriptor,
         )
     except FileExistsError:
-        return False
+        existing, metadata = _read_named_file(
+            journal_descriptor,
+            name,
+            expected_links=1,
+        )
+        if existing != serialized:
+            raise PersistenceError(
+                "snapshot journal conflicts with the requested payload"
+            )
+        return _artifact_state(metadata)
     except OSError as error:
         raise PersistenceError("unable to create snapshot journal entry") from error
 
@@ -451,8 +507,10 @@ def _create_journal_entry(
         )
         if _inode(written) != identity or _inode(named_after) != identity:
             raise PersistenceError("snapshot journal entry changed during write")
+        if _artifact_state(written) != _artifact_state(named_after):
+            raise PersistenceError("snapshot journal entry metadata changed")
         os.fsync(journal_descriptor)
-        return True
+        return _artifact_state(written)
     except PersistenceError:
         raise
     except OSError as error:
@@ -545,7 +603,7 @@ def _validate_journal_link(
         snapshots_descriptor,
         journal_descriptor,
     )
-    _, journal = _read_named_file(
+    journal = _inspect_named_file(
         journal_descriptor,
         name,
         expected_links=2,
@@ -581,13 +639,21 @@ def _require_journal_entry_absent(
 def _validate_journal_directory_binding(
     snapshots_descriptor: int,
     journal_descriptor: int,
+    expected_snapshots: tuple[int, int] | None = None,
+    expected_journal: tuple[int, int] | None = None,
 ) -> None:
     try:
+        snapshots = os.fstat(snapshots_descriptor)
         opened = os.fstat(journal_descriptor)
         named = os.stat(
             _JOURNAL_DIRECTORY,
             dir_fd=snapshots_descriptor,
             follow_symlinks=False,
+        )
+        _validate_directory(
+            snapshots,
+            exact_mode=None,
+            require_owner=False,
         )
         _validate_directory(opened, exact_mode=0o700)
         _validate_directory(named, exact_mode=0o700)
@@ -595,8 +661,27 @@ def _validate_journal_directory_binding(
         raise
     except OSError as error:
         raise PersistenceError("unable to verify snapshot journal") from error
+    if expected_snapshots is not None and _inode(snapshots) != expected_snapshots:
+        raise PersistenceError("snapshot directory identity changed")
+    if expected_journal is not None and _inode(opened) != expected_journal:
+        raise PersistenceError("opened snapshot journal identity changed")
     if _inode(opened) != _inode(named):
-        raise PersistenceError("snapshot journal directory changed during load")
+        raise PersistenceError("snapshot journal directory binding changed")
+
+
+def _inspect_named_file(
+    directory_descriptor: int,
+    name: str,
+    *,
+    expected_links: int,
+) -> os.stat_result:
+    _, metadata = _access_named_file(
+        directory_descriptor,
+        name,
+        expected_links=expected_links,
+        read_content=False,
+    )
+    return metadata
 
 
 def _read_named_file(
@@ -605,6 +690,24 @@ def _read_named_file(
     *,
     expected_links: int,
 ) -> tuple[bytes, os.stat_result]:
+    data, metadata = _access_named_file(
+        directory_descriptor,
+        name,
+        expected_links=expected_links,
+        read_content=True,
+    )
+    if data is None:  # pragma: no cover - read_content=True contract
+        raise PersistenceError("snapshot content was not read")
+    return data, metadata
+
+
+def _access_named_file(
+    directory_descriptor: int,
+    name: str,
+    *,
+    expected_links: int,
+    read_content: bool,
+) -> tuple[bytes | None, os.stat_result]:
     before = _name_metadata(directory_descriptor, name)
     _validate_regular(before, expected_links=expected_links)
     descriptor = _open_snapshot_file(directory_descriptor, name)
@@ -613,20 +716,20 @@ def _read_named_file(
         _validate_regular(opened, expected_links=expected_links)
         if _file_identity(before) != _file_identity(opened):
             raise PersistenceError("snapshot changed while it was opened")
-        data = _read_exact(descriptor, opened.st_size)
+        data = _read_exact(descriptor, opened.st_size) if read_content else None
         after_read = os.fstat(descriptor)
         _validate_regular(after_read, expected_links=expected_links)
         if _file_identity(after_read) != _file_identity(opened):
-            raise PersistenceError("snapshot changed while it was read")
+            raise PersistenceError("snapshot changed while it was accessed")
         named_after = _name_metadata(directory_descriptor, name)
         _validate_regular(named_after, expected_links=expected_links)
         if _file_identity(named_after) != _file_identity(opened):
-            raise PersistenceError("snapshot name changed while it was read")
+            raise PersistenceError("snapshot name changed while it was accessed")
         return data, after_read
     except PersistenceError:
         raise
     except OSError as error:
-        raise PersistenceError("unable to safely read snapshot") from error
+        raise PersistenceError("unable to safely access snapshot") from error
     finally:
         _close_descriptor(descriptor)
 
@@ -771,6 +874,40 @@ def _optional_name_metadata(
 
 def _inode(metadata: os.stat_result) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
+
+
+def _artifact_state(metadata: os.stat_result) -> _ArtifactState:
+    return _ArtifactState(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        owner=metadata.st_uid,
+        mode=stat.S_IMODE(metadata.st_mode),
+        size=metadata.st_size,
+        links=metadata.st_nlink,
+    )
+
+
+def _require_artifact_state(
+    metadata: os.stat_result,
+    expected: _ArtifactState,
+    *,
+    expected_links: int,
+) -> None:
+    _validate_regular(
+        metadata,
+        expected_links=expected_links,
+        expected_size=expected.size,
+    )
+    required = _ArtifactState(
+        device=expected.device,
+        inode=expected.inode,
+        owner=expected.owner,
+        mode=expected.mode,
+        size=expected.size,
+        links=expected_links,
+    )
+    if _artifact_state(metadata) != required:
+        raise PersistenceError("snapshot artifact identity changed")
 
 
 def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
