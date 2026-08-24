@@ -31,6 +31,7 @@ from steam_game_radar.snapshot import (
 
 
 UTC = timezone.utc
+SAFE_TEMP_DIR = str(Path(tempfile.gettempdir()).resolve())
 
 
 class SnapshotTests(unittest.TestCase):
@@ -81,7 +82,7 @@ class SnapshotTests(unittest.TestCase):
                 make_run_id(invalid_time, entropy)
 
     def test_same_day_snapshot_names_are_immutable(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             config = RadarConfig(data_dir=Path(directory))
             first_run = "20260824T030405Z-1234abcd"
             second_run = "20260824T030405Z-fedcba98"
@@ -100,23 +101,16 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(first.read_bytes(), original)
 
     def test_persist_snapshot_atomically_publishes_valid_json(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             config = RadarConfig(data_dir=Path(directory))
             run_id = "20260824T030405Z-1234abcd"
-            real_link = os.link
-            published: list[tuple[Path, Path]] = []
-
-            def recording_link(source: object, target: object, **kwargs: object) -> None:
-                published.append((Path(source), Path(target)))
-                real_link(source, target, **kwargs)
-
             with mock.patch(
-                "steam_game_radar.snapshot.atomic_write_json",
-                wraps=atomic_write_json,
-            ) as shared_writer, mock.patch(
+                "steam_game_radar.snapshot.os.open",
+                wraps=os.open,
+            ) as secure_open, mock.patch(
                 "steam_game_radar.snapshot.os.link",
-                side_effect=recording_link,
-            ):
+                wraps=os.link,
+            ) as secure_link:
                 path = persist_snapshot(
                     config,
                     run_id,
@@ -124,16 +118,47 @@ class SnapshotTests(unittest.TestCase):
                     {"capabilities": {"appdetails": True}},
                 )
 
-            self.assertEqual(shared_writer.call_count, 1)
-            self.assertEqual(published[0][1], path)
-            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["run_id"], run_id)
+            create_calls = [
+                call
+                for call in secure_open.call_args_list
+                if call.kwargs.get("dir_fd") is not None
+                and call.args[1] & os.O_CREAT
+                and call.args[1] & os.O_EXCL
+                and call.args[1] & getattr(os, "O_NOFOLLOW", 0)
+            ]
+            self.assertTrue(create_calls)
+            link_call = secure_link.call_args
+            self.assertIsNotNone(link_call)
+            self.assertIsInstance(link_call.kwargs.get("src_dir_fd"), int)
+            self.assertIsInstance(link_call.kwargs.get("dst_dir_fd"), int)
+            self.assertEqual(link_call.args[1], f"{run_id}.json")
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8"))["run_id"],
+                run_id,
+            )
             self.assertEqual(
                 [entry.name for entry in path.parent.iterdir()],
                 [f"{run_id}.json"],
             )
 
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            outside = root / "outside"
+            outside.mkdir()
+            alias = root / "alias"
+            alias.symlink_to(outside, target_is_directory=True)
+            escaped_data = alias / "data"
+            with self.assertRaises(PersistenceError):
+                persist_snapshot(
+                    RadarConfig(data_dir=escaped_data),
+                    run_id,
+                    [self.record()],
+                    {"must_not_escape": True},
+                )
+            self.assertFalse((outside / "data").exists())
+
     def test_snapshot_has_versioned_canonical_schema(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             config = RadarConfig(data_dir=Path(directory))
             run_id = "20260824T030405Z-1234abcd"
             path = persist_snapshot(
@@ -179,13 +204,13 @@ class SnapshotTests(unittest.TestCase):
                 load_snapshots(config)
 
     def test_load_snapshots_sorts_by_explicit_utc_time_not_mtime(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             config = RadarConfig(data_dir=Path(directory))
             later = persist_snapshot(
                 config,
                 "20260824T030000Z-22222222",
                 [self.record("2026-08-24T03:00:00Z")],
-                {"order": 2},
+                {"order": 2, "origin": "inside"},
             )
             earlier = persist_snapshot(
                 config,
@@ -195,7 +220,6 @@ class SnapshotTests(unittest.TestCase):
             )
             os.utime(earlier, (2_000_000_000, 2_000_000_000))
             os.utime(later, (1_000_000_000, 1_000_000_000))
-
             loaded = load_snapshots(config)
 
             self.assertEqual(
@@ -205,7 +229,54 @@ class SnapshotTests(unittest.TestCase):
                     "20260824T030000Z-22222222",
                 ],
             )
-            self.assertEqual(loaded[0]["records"], [self.record("2026-08-23T23:00:00Z").to_dict()])
+            self.assertEqual(loaded[0]["records"][0]["appid"], 730)
+            self.assertEqual(loaded[1]["metadata"]["origin"], "inside")
+            with self.assertRaises(TypeError):
+                loaded[0]["metadata"]["mutated"] = True
+            with self.assertRaises(TypeError):
+                loaded[0]["records"][0]["metrics"]["current_players"][
+                    "value"
+                ] = 0
+            with self.assertRaises(AttributeError):
+                loaded[0]["records"].append({})
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            config = RadarConfig(data_dir=root / "data")
+            run_id = "20260824T030000Z-33333333"
+            snapshot_path = persist_snapshot(
+                config,
+                run_id,
+                [self.record("2026-08-24T03:00:00Z")],
+                {"origin": "inside"},
+            )
+            replacement = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            replacement["metadata"]["origin"] = "outside"
+            outside = root / "outside.json"
+            atomic_write_json(outside, replacement)
+            real_open = os.open
+            swapped = False
+
+            def swap_before_open(
+                name: object,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal swapped
+                if name == snapshot_path.name and dir_fd is not None and not swapped:
+                    swapped = True
+                    snapshot_path.unlink()
+                    snapshot_path.symlink_to(outside)
+                return real_open(name, flags, mode, dir_fd=dir_fd)
+
+            with mock.patch(
+                "steam_game_radar.snapshot.os.open",
+                side_effect=swap_before_open,
+            ), self.assertRaises(PersistenceError):
+                load_snapshots(config)
+            self.assertTrue(swapped)
 
     def test_one_day_window_includes_18_and_36_hour_boundaries(self) -> None:
         current = datetime(2026, 8, 24, 12, tzinfo=UTC)
@@ -264,7 +335,7 @@ class SnapshotTests(unittest.TestCase):
         )
 
     def test_manual_canonical_raw_uses_shared_redacted_copy(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             config = RadarConfig(data_dir=Path(directory))
             canonical = {
                 "schema_version": 1,
@@ -288,7 +359,7 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(canonical["rows"][0]["api_token"], "hidden")
 
     def test_raw_retention_and_size_stay_in_shared_artifact_module(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             root = Path(directory)
             now = datetime(2026, 8, 24, tzinfo=UTC)
             small_limit = RadarConfig(
