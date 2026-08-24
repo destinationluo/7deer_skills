@@ -77,6 +77,12 @@ _STEAMDB_VIEWS = (
     "trending_followers",
     "recent_releases",
 )
+_OFFICIAL_CAPABILITIES = (
+    "most_played",
+    "featured_categories",
+    "appdetails",
+    "current_players",
+)
 _DOMAIN_EXIT_CODES = (
     (InputValidationError, 2),
     (ProviderUnavailableError, 3),
@@ -170,7 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
 def run_scan(args: argparse.Namespace, services: Services) -> int:
     project_root, config = _runtime_config(args, services)
     del project_root
-    started_at = _utc_now(services.clock())
+    started_at = _utc_second(services.clock())
     run_id = make_run_id(started_at, services.entropy(4))
     observed_at = _timestamp(started_at)
     lock = services.lock_factory(
@@ -182,6 +188,7 @@ def run_scan(args: argparse.Namespace, services: Services) -> int:
     )
     with lock:
         history = tuple(services.load_snapshots(config))
+        _require_new_run_id(history, run_id)
         provider_error: ProviderUnavailableError | None = None
         collection: CollectionResult | None = None
         try:
@@ -267,7 +274,7 @@ def run_scan(args: argparse.Namespace, services: Services) -> int:
 def run_import(args: argparse.Namespace, services: Services) -> int:
     project_root, config = _runtime_config(args, services)
     input_path = _project_path(cast(Path, args.input), project_root)
-    started_at = _utc_now(services.clock())
+    started_at = _utc_second(services.clock())
     run_id = make_run_id(started_at, services.entropy(4))
     observed_at = _timestamp(started_at)
     lock = services.lock_factory(
@@ -279,6 +286,7 @@ def run_import(args: argparse.Namespace, services: Services) -> int:
     )
     with lock:
         history = tuple(services.load_snapshots(config))
+        _require_new_run_id(history, run_id)
         imported = services.import_steamdb(input_path, args.view, observed_at)
         services.persist_raw(
             config,
@@ -348,7 +356,7 @@ def run_import(args: argparse.Namespace, services: Services) -> int:
 def run_enrich(args: argparse.Namespace, services: Services) -> int:
     project_root, config = _runtime_config(args, services)
     input_path = _project_path(cast(Path, args.input), project_root)
-    generated_at = _utc_now(services.clock())
+    generated_at = _utc_second(services.clock())
     run_id = cast(str, args.run_id)
     lock = services.lock_factory(
         config.data_dir / ".run.lock",
@@ -464,6 +472,10 @@ def _utc_now(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _utc_second(value: datetime) -> datetime:
+    return _utc_now(value).replace(microsecond=0)
+
+
 def _timestamp(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
@@ -471,17 +483,22 @@ def _timestamp(value: datetime) -> str:
 
 
 def _require_usable_official_collection(collection: CollectionResult) -> None:
-    discovery_available = (
-        collection.capabilities["most_played"]
-        or collection.capabilities["featured_categories"]
+    complete = all(
+        collection.capabilities.get(name) is True
+        for name in _OFFICIAL_CAPABILITIES
     )
-    details_usable = collection.capabilities["appdetails"] or bool(
-        collection.released or collection.unreleased
-    )
-    if not discovery_available or not details_usable:
+    if not complete or not (collection.released or collection.unreleased):
         raise ProviderUnavailableError(
             "official Steam discovery did not produce a usable collection"
         )
+
+
+def _require_new_run_id(
+    snapshots: Sequence[Mapping[str, object]],
+    run_id: str,
+) -> None:
+    if any(snapshot.get("run_id") == run_id for snapshot in snapshots):
+        raise PersistenceError("run_id already has an immutable snapshot")
 
 
 def _newest_official_fallback(

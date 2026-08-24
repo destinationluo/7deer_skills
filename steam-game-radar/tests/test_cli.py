@@ -327,8 +327,45 @@ class CliTests(unittest.TestCase):
             self.assertTrue(
                 (root / "state" / "steam-radar" / "snapshots" / f"{RUN_A}.json").exists()
             )
-            raw_files = list((root / "state" / "steam-radar" / "raw" / RUN_A).glob("*.json"))
+            raw_files = list(
+                (root / "state" / "steam-radar" / "raw" / RUN_A).glob(
+                    "*.json"
+                )
+            )
             self.assertEqual([path.name for path in raw_files], ["most_played.json"])
+            snapshot_path = (
+                root / "state" / "steam-radar" / "snapshots" / f"{RUN_A}.json"
+            )
+            raw_path = raw_files[0]
+            original_snapshot = snapshot_path.read_bytes()
+            original_raw = raw_path.read_bytes()
+            duplicate_events: list[str] = []
+            duplicate_collection = CollectionResult(
+                released=(self.official_record(players=99_999),),
+                unreleased=(),
+                capabilities=self.collection().capabilities,
+                warnings=(),
+                raw={"most_played": {"response": {"changed": True}}},
+            )
+
+            def duplicate_collect(*_args: object) -> CollectionResult:
+                duplicate_events.append("collect")
+                return duplicate_collection
+
+            def duplicate_raw(*call_args: object) -> Path:
+                duplicate_events.append("raw")
+                return cli.default_persist_raw(*call_args)
+
+            duplicate_services = replace(
+                self.services(root),
+                collect_official=duplicate_collect,
+                persist_raw=duplicate_raw,
+            )
+            with self.assertRaises(PersistenceError):
+                cli.run_scan(args, duplicate_services)
+            self.assertEqual(duplicate_events, [])
+            self.assertEqual(snapshot_path.read_bytes(), original_snapshot)
+            self.assertEqual(raw_path.read_bytes(), original_raw)
 
     def test_scan_provider_failure_uses_fresh_official_fallback(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
@@ -387,6 +424,30 @@ class CliTests(unittest.TestCase):
                 [warning["code"] for warning in report["warnings"]],
             )
 
+        for age, expected_status in (
+            (timedelta(hours=36), "fresh"),
+            (timedelta(hours=36, seconds=1), "stale"),
+        ):
+            with self.subTest(age=age), tempfile.TemporaryDirectory(
+                dir=SAFE_TEMP_DIR
+            ) as directory:
+                root = Path(directory)
+                self.persist_official_history(root, age)
+                services = replace(
+                    self.services(
+                        root,
+                        now=NOW + timedelta(microseconds=500_000),
+                    ),
+                    collect_official=lambda *_args: (_ for _ in ()).throw(
+                        ProviderUnavailableError("offline")
+                    ),
+                )
+                args = cli.build_parser().parse_args(
+                    ["scan", "--config", "radar.json"]
+                )
+                self.assertEqual(cli.run_scan(args, services), 0)
+                self.assertEqual(self.latest(root)["data_status"], expected_status)
+
     def test_scan_provider_failure_rejects_expired_or_missing_fallback(self) -> None:
         for age in (None, timedelta(hours=72, seconds=1)):
             with self.subTest(age=age), tempfile.TemporaryDirectory(
@@ -405,6 +466,69 @@ class CliTests(unittest.TestCase):
                 args = cli.build_parser().parse_args(["scan", "--config", "radar.json"])
                 with self.assertRaises(ProviderUnavailableError):
                     cli.run_scan(args, services)
+
+        complete = self.collection()
+        capability_variants = (
+            {
+                **dict(complete.capabilities),
+                "current_players": False,
+            },
+            {
+                **dict(complete.capabilities),
+                "most_played": False,
+            },
+        )
+        unusable_collections = tuple(
+            CollectionResult(
+                released=complete.released,
+                unreleased=complete.unreleased,
+                capabilities=capabilities,
+                warnings=(),
+                raw={},
+            )
+            for capabilities in capability_variants
+        ) + (
+            CollectionResult(
+                released=(),
+                unreleased=(),
+                capabilities=complete.capabilities,
+                warnings=(),
+                raw={},
+            ),
+        )
+        for collection in unusable_collections:
+            with self.subTest(capabilities=collection.capabilities):
+                with tempfile.TemporaryDirectory(
+                    dir=SAFE_TEMP_DIR
+                ) as directory:
+                    root = Path(directory)
+                    self.write_config(root)
+                    args = cli.build_parser().parse_args(
+                        ["scan", "--config", "radar.json"]
+                    )
+                    with self.assertRaises(ProviderUnavailableError):
+                        cli.run_scan(
+                            args,
+                            self.services(root, collection=collection),
+                        )
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            self.persist_official_history(root, timedelta(hours=72))
+            services = replace(
+                self.services(
+                    root,
+                    now=NOW + timedelta(microseconds=500_000),
+                ),
+                collect_official=lambda *_args: (_ for _ in ()).throw(
+                    ProviderUnavailableError("offline")
+                ),
+            )
+            args = cli.build_parser().parse_args(
+                ["scan", "--config", "radar.json"]
+            )
+            self.assertEqual(cli.run_scan(args, services), 0)
+            self.assertEqual(self.latest(root)["data_status"], "stale")
 
     def test_import_manual_baseline_persists_canonical_raw_and_partial_rejections(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
@@ -435,18 +559,49 @@ class CliTests(unittest.TestCase):
             self.assertEqual(candidate["deltas"], {})
             self.assertIsNone(candidate["final_score"])
             self.assertEqual(candidate["action"], "needs_seo_enrichment")
-            raw = json.loads(
-                (
-                    root
-                    / "state"
-                    / "steam-radar"
-                    / "raw"
-                    / RUN_A
-                    / "steamdb_wishlist_activity.json"
-                ).read_text(encoding="utf-8")
+            raw_path = (
+                root
+                / "state"
+                / "steam-radar"
+                / "raw"
+                / RUN_A
+                / "steamdb_wishlist_activity.json"
             )
+            snapshot_path = (
+                root / "state" / "steam-radar" / "snapshots" / f"{RUN_A}.json"
+            )
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
             self.assertEqual(raw["view"], "wishlist_activity")
             self.assertEqual(len(raw["rows"]), 2)
+            original_raw = raw_path.read_bytes()
+            original_snapshot = snapshot_path.read_bytes()
+            self.write_manual_csv(root, partial=True).write_text(
+                "appid,name,wishlist_7d_gain,release_date\n"
+                "20,Manual Twenty,2000,2026-09-01\n"
+                "not-an-appid,Broken,900,2026-09-02\n",
+                encoding="utf-8",
+            )
+            duplicate_events: list[str] = []
+            base = self.services(root)
+
+            def duplicate_import(*call_args: object) -> object:
+                duplicate_events.append("import")
+                return cli.default_import_steamdb(*call_args)
+
+            def duplicate_raw(*call_args: object) -> Path:
+                duplicate_events.append("raw")
+                return cli.default_persist_raw(*call_args)
+
+            duplicate_services = replace(
+                base,
+                import_steamdb=duplicate_import,
+                persist_raw=duplicate_raw,
+            )
+            with self.assertRaises(PersistenceError):
+                cli.run_import(args, duplicate_services)
+            self.assertEqual(duplicate_events, [])
+            self.assertEqual(raw_path.read_bytes(), original_raw)
+            self.assertEqual(snapshot_path.read_bytes(), original_snapshot)
 
     def test_import_merges_newest_eligible_official_snapshot(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
@@ -471,6 +626,28 @@ class CliTests(unittest.TestCase):
                 ([item["appid"] for item in report["released"]], [item["appid"] for item in report["unreleased"]]),
                 ([10], [20]),
             )
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            self.persist_official_history(root, timedelta(hours=72))
+            self.write_manual_csv(root)
+            args = cli.build_parser().parse_args(
+                [
+                    "import-steamdb",
+                    "--config",
+                    "radar.json",
+                    "--view",
+                    "wishlist_activity",
+                    "--input",
+                    "steamdb.csv",
+                ]
+            )
+            services = self.services(
+                root,
+                now=NOW + timedelta(microseconds=500_000),
+            )
+            self.assertEqual(cli.run_import(args, services), 0)
+            self.assertEqual(self.latest(root)["mode"], "official_plus_manual")
 
     def test_enrich_requires_matching_run_and_builds_final_report(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
