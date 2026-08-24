@@ -456,6 +456,40 @@ class ScoreTests(unittest.TestCase):
             with self.subTest(rank=rank):
                 scored = score_unreleased(self.candidate(release_status="unreleased", metrics={"coming_soon_rank": self.observation(rank, "coming_soon")}))
                 self.assertEqual(scored.metric_scores["coming_soon_visibility"], expected)
+        unavailable = score_unreleased(
+            self.candidate(release_status="unreleased")
+        )
+        self.assertEqual(
+            dict(unavailable.metric_scores),
+            {"release_proximity": 0.0, "coming_soon_visibility": 0.0},
+        )
+        explicit_unavailable = score_unreleased(
+            self.candidate(
+                release_status="unreleased",
+                metrics={
+                    "release_date": self.observation("TBA", "release"),
+                    "coming_soon_rank": self.observation(
+                        "unranked",
+                        "coming_soon",
+                    ),
+                },
+            )
+        )
+        self.assertEqual(
+            dict(explicit_unavailable.metric_scores),
+            {"release_proximity": 0.0, "coming_soon_visibility": 0.0},
+        )
+        malformed = score_unreleased(
+            self.candidate(
+                release_status="unreleased",
+                metrics={
+                    "release_date": self.observation(20260824, "release"),
+                    "coming_soon_rank": self.observation([], "coming_soon"),
+                },
+            )
+        )
+        self.assertNotIn("release_proximity", malformed.metric_scores)
+        self.assertNotIn("coming_soon_visibility", malformed.metric_scores)
         pseudo = score_unreleased(
             self.candidate(
                 release_status="unreleased",
@@ -482,8 +516,27 @@ class ScoreTests(unittest.TestCase):
         self.assertEqual(insufficient.action, "insufficient_data")
 
         passing = score_unreleased(self.candidate(release_status="unreleased", metrics={"release_date": self.observation("2026-08-30", "release"), "wishlist_gain_7d": self.observation(1000, "wishlist")}))
-        self.assertEqual(passing.steam_heat_score, 73.3)
+        self.assertEqual(passing.steam_heat_score, 55.0)
         self.assertEqual(passing.action, "needs_seo_enrichment")
+
+        unavailable_zero_metrics = score_unreleased(
+            self.candidate(
+                release_status="unreleased",
+                metrics={
+                    "wishlist_gain_7d": self.observation(1000, "wishlist"),
+                },
+            )
+        )
+        self.assertEqual(
+            dict(unavailable_zero_metrics.metric_scores),
+            {
+                "wishlist_or_follower_gain": 60.0,
+                "release_proximity": 0.0,
+                "coming_soon_visibility": 0.0,
+            },
+        )
+        self.assertEqual(unavailable_zero_metrics.steam_heat_score, 30.0)
+        self.assertEqual(unavailable_zero_metrics.action, "needs_seo_enrichment")
         with self.assertRaises(InputValidationError):
             score_unreleased(self.candidate(release_status="released"))
 

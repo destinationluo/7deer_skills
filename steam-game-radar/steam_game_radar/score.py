@@ -286,9 +286,17 @@ def score_unreleased(candidate: AnalyzedCandidate) -> ScoredCandidate:
     proximity = _release_day_distance(candidate.record)
     if proximity is not None and proximity >= 0:
         raw_scores["release_proximity"] = _release_proximity(proximity)
+    elif _metric_is_unavailable(candidate.record, "release_date", {"tba"}):
+        raw_scores["release_proximity"] = 0.0
     rank = _positive_metric(candidate.record, "coming_soon_rank")
     if rank is not None:
         raw_scores["coming_soon_visibility"] = _coming_soon_visibility(rank)
+    elif _metric_is_unavailable(
+        candidate.record,
+        "coming_soon_rank",
+        {"unranked"},
+    ):
+        raw_scores["coming_soon_visibility"] = 0.0
     return _scored_from_metrics(candidate, raw_scores, _UNRELEASED_WEIGHTS, 2, 30)
 
 
@@ -612,6 +620,20 @@ def _steam_observation(
     if observation is None or observation.source_kind not in _STEAM_SOURCE_KINDS:
         return None
     return observation
+
+
+def _metric_is_unavailable(
+    record: GameRecord,
+    name: str,
+    sentinels: Collection[str],
+) -> bool:
+    observation = record.metrics.get(name)
+    if observation is None:
+        return True
+    if observation.source_kind not in _STEAM_SOURCE_KINDS:
+        return False
+    value = observation.value
+    return isinstance(value, str) and value.strip().casefold() in sentinels
 
 
 def _rounded_score(value: object) -> float:
