@@ -1,4 +1,9 @@
-"""Pure same-source historical trend analysis for normalized game records."""
+"""Pure same-source trend analysis for Task 7-selected history snapshots.
+
+Callers must choose ``one_day_snapshot`` and ``seven_day_snapshot`` with
+``snapshot.select_comparison`` before invoking this module. Snapshot presence
+therefore means historical presence; metric source timestamps only gate deltas.
+"""
 
 from __future__ import annotations
 
@@ -55,7 +60,13 @@ def analyze_trends(
     one_day_snapshot: Mapping[str, object] | None,
     seven_day_snapshot: Mapping[str, object] | None,
 ) -> Sequence[AnalyzedCandidate]:
-    """Calculate 1d/7d deltas only for exact metric/source identities."""
+    """Calculate deltas from Task 7-selected 1d/7d history snapshots.
+
+    The two snapshots must already have been selected by
+    ``snapshot.select_comparison``. This function preserves AppID presence from
+    either supplied snapshot while requiring strict source/time integrity for
+    every calculated delta.
+    """
 
     current_records = _current_records(current)
     one_day_time, one_day = _historical_records(one_day_snapshot, "one-day")
@@ -79,14 +90,13 @@ def analyze_trends(
             "7d",
             deltas,
         )
-        seen_before = _seen_in_past_snapshot(record, one_day_time, one_day) or (
-            _seen_in_past_snapshot(record, seven_day_time, seven_day)
-        )
         candidates.append(
             AnalyzedCandidate(
                 record=record,
                 deltas=deltas,
-                newly_observed=not seen_before,
+                newly_observed=(
+                    record.appid not in one_day and record.appid not in seven_day
+                ),
                 warnings=(),
             )
         )
@@ -198,25 +208,6 @@ def _add_window_deltas(
             deltas[f"{metric_name}_{window}_percent"] = (
                 (current_value - old_value) / old_value * 100.0
             )
-
-
-def _seen_in_past_snapshot(
-    current: GameRecord,
-    snapshot_time: datetime | None,
-    historical: Mapping[int, GameRecord],
-) -> bool:
-    """Count presence only when the snapshot is provably before this record."""
-
-    if snapshot_time is None or current.appid not in historical:
-        return False
-    if not current.metrics:
-        # With no observation time there is no safe temporal reference.
-        return False
-    reference_time = max(
-        _parse_utc(observation.observed_at, "current metric observed_at")
-        for observation in current.metrics.values()
-    )
-    return snapshot_time < reference_time
 
 
 def _is_rank_metric(metric_name: str) -> bool:

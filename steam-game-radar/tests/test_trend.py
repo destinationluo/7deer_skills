@@ -153,7 +153,7 @@ class TrendTests(unittest.TestCase):
                     None,
                 )[0]
                 self.assertEqual(dict(candidate.deltas), {})
-                self.assertTrue(candidate.newly_observed)
+                self.assertFalse(candidate.newly_observed)
 
         after_envelope = self.record(
             10,
@@ -311,12 +311,43 @@ class TrendTests(unittest.TestCase):
 
         no_time_reference = self.record(41, {})
         historical_without_metrics = self.record(41, {})
-        conservative = analyze_trends(
+        present_without_time_reference = analyze_trends(
             [no_time_reference],
             self.snapshot([historical_without_metrics]),
             None,
         )[0]
-        self.assertTrue(conservative.newly_observed)
+        self.assertFalse(present_without_time_reference.newly_observed)
+
+        stale_current = self.record(
+            42,
+            {
+                "current_players": (
+                    150,
+                    "steam_current_players",
+                    "2026-08-22T12:00:00Z",
+                )
+            },
+        )
+        selected_history = self.record(
+            42,
+            {
+                "current_players": (
+                    100,
+                    "steam_current_players",
+                    "2026-08-23T12:00:00Z",
+                )
+            },
+        )
+        stale_candidate = analyze_trends(
+            [stale_current],
+            self.snapshot(
+                [selected_history],
+                observed_at="2026-08-23T12:00:00Z",
+            ),
+            None,
+        )[0]
+        self.assertEqual(dict(stale_candidate.deltas), {})
+        self.assertFalse(stale_candidate.newly_observed)
 
     def test_rank_improvement_prefers_7d_then_1d_then_provider_previous(self) -> None:
         record = self.record(
