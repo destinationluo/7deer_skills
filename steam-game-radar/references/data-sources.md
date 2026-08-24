@@ -15,9 +15,24 @@ userinfo and every explicit port, including `:443`, and has redirects disabled.
 
 The two discovery capabilities run first. Released candidates are ordered by
 most-played, then top sellers, then new releases; unreleased candidates come
-from coming soon. Dedupe preserves source ranks. Candidate caps default to 50
-released and 50 unreleased before per-AppID requests. Only base games survive
-the app-details type filter.
+from coming soon. Dedupe preserves source ranks. Only base games survive the
+app-details type filter.
+
+## Configuration bindings
+
+These defaults are bound to `references/config.example.json`; the field name
+is part of the contract, not an interchangeable label.
+
+| Config field | Semantic binding | Documented default |
+|---|---|---|
+| `released_candidate_limit` | Released candidates capped before per-AppID requests | `50` |
+| `unreleased_candidate_limit` | Unreleased candidates capped before per-AppID requests | `50` |
+| `request_timeout_seconds` | Per-attempt request timeout | `15.0 seconds` |
+| `minimum_request_interval_seconds` | Minimum interval between request starts | `1.0 seconds` |
+| `max_retries` | Retries after the first attempt | `3` |
+| `raw_max_bytes_per_provider` | Maximum response/raw bytes per provider | `5242880 bytes (5 MiB)` |
+| `stale_warning_hours` | Age strictly greater than this produces a stale warning | `36 hours` |
+| `stale_fallback_limit_hours` | Maximum inclusive official fallback age | `72 hours` |
 
 ## Transport limits
 

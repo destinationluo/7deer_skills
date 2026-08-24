@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 import re
 import sys
@@ -171,7 +172,55 @@ class SkillDocumentationTests(unittest.TestCase):
             set(ALLOWED_HOSTS),
         )
         flattened = " ".join(text.split())
-        config = RadarConfig()
+        config_path = SKILL_ROOT / "references/config.example.json"
+        config_mapping = json.loads(_read(config_path))
+        config = RadarConfig.from_mapping(config_mapping, project_root=ROOT)
+        policy_rows = {
+            field: (meaning.strip(), documented.strip())
+            for field, meaning, documented in re.findall(
+                r"(?m)^\| `([^`]+)` \| ([^|]+?) \| `([^`]+)` \|$",
+                text,
+            )
+        }
+        self.assertEqual(
+            policy_rows,
+            {
+                "released_candidate_limit": (
+                    "Released candidates capped before per-AppID requests",
+                    str(config.released_candidate_limit),
+                ),
+                "unreleased_candidate_limit": (
+                    "Unreleased candidates capped before per-AppID requests",
+                    str(config.unreleased_candidate_limit),
+                ),
+                "request_timeout_seconds": (
+                    "Per-attempt request timeout",
+                    f"{config.request_timeout_seconds} seconds",
+                ),
+                "minimum_request_interval_seconds": (
+                    "Minimum interval between request starts",
+                    f"{config.minimum_request_interval_seconds} seconds",
+                ),
+                "max_retries": (
+                    "Retries after the first attempt",
+                    str(config.max_retries),
+                ),
+                "raw_max_bytes_per_provider": (
+                    "Maximum response/raw bytes per provider",
+                    f"{config.raw_max_bytes_per_provider} bytes (5 MiB)",
+                ),
+                "stale_warning_hours": (
+                    "Age strictly greater than this produces a stale warning",
+                    f"{config.stale_warning_hours} hours",
+                ),
+                "stale_fallback_limit_hours": (
+                    "Maximum inclusive official fallback age",
+                    f"{config.stale_fallback_limit_hours} hours",
+                ),
+            },
+        )
+        for field in policy_rows:
+            self.assertEqual(config_mapping[field], getattr(config, field))
         self.assertIn("HTTPS-only", text)
         self.assertIn(
             "allows only `api.steampowered.com` and `store.steampowered.com`",
@@ -183,14 +232,6 @@ class SkillDocumentationTests(unittest.TestCase):
         )
         self.assertRegex(text.casefold(), r"(?:no authentication|no api key|\u65e0\u9700\u8ba4\u8bc1).*(?:no api key|\u65e0\u9700 api key)")
         self.assertRegex(text.casefold(), r"(?:redirects disabled|no redirects|\u7981\u7528\u91cd\u5b9a\u5411)")
-        for token in (
-            str(config.minimum_request_interval_seconds),
-            str(int(config.request_timeout_seconds)),
-            str(config.max_retries),
-            str(config.released_candidate_limit),
-            "5 MiB",
-        ):
-            self.assertIn(token, text)
         self.assertIn(
             f"`max_retries={config.max_retries}` means {config.max_retries + 1} total attempts",
             flattened,
