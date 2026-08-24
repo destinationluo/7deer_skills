@@ -1,6 +1,6 @@
 ﻿# 🛠️ 7Deer Skills — Agent Skills 开放标准技能库
 
-> 25 个可复用的 AI Agent 技能模块，基于 [Agent Skills 开放标准](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)构建。
+> 32 个可复用的 AI Agent 技能模块，基于 [Agent Skills 开放标准](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)构建。
 > 克隆到项目中，你的 AI Agent 即可自动发现并加载这些能力。
 
 这是一个开源技能库，包含了从实际项目中提炼出来的可复用代码模块和指令模板。
@@ -25,7 +25,7 @@
 🔄 **内容自动同步** — `auto-page-sync` 让你只管往仓库写 Markdown，前端页面自动生成。配合 GitHub Actions 定时拉取，Google 爬虫看到的永远是最新内容。支持日报、博客、Changelog、Landing Page 等多种页面模式，一套机制复用所有项目。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
-[![Skills](https://img.shields.io/badge/skills-26-blue.svg)](#-完整技能清单)
+[![Skills](https://img.shields.io/badge/skills-32-blue.svg)](#-完整技能清单)
 [![Agent Skills Standard](https://img.shields.io/badge/standard-Agent_Skills-8A2BE2.svg)](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)
 [![Contributions Welcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](./CONTRIBUTING.md)
 
@@ -118,6 +118,15 @@ cp -r 7deer_skills/google-trends-to-pages .agent/skills/
 | 9 | **data-scraper-intent** | 数据提取 & 搜索意图分析（爬虫 + LLM） | SEO/数据采集 |
 | 10 | **youtube-intel** | YouTube 内容情报与竞品监测（Discovery + Monitoring） | 选题策划/竞品分析 |
 | 11 | **youtube-transcribe** | YouTube 视频转录（yt-dlp + whisper） | 视频内容提取 |
+
+### 游戏 & 数据情报
+| # | 技能名称 | 描述 | 适用场景 |
+|---|---------|------|---------|
+| 12 | **steam-game-radar** | Steam 官方趋势扫描 + 本地 SteamDB 榜单导入，分开评估已发布/未发布游戏 | Steam 选品与 SEO 机会 |
+| 13 | **html5-game-radar** | HTML5 浏览器可玩游戏发现，不与 Steam 候选集或评分混合 | Web 游戏机会发现 |
+| 14 | **itchio-new-game-hunt** | itch.io 新游戏挖掘与趋势追踪 | 独立游戏选品 |
+| 15 | **youtube-game-scout** | YouTube 游戏趋势扫描与候选挖掘 | 游戏内容情报 |
+| 16 | **x-demand-radar** | X/Twitter 需求信号与热点扫描 | 需求与趋势情报 |
 
 ### 外链建设
 | # | 技能名称 | 描述 | 适用场景 |
@@ -395,7 +404,7 @@ OPENAI_API_KEY=your_openai_api_key_here
 
 ## 📊 技能统计
 
-- **总技能数**: 25 个
+- **总技能数**: 32 个
 - **P0 核心技能**: 3 个
 - **代码行数**: 15,000+ 行
 - **文档页数**: 70+ 页
@@ -418,6 +427,10 @@ OPENAI_API_KEY=your_openai_api_key_here
 ---
 
 ## 📝 更新日志
+
+### 2026-08-24
+- 🎮 添加 **steam-game-radar**（Steam 官方趋势、本地 SteamDB 导入、SEO 评分与定时路由）
+- 📊 技能总数 → 32
 
 
 ### 2026-04-12
@@ -492,4 +505,3 @@ MIT License - 开源分享，欢迎使用和贡献。详见 [LICENSE](./LICENSE)
 ---
 
 **⭐ 如果这个技能库对你有帮助，请给个 Star！**
-

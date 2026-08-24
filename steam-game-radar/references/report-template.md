@@ -39,3 +39,49 @@ The paired files are `{run_id}.{phase}.json` and `{run_id}.{phase}.md`.
 Timestamped pairs are immutable. `latest.json` and `latest.md` advance only for
 a newer run timestamp or for a final phase replacing the same run's
 preliminary phase.
+
+## Canonical top-level fields
+
+The JSON object contains exactly these fields:
+
+- `report_schema_version`
+- `run_id`
+- `phase`
+- `mode`
+- `generated_at`
+- `data_status`
+- `released`
+- `unreleased`
+- `newly_observed`
+- `warnings`
+- `rejected_rows`
+
+`phase` is `preliminary` or `final`; `mode` is `official_scan`,
+`official_plus_manual`, or `manual_baseline`; `data_status` is `fresh`,
+`stale`, or `manual_only`. `newly_observed` is a sorted unique AppID array.
+Run warnings use `code`, `message`, and optional `appid`. Rejected rows use
+`row_number`, `code`, `message`, and optional `appid`.
+
+## Canonical candidate fields
+
+Every object in `released` or `unreleased` contains exactly:
+
+- `appid`
+- `name`
+- `release_status`
+- `store_url`
+- `observed_metrics`
+- `deltas`
+- `metric_scores`
+- `steam_heat_score`
+- `seo_opportunity_score`
+- `final_score`
+- `action`
+- `confidence`
+- `warnings`
+- `evidence`
+- `recommended_content_types`
+
+Each `observed_metrics` value contains `value`, `source_id`, `source_kind`, and
+`observed_at`. Evidence entries contain `source` and `url`. Candidate warnings
+use the run-warning shape. Nullable scores remain JSON `null`; Markdown does not re-sort candidates or recompute scores from the canonical JSON.
