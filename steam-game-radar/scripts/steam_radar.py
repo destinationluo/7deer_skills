@@ -7,6 +7,7 @@ import argparse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import secrets
@@ -47,7 +48,13 @@ from steam_game_radar.report import (
     persist_report as default_persist_report,
 )
 from steam_game_radar.run_lock import RunLock
-from steam_game_radar.schemas import GameRecord, RejectedRow, WarningRecord
+from steam_game_radar.schemas import (
+    GameRecord,
+    MAX_JSON_SAFE_INTEGER,
+    MIN_JSON_SAFE_INTEGER,
+    RejectedRow,
+    WarningRecord,
+)
 from steam_game_radar.score import (
     ScoredCandidate,
     apply_final_score as default_apply_final_score,
@@ -111,6 +118,12 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _write_manifest_stdout(line: str) -> None:
+    written = sys.stdout.write(line)
+    if written != len(line):
+        raise OSError("stdout accepted only part of the run manifest")
+
+
 @dataclass(frozen=True)
 class Services:
     """Injected runtime boundaries for deterministic, offline orchestration tests."""
@@ -148,6 +161,7 @@ class Services:
     apply_final_score: Callable[..., ScoredCandidate] = default_apply_final_score
     build_report: Callable[..., dict[str, object]] = default_build_report
     persist_report: Callable[..., tuple[Path, Path]] = default_persist_report
+    emit_manifest: Callable[[str], None] = _write_manifest_stdout
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -419,7 +433,13 @@ def run_enrich(args: argparse.Namespace, services: Services) -> int:
             warnings=metadata["warnings"],
             rejected_rows=metadata["rejected_rows"],
         )
-        services.persist_report(config, report, lock)
+        report_paths = services.persist_report(config, report, lock)
+        _emit_run_manifest(
+            services,
+            report,
+            report_paths,
+            enrichment_candidate_appids=(),
+        )
     return 0
 
 
@@ -601,7 +621,16 @@ def _persist_preliminary(
         warnings=warnings,
         rejected_rows=rejected_rows,
     )
-    services.persist_report(config, report, lock)
+    report_paths = services.persist_report(config, report, lock)
+    _emit_run_manifest(
+        services,
+        report,
+        report_paths,
+        enrichment_candidate_appids=_enrichment_candidate_appids(
+            released + unreleased,
+            config.enrichment_top_n,
+        ),
+    )
 
 
 def _analyze(
@@ -659,6 +688,93 @@ def _candidate_pools(
         )[:limit]
     )
     return released, unreleased
+
+
+def _enrichment_candidate_appids(
+    candidates: Sequence[ScoredCandidate],
+    limit: int,
+) -> tuple[int, ...]:
+    eligible = (
+        candidate
+        for candidate in candidates
+        if candidate.steam_heat_score is not None
+        and candidate.action == "needs_seo_enrichment"
+    )
+    return tuple(
+        candidate.record.appid
+        for candidate in sorted(eligible, key=candidate_sort_key)[:limit]
+    )
+
+
+def _emit_run_manifest(
+    services: Services,
+    report: Mapping[str, object],
+    report_paths: tuple[Path, Path],
+    *,
+    enrichment_candidate_appids: Sequence[int],
+) -> None:
+    json_path, markdown_path = report_paths
+    manifest = {
+        "schema_version": 1,
+        "run_id": report["run_id"],
+        "phase": report["phase"],
+        "report_json": str(Path(json_path).resolve()),
+        "report_markdown": str(Path(markdown_path).resolve()),
+        "warnings": report["warnings"],
+        "enrichment_candidate_appids": list(enrichment_candidate_appids),
+    }
+    services.emit_manifest(_serialize_manifest(manifest))
+
+
+def _serialize_manifest(value: object) -> str:
+    _validate_manifest_json(value, active=set())
+    serialized = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    serialized.encode("utf-8", errors="strict")
+    return serialized + "\n"
+
+
+def _validate_manifest_json(value: object, *, active: set[int]) -> None:
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, str):
+        value.encode("utf-8", errors="strict")
+        return
+    if isinstance(value, int):
+        if value < MIN_JSON_SAFE_INTEGER or value > MAX_JSON_SAFE_INTEGER:
+            raise ValueError("manifest integer is outside the JSON-safe range")
+        return
+    if isinstance(value, list):
+        identity = id(value)
+        if identity in active:
+            raise ValueError("manifest must not contain cycles")
+        active.add(identity)
+        try:
+            for item in value:
+                _validate_manifest_json(item, active=active)
+        finally:
+            active.remove(identity)
+        return
+    if isinstance(value, dict):
+        identity = id(value)
+        if identity in active:
+            raise ValueError("manifest must not contain cycles")
+        active.add(identity)
+        try:
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError("manifest keys must be strings")
+                key.encode("utf-8", errors="strict")
+                _validate_manifest_json(item, active=active)
+        finally:
+            active.remove(identity)
+        return
+    raise ValueError("manifest must contain only JSON-native values")
 
 
 def _snapshot_for_run(

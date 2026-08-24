@@ -45,17 +45,17 @@ SAFE_TEMP_DIR = str(Path(tempfile.gettempdir()).resolve())
 
 
 class CliTests(unittest.TestCase):
-    def write_config(self, root: Path) -> Path:
+    def write_config(self, root: Path, **overrides: object) -> Path:
         path = root / "radar.json"
+        values: dict[str, object] = {
+            "data_dir": "state/steam-radar",
+            "report_dir": "output/steam-radar",
+            "max_retries": 0,
+            "minimum_request_interval_seconds": 0.01,
+        }
+        values.update(overrides)
         path.write_text(
-            json.dumps(
-                {
-                    "data_dir": "state/steam-radar",
-                    "report_dir": "output/steam-radar",
-                    "max_retries": 0,
-                    "minimum_request_interval_seconds": 0.01,
-                }
-            ),
+            json.dumps(values),
             encoding="utf-8",
         )
         return path
@@ -79,6 +79,7 @@ class CliTests(unittest.TestCase):
             "pid_alive": lambda _pid: False,
             "project_root": lambda: root,
             "client_factory": lambda _config: object(),
+            "emit_manifest": lambda _line: None,
         }
         if collection is not None:
             overrides["collect_official"] = (
@@ -206,6 +207,14 @@ class CliTests(unittest.TestCase):
             )
         )
 
+    def parse_manifest_line(self, line: str) -> dict[str, object]:
+        self.assertTrue(line.endswith("\n"))
+        self.assertEqual(line.count("\n"), 1)
+        line.encode("utf-8", errors="strict")
+        value = json.loads(line)
+        self.assertIsInstance(value, dict)
+        return value
+
     def test_build_parser_parses_scan_exactly(self) -> None:
         parsed = cli.build_parser().parse_args(["scan", "--config", "cfg.json"])
         self.assertEqual(vars(parsed), {"command": "scan", "config": Path("cfg.json")})
@@ -280,9 +289,28 @@ class CliTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stderr, "")
+            manifest = self.parse_manifest_line(completed.stdout)
+            self.assertEqual(
+                (manifest["schema_version"], manifest["phase"]),
+                (1, "preliminary"),
+            )
             report = self.latest(root)
             self.assertEqual(report["mode"], "manual_baseline")
             self.assertTrue((root / "state" / "steam-radar" / "raw").is_dir())
+
+            help_result = subprocess.run(
+                [sys.executable, str(SCRIPT_PATH), "--help"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            self.assertEqual(help_result.returncode, 0)
+            self.assertEqual(help_result.stderr, "")
+            self.assertIn("usage:", help_result.stdout)
+            self.assertNotIn('"schema_version":1', help_result.stdout)
 
     def test_run_lock_is_released_in_finally(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
@@ -306,17 +334,28 @@ class CliTests(unittest.TestCase):
             root = Path(directory)
             self.write_config(root)
             events: list[str] = []
+            emitted: list[str] = []
+            persisted_paths: list[tuple[Path, Path]] = []
             base = self.services(root, collection=self.collection())
+
+            def persist_with_spy(
+                config: RadarConfig,
+                report: dict[str, object],
+                lock: object,
+            ) -> tuple[Path, Path]:
+                events.append("persist")
+                paths = cli.default_persist_report(config, report, lock)
+                persisted_paths.append(paths)
+                return paths
+
             services = replace(
                 base,
                 build_report=lambda **kwargs: (
                     events.append("build"),
                     cli.default_build_report(**kwargs),
                 )[1],
-                persist_report=lambda config, report, lock: (
-                    events.append("persist"),
-                    cli.default_persist_report(config, report, lock),
-                )[1],
+                persist_report=persist_with_spy,
+                emit_manifest=emitted.append,
             )
             args = cli.build_parser().parse_args(["scan", "--config", "radar.json"])
             self.assertEqual(cli.run_scan(args, services), 0)
@@ -324,6 +363,22 @@ class CliTests(unittest.TestCase):
             self.assertEqual((report["mode"], report["data_status"]), ("official_scan", "fresh"))
             self.assertEqual(report["newly_observed"], [10])
             self.assertEqual(events, ["build", "persist"])
+            self.assertEqual(len(emitted), 1)
+            manifest = self.parse_manifest_line(emitted[0])
+            self.assertEqual(
+                manifest,
+                {
+                    "schema_version": 1,
+                    "run_id": RUN_A,
+                    "phase": "preliminary",
+                    "report_json": str(persisted_paths[0][0].resolve()),
+                    "report_markdown": str(persisted_paths[0][1].resolve()),
+                    "warnings": [],
+                    "enrichment_candidate_appids": [],
+                },
+            )
+            self.assertTrue(persisted_paths[0][0].exists())
+            self.assertTrue(persisted_paths[0][1].exists())
             self.assertTrue(
                 (root / "state" / "steam-radar" / "snapshots" / f"{RUN_A}.json").exists()
             )
@@ -360,12 +415,115 @@ class CliTests(unittest.TestCase):
                 self.services(root),
                 collect_official=duplicate_collect,
                 persist_raw=duplicate_raw,
+                emit_manifest=lambda _line: duplicate_events.append("emit"),
             )
             with self.assertRaises(PersistenceError):
                 cli.run_scan(args, duplicate_services)
             self.assertEqual(duplicate_events, [])
             self.assertEqual(snapshot_path.read_bytes(), original_snapshot)
             self.assertEqual(raw_path.read_bytes(), original_raw)
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            self.write_config(
+                root,
+                preliminary_top_n=10,
+                enrichment_top_n=2,
+            )
+            stamp = NOW.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            def released_candidate(
+                appid: int,
+                players: int,
+                current_rank: int,
+                previous_rank: int,
+            ) -> GameRecord:
+                return GameRecord(
+                    schema_version=1,
+                    appid=appid,
+                    name=f"Released {appid}",
+                    release_status="released",
+                    store_url=f"https://store.steampowered.com/app/{appid}/",
+                    metrics={
+                        "current_players": MetricObservation(
+                            players,
+                            "steam_current_players",
+                            "steam_official",
+                            stamp,
+                        ),
+                        "most_played_rank": MetricObservation(
+                            current_rank,
+                            "steam_most_played_rank",
+                            "steam_official",
+                            stamp,
+                        ),
+                        "previous_rank": MetricObservation(
+                            previous_rank,
+                            "steam_previous_rank",
+                            "steam_official",
+                            stamp,
+                        ),
+                    },
+                    source_extra={"app_type": "game"},
+                )
+
+            def unreleased_candidate(
+                appid: int,
+                wishlist_gain: int,
+            ) -> GameRecord:
+                return GameRecord(
+                    schema_version=1,
+                    appid=appid,
+                    name=f"Unreleased {appid}",
+                    release_status="unreleased",
+                    store_url=f"https://store.steampowered.com/app/{appid}/",
+                    metrics={
+                        "wishlist_gain_7d": MetricObservation(
+                            wishlist_gain,
+                            "steam_wishlist_gain",
+                            "steam_official",
+                            stamp,
+                        ),
+                        "release_date": MetricObservation(
+                            "2026-08-30",
+                            "steam_appdetails",
+                            "steam_official",
+                            stamp,
+                        ),
+                    },
+                    source_extra={"app_type": "game"},
+                )
+
+            mixed = CollectionResult(
+                released=(
+                    released_candidate(101, 100_000, 1, 51),
+                    released_candidate(102, 1_000, 10, 15),
+                ),
+                unreleased=(
+                    unreleased_candidate(201, 20_000),
+                    unreleased_candidate(202, 1_000),
+                ),
+                capabilities=self.collection().capabilities,
+                warnings=(),
+                raw={"most_played": {"response": {"ok": True}}},
+            )
+            mixed_output: list[str] = []
+            args = cli.build_parser().parse_args(
+                ["scan", "--config", "radar.json"]
+            )
+            services = replace(
+                self.services(root, collection=mixed),
+                emit_manifest=mixed_output.append,
+            )
+            self.assertEqual(cli.run_scan(args, services), 0)
+            manifest = self.parse_manifest_line(mixed_output[0])
+            self.assertEqual(
+                manifest["enrichment_candidate_appids"],
+                [101, 201],
+            )
+            report = self.latest(root)
+            self.assertEqual(len(report["released"]), 2)
+            self.assertEqual(len(report["unreleased"]), 2)
 
     def test_scan_provider_failure_uses_fresh_official_fallback(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
@@ -638,15 +796,18 @@ class CliTests(unittest.TestCase):
                 self.write_config(root)
                 if age is not None:
                     self.persist_official_history(root, age)
+                emitted: list[str] = []
                 services = replace(
                     self.services(root),
                     collect_official=lambda *_args: (_ for _ in ()).throw(
                         ProviderUnavailableError("offline")
                     ),
+                    emit_manifest=emitted.append,
                 )
                 args = cli.build_parser().parse_args(["scan", "--config", "radar.json"])
                 with self.assertRaises(ProviderUnavailableError):
                     cli.run_scan(args, services)
+                self.assertEqual(emitted, [])
 
         complete = self.collection()
         capability_variants = (
@@ -727,7 +888,12 @@ class CliTests(unittest.TestCase):
                     "steamdb.csv",
                 ]
             )
-            self.assertEqual(cli.run_import(args, self.services(root)), 0)
+            emitted: list[str] = []
+            services = replace(
+                self.services(root),
+                emit_manifest=emitted.append,
+            )
+            self.assertEqual(cli.run_import(args, services), 0)
             report = self.latest(root)
             self.assertEqual((report["mode"], report["data_status"]), ("manual_baseline", "manual_only"))
             self.assertEqual(len(report["rejected_rows"]), 1)
@@ -754,6 +920,26 @@ class CliTests(unittest.TestCase):
             raw = json.loads(raw_path.read_text(encoding="utf-8"))
             self.assertEqual(raw["view"], "wishlist_activity")
             self.assertEqual(len(raw["rows"]), 2)
+            self.assertEqual(len(emitted), 1)
+            manifest = self.parse_manifest_line(emitted[0])
+            self.assertEqual(manifest["schema_version"], 1)
+            self.assertEqual(manifest["run_id"], RUN_A)
+            self.assertEqual(manifest["phase"], "preliminary")
+            self.assertEqual(manifest["warnings"], report["warnings"])
+            self.assertEqual(manifest["enrichment_candidate_appids"], [20])
+            self.assertEqual(
+                manifest["report_json"],
+                str(
+                    (
+                        root
+                        / "output"
+                        / "steam-radar"
+                        / f"{RUN_A}.preliminary.json"
+                    ).resolve()
+                ),
+            )
+            self.assertTrue(Path(manifest["report_json"]).exists())
+            self.assertTrue(Path(manifest["report_markdown"]).exists())
             original_raw = raw_path.read_bytes()
             original_snapshot = snapshot_path.read_bytes()
             self.write_manual_csv(root, partial=True).write_text(
@@ -777,6 +963,7 @@ class CliTests(unittest.TestCase):
                 base,
                 import_steamdb=duplicate_import,
                 persist_raw=duplicate_raw,
+                emit_manifest=lambda _line: duplicate_events.append("emit"),
             )
             with self.assertRaises(PersistenceError):
                 cli.run_import(args, duplicate_services)
@@ -861,8 +1048,44 @@ class CliTests(unittest.TestCase):
                     good.name,
                 ]
             )
-            self.assertEqual(cli.run_enrich(enrich_args, services), 0)
-            self.assertEqual(self.latest(root)["phase"], "final")
+            final_output: list[str] = []
+            enrich_services = replace(
+                services,
+                emit_manifest=final_output.append,
+            )
+            self.assertEqual(cli.run_enrich(enrich_args, enrich_services), 0)
+            final_report = self.latest(root)
+            self.assertEqual(final_report["phase"], "final")
+            self.assertEqual(len(final_output), 1)
+            manifest = self.parse_manifest_line(final_output[0])
+            self.assertEqual(
+                manifest,
+                {
+                    "schema_version": 1,
+                    "run_id": RUN_A,
+                    "phase": "final",
+                    "report_json": str(
+                        (
+                            root
+                            / "output"
+                            / "steam-radar"
+                            / f"{RUN_A}.final.json"
+                        ).resolve()
+                    ),
+                    "report_markdown": str(
+                        (
+                            root
+                            / "output"
+                            / "steam-radar"
+                            / f"{RUN_A}.final.md"
+                        ).resolve()
+                    ),
+                    "warnings": final_report["warnings"],
+                    "enrichment_candidate_appids": [],
+                },
+            )
+            self.assertTrue(Path(manifest["report_json"]).exists())
+            self.assertTrue(Path(manifest["report_markdown"]).exists())
             mismatch = cli.build_parser().parse_args(
                 [
                     "enrich",
@@ -875,7 +1098,8 @@ class CliTests(unittest.TestCase):
                 ]
             )
             with self.assertRaises(InputValidationError):
-                cli.run_enrich(mismatch, services)
+                cli.run_enrich(mismatch, enrich_services)
+            self.assertEqual(len(final_output), 1)
 
     def test_main_maps_domain_errors_to_codes_two_through_six(self) -> None:
         cases = (
@@ -904,6 +1128,40 @@ class CliTests(unittest.TestCase):
             self.assertIn("Traceback", stderr.getvalue())
             self.assertIn("RuntimeError: unexpected sentinel", stderr.getvalue())
             self.assertIsNone(original.__cause__)
+
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            self.write_config(root)
+            self.write_manual_csv(root)
+            services = replace(
+                self.services(root),
+                emit_manifest=lambda _line: (_ for _ in ()).throw(
+                    RuntimeError("stdout unavailable")
+                ),
+            )
+            with mock.patch.object(
+                cli,
+                "Services",
+                return_value=services,
+            ), mock.patch(
+                "sys.stderr",
+                new_callable=io.StringIO,
+            ) as stderr:
+                self.assertEqual(
+                    cli.main(
+                        [
+                            "import-steamdb",
+                            "--config",
+                            "radar.json",
+                            "--view",
+                            "wishlist_activity",
+                            "--input",
+                            "steamdb.csv",
+                        ]
+                    ),
+                    1,
+                )
+                self.assertIn("RuntimeError: stdout unavailable", stderr.getvalue())
 
     def test_delayed_older_enrichment_writes_final_without_replacing_latest(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
