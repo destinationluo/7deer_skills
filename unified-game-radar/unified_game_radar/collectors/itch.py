@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 import re
+import unicodedata
 from urllib.parse import urlsplit
 
 from ..errors import InputValidationError
@@ -66,6 +67,20 @@ _ORIGINALITY = frozenset(
 _COUNTRY = re.compile(r"[A-Z]{2}\Z", flags=re.ASCII)
 _LOCALE = re.compile(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*\Z")
 _UTC_SECONDS = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+_EVIDENCE_PATHS = {
+    "newest": "/games/newest",
+    "popular": "/games/top-sellers",
+}
+_EVIDENCE_HOSTS = ("itch.io", "www.itch.io")
+_EVIDENCE_QUERIES = ("", "?format=html5")
+_EVIDENCE_URLS = {
+    surface: frozenset(
+        f"https://{host}{path}{query}"
+        for host in _EVIDENCE_HOSTS
+        for query in _EVIDENCE_QUERIES
+    )
+    for surface, path in _EVIDENCE_PATHS.items()
+}
 
 
 def _invalid(message: str) -> InputValidationError:
@@ -184,6 +199,8 @@ def _utc_seconds(value: object, name: str) -> datetime:
 
 def _itch_url(value: object, name: str) -> tuple[str, str]:
     parsed = _text(value, name, 8192)
+    if any(unicodedata.category(character) in {"Cc", "Cf"} for character in parsed):
+        raise _invalid(f"{name} must not contain control or format characters")
     try:
         split = urlsplit(parsed)
         hostname = split.hostname
@@ -229,8 +246,12 @@ def _game_url(value: object) -> tuple[str, str]:
     return parsed, platform_id
 
 
-def _evidence_url(value: object) -> str:
+def _evidence_url(value: object, surface: str) -> str:
     parsed, _ = _itch_url(value, "evidence_url")
+    if parsed not in _EVIDENCE_URLS[surface]:
+        raise _invalid(
+            "evidence_url must be an exact public itch listing URL for its surface"
+        )
     return parsed
 
 
@@ -306,7 +327,11 @@ class ItchBrowserRow:
         if self.observed_at.microsecond:
             raise _invalid("observed_at must use second precision")
         object.__setattr__(self, "observed_at", self.observed_at.astimezone(timezone.utc))
-        object.__setattr__(self, "evidence_url", _evidence_url(self.evidence_url))
+        object.__setattr__(
+            self,
+            "evidence_url",
+            _evidence_url(self.evidence_url, self.surface),
+        )
 
 
 @dataclass(frozen=True)
@@ -332,16 +357,8 @@ class ItchBrowserEnvelope:
             raise _invalid("geo must be a two-letter uppercase country code")
         if not isinstance(self.locale, str) or _LOCALE.fullmatch(self.locale) is None:
             raise _invalid("locale is invalid")
-        object.__setattr__(
-            self,
-            "metric_definition_version",
-            _integer(
-                self.metric_definition_version,
-                "metric_definition_version",
-                minimum=1,
-                maximum=1_000_000,
-            ),
-        )
+        if self.metric_definition_version != 1 or type(self.metric_definition_version) is not int:
+            raise _invalid("metric_definition_version must be 1")
         if not isinstance(self.observed_at, datetime):
             raise _invalid("observed_at must be a UTC datetime")
         if self.observed_at.tzinfo is None or self.observed_at.utcoffset() != timezone.utc.utcoffset(self.observed_at):

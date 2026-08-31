@@ -32,7 +32,15 @@ enabled:
 1. `newest`: the newest browser-playable games listing.
 2. `popular`: the public popular/top browser-playable listing.
 
-For each surface, start at its canonical `https://itch.io/...` listing URL.
+For each surface, use its exact public listing path: `/games/newest` for
+`newest` and `/games/top-sellers` for `popular`, on either `itch.io` or
+`www.itch.io`. The only permitted query is the exact browser-playable filter
+`?format=html5`; an empty query is also accepted for pages where the visible
+listing is already browser-playable. Fragments, trailing slashes, other query
+parameters, and creator subdomains are not valid listing evidence. The row's
+`evidence_url` must match its declared surface.
+
+Start at that canonical `https://itch.io/...` listing URL.
 Collect in visible order, stop after 100 unique game cards, five page/scroll
 advances, or the first advance that yields no new game cards. The combined
 envelope may contain at most 200 rows. Do not use signed-in recommendations or
@@ -123,7 +131,9 @@ Every item in `rows` has exactly these thirteen keys:
 Titles and developer names are limited to 256 characters; genre is nullable
 and limited to 128 characters. Rank is a strict integer from 1 through 200.
 Booleans must be JSON booleans, not `0`/`1`. URLs must use HTTPS, contain no
-credentials or custom port, and belong to `itch.io` or an `itch.io` subdomain.
+control or Unicode format characters, credentials, or custom port, and belong
+to `itch.io` or an `itch.io` subdomain. In version 1,
+`metric_definition_version` is exactly `1`.
 
 The same game may appear once on each surface. An identical repeated row on the
 same surface and timestamp is idempotently collapsed. A changed repeated row

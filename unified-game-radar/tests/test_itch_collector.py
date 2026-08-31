@@ -130,6 +130,7 @@ class ItchEnvelopeContractTests(unittest.TestCase):
             valid_envelope(run_id="20260831T080000Z-b1c2d3e4"),
             valid_envelope(collector="steam"),
             valid_envelope(schema_version=2),
+            valid_envelope(metric_definition_version=2),
         )
         for payload in cases:
             with self.subTest(payload=payload):
@@ -211,6 +212,72 @@ class ItchRowValidationTests(unittest.TestCase):
                 with self.assertRaises(InputValidationError):
                     parse_itch_envelope(
                         valid_envelope([valid_row(game_url=game_url, evidence_url=evidence_url)]),
+                        radar_run(),
+                    )
+
+    def test_rejects_control_and_format_characters_in_urls_before_parsing(self) -> None:
+        invalid_urls = (
+            "https://tiny-studio.itch.io/signal\ngarden",
+            "https://tiny-studio.itch.io/signal\tgarden",
+            "https://tiny-studio.itch.io/signal\u200bgarden",
+            "https://tiny-studio.itch.io/signal\u2066garden",
+        )
+        for value in invalid_urls:
+            with self.subTest(game_url=repr(value)):
+                with self.assertRaises(InputValidationError):
+                    parse_itch_envelope(
+                        valid_envelope([valid_row(game_url=value)]),
+                        radar_run(),
+                    )
+
+        invalid_evidence_urls = (
+            "https://itch.io/games/new\nest",
+            "https://itch.io/games/newest?format=html5\t",
+            "https://itch.io/games/\u200bnewest",
+            "https://itch.io/games/\u2066newest",
+        )
+        for value in invalid_evidence_urls:
+            with self.subTest(evidence_url=repr(value)):
+                with self.assertRaises(InputValidationError):
+                    parse_itch_envelope(
+                        valid_envelope([valid_row(evidence_url=value)]),
+                        radar_run(),
+                    )
+
+    def test_evidence_url_is_an_exact_public_listing_for_its_surface(self) -> None:
+        accepted = (
+            ("newest", "https://itch.io/games/newest"),
+            ("newest", "https://itch.io/games/newest?format=html5"),
+            ("newest", "https://www.itch.io/games/newest?format=html5"),
+            ("popular", "https://itch.io/games/top-sellers"),
+            ("popular", "https://itch.io/games/top-sellers?format=html5"),
+        )
+        for surface, evidence_url in accepted:
+            with self.subTest(surface=surface, evidence_url=evidence_url):
+                parse_itch_envelope(
+                    valid_envelope(
+                        [valid_row(surface=surface, evidence_url=evidence_url)]
+                    ),
+                    radar_run(),
+                )
+
+        rejected = (
+            ("newest", "https://itch.io/games/top-sellers"),
+            ("popular", "https://itch.io/games/newest"),
+            ("newest", "https://creator.itch.io/games/newest"),
+            ("newest", "https://itch.io/games/newest/"),
+            ("popular", "https://itch.io/games/popular"),
+            ("newest", "https://itch.io/games/newest?format=html5&sort=date"),
+            ("newest", "https://itch.io/games/newest?format=download"),
+            ("newest", "https://itch.io/games/newest#featured"),
+        )
+        for surface, evidence_url in rejected:
+            with self.subTest(surface=surface, evidence_url=evidence_url):
+                with self.assertRaises(InputValidationError):
+                    parse_itch_envelope(
+                        valid_envelope(
+                            [valid_row(surface=surface, evidence_url=evidence_url)]
+                        ),
                         radar_run(),
                     )
 
