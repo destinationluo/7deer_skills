@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -204,6 +205,32 @@ class RobloxEnvelopeContractTests(unittest.TestCase):
             with self.subTest(payload=type(payload).__name__):
                 with self.assertRaises(InputValidationError):
                     parse_roblox_envelope(payload, radar_run())
+
+    def test_maps_oversized_raw_json_numbers_to_input_validation_error(self) -> None:
+        raw = json.dumps(valid_envelope())
+        oversized = "9" * 5000
+        replacements = (
+            ('"universe_id": 1234567890', f'"universe_id": {oversized}'),
+            ('"place_id": 9876543210', f'"place_id": {oversized}'),
+            (
+                '"concurrent_players": 1250',
+                f'"concurrent_players": {oversized}',
+            ),
+        )
+        for old, new in replacements:
+            oversized_raw = raw.replace(old, new, 1)
+            self.assertNotEqual(raw, oversized_raw)
+            self.assertLess(len(oversized_raw.encode("utf-8")), MAX_ENVELOPE_BYTES)
+            for payload in (oversized_raw, oversized_raw.encode("utf-8")):
+                with self.subTest(field=old, payload=type(payload).__name__):
+                    with patch(
+                        "unified_game_radar.collectors.roblox.json.loads",
+                        side_effect=ValueError(
+                            "Exceeds the limit for integer string conversion"
+                        ),
+                    ):
+                        with self.assertRaises(InputValidationError):
+                            parse_roblox_envelope(payload, radar_run())
 
 
 class RobloxRowValidationTests(unittest.TestCase):

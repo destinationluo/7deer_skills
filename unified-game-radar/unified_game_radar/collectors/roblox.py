@@ -125,7 +125,7 @@ def _materialize_payload(value: object) -> Mapping[str, object]:
         )
     try:
         parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_json_object)
-    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+    except (UnicodeError, ValueError, RecursionError) as error:
         raise _invalid("Roblox envelope must be valid UTF-8 JSON") from error
     if not isinstance(parsed, Mapping):
         raise _invalid("Roblox envelope must contain a JSON object")
