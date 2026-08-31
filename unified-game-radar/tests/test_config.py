@@ -215,6 +215,32 @@ class RadarConfigTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             RadarConfig.from_mapping({"max_retries": True})
 
+    def test_numeric_limits_wrap_extreme_integer_conversion_errors(self) -> None:
+        huge_integer = 10**400
+        for field in (
+            "heat_floor",
+            "request_timeout_seconds",
+            "minimum_request_interval_seconds",
+        ):
+            with self.subTest(
+                field=field
+            ), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.json"
+                path.write_text(json.dumps({field: huge_integer}), encoding="utf-8")
+                with self.assertRaises(ConfigurationError):
+                    RadarConfig.from_file(path)
+
+    def test_heat_floor_is_a_percentage(self) -> None:
+        self.assertEqual(
+            RadarConfig.from_mapping({"heat_floor": 100}).heat_floor,
+            100,
+        )
+        for value in (100.1, 10**400):
+            with self.subTest(value_type=type(value)), self.assertRaises(
+                ConfigurationError
+            ):
+                RadarConfig.from_mapping({"heat_floor": value})
+
     def test_collection_and_daily_publication_settings_are_validated(self) -> None:
         self.assertEqual(
             RadarConfig.from_mapping(
@@ -244,6 +270,41 @@ class RadarConfigTests(unittest.TestCase):
                 ConfigurationError
             ):
                 IdentityAlias(1, source, target)
+
+    def test_identity_alias_platform_ids_use_safe_canonical_formats(self) -> None:
+        self.assertEqual(
+            IdentityAlias(1, "itch:author-game_1.2", "steam:123"),
+            IdentityAlias(1, "itch:author-game_1.2", "steam:123"),
+        )
+        valid_pairs = (
+            ("steam:1", "roblox:999999"),
+            ("roblox:7", "itch:game"),
+        )
+        for source, target in valid_pairs:
+            with self.subTest(source=source, target=target):
+                IdentityAlias(1, source, target)
+
+        invalid_keys = (
+            "steam:0",
+            "steam:-1",
+            "steam:+1",
+            "steam:01",
+            "steam:1/2",
+            "roblox:0",
+            "roblox:12.5",
+            "roblox:\uff11",
+            "itch:Game",
+            "itch:-game",
+            "itch:game-",
+            "itch:game--copy",
+            "itch:author/game",
+            "itch:bad\x00key",
+            "itch:bad\nkey",
+            f"itch:{'a' * 129}",
+        )
+        for key in invalid_keys:
+            with self.subTest(key=repr(key)), self.assertRaises(ConfigurationError):
+                IdentityAlias(1, key, "roblox:456")
 
     def test_enabled_platforms_are_exact_and_ordered(self) -> None:
         for platforms in (
@@ -284,6 +345,93 @@ class RadarConfigTests(unittest.TestCase):
                 report_dir=Path("/tmp/project/reports/unified-game-radar/steam"),
             ),
         )
+
+    def test_to_steam_config_propagates_every_custom_legacy_field(self) -> None:
+        config = RadarConfig.from_mapping(
+            {
+                "timezone": "UTC",
+                "country": "CN",
+                "locale": "zh-CN",
+                "steam_language": "schinese",
+                "steam_released_candidate_limit": 80,
+                "steam_unreleased_candidate_limit": 70,
+                "collection_hours": [9, 17],
+                "daily_publish_hour": 17,
+                "enabled_platforms": ["steam"],
+                "preliminary_top_n": 30,
+                "enrichment_top_n": 15,
+                "final_top_n": 8,
+                "heat_floor": 35,
+                "fresh_hours": 8,
+                "stale_fallback_hours": 48,
+                "raw_retention_days": 21,
+                "raw_max_bytes_per_provider": 9_000_000,
+                "request_timeout_seconds": 8.5,
+                "max_retries": 4,
+                "minimum_request_interval_seconds": 1.5,
+                "data_dir": "state",
+                "report_dir": "output",
+            },
+            project_root=Path("/tmp/custom-project"),
+        )
+
+        self.assertEqual(
+            config.to_steam_config(),
+            SteamRadarConfig(
+                schema_version=1,
+                country="CN",
+                language="schinese",
+                timezone="UTC",
+                schedule="0 9,17 * * *",
+                released_candidate_limit=80,
+                unreleased_candidate_limit=70,
+                preliminary_top_n=30,
+                enrichment_top_n=15,
+                final_top_n=8,
+                request_timeout_seconds=8.5,
+                max_retries=4,
+                minimum_request_interval_seconds=1.5,
+                raw_retention_days=21,
+                raw_max_bytes_per_provider=9_000_000,
+                stale_warning_hours=8,
+                stale_fallback_limit_hours=48,
+                data_dir=Path("/tmp/custom-project/state/steam"),
+                report_dir=Path("/tmp/custom-project/output/steam"),
+            ),
+        )
+
+    def test_file_loading_rejects_duplicate_keys_at_any_depth(self) -> None:
+        duplicate_documents = (
+            '{"schema_version": 1, "schema_version": 1}',
+            (
+                '{"identity_aliases": [{"schema_version": 1, '
+                '"source": "steam:123", "target": "roblox:456", '
+                '"target": "roblox:789"}]}'
+            ),
+        )
+        for document in duplicate_documents:
+            with self.subTest(
+                document=document
+            ), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.json"
+                path.write_text(document, encoding="utf-8")
+                with self.assertRaisesRegex(
+                    ConfigurationError,
+                    "duplicate JSON key",
+                ):
+                    RadarConfig.from_file(path)
+
+    def test_file_loading_wraps_invalid_missing_and_non_object_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            invalid_path = root / "invalid.json"
+            invalid_path.write_text("[", encoding="utf-8")
+            array_path = root / "array.json"
+            array_path.write_text("[]", encoding="utf-8")
+
+            for path in (invalid_path, array_path, root / "missing.json"):
+                with self.subTest(path=path), self.assertRaises(ConfigurationError):
+                    RadarConfig.from_file(path)
 
     def test_serialized_example_is_the_complete_default_mapping(self) -> None:
         example = json.loads(

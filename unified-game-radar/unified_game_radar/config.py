@@ -19,7 +19,15 @@ if TYPE_CHECKING:
 _COUNTRY = re.compile(r"[A-Z]{2}", flags=re.ASCII)
 _LOCALE = re.compile(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*")
 _STEAM_LANGUAGE = re.compile(r"[a-z][a-z0-9_]*", flags=re.ASCII)
-_PLATFORM_KEY = re.compile(r"(?:itch|steam|roblox):\S+")
+_NUMERIC_PLATFORM_KEY = re.compile(
+    r"(?:steam|roblox):[1-9][0-9]*",
+    flags=re.ASCII,
+)
+_ITCH_IDENTIFIER = re.compile(
+    r"[a-z0-9]+(?:[-_.][a-z0-9]+)*",
+    flags=re.ASCII,
+)
+_MAX_ITCH_IDENTIFIER_LENGTH = 128
 _PLATFORM_ORDER = {"itch": 0, "steam": 1, "roblox": 2}
 
 
@@ -122,6 +130,8 @@ class RadarConfig:
         ):
             parsed = _positive_number(getattr(self, name), name)
             object.__setattr__(self, name, parsed)
+        if self.heat_floor > 100:
+            raise ConfigurationError("heat_floor must not exceed 100")
 
         collection_hours = _collection_hours(self.collection_hours)
         object.__setattr__(self, "collection_hours", collection_hours)
@@ -204,7 +214,10 @@ class RadarConfig:
         project_root: Path | None = None,
     ) -> "RadarConfig":
         try:
-            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+            raw = json.loads(
+                Path(path).read_text(encoding="utf-8"),
+                object_pairs_hook=_strict_json_object,
+            )
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise ConfigurationError(f"unable to read configuration: {path}") from error
         if not isinstance(raw, Mapping):
@@ -265,7 +278,10 @@ def _positive_integer(value: object, name: str) -> int:
 def _positive_number(value: object, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigurationError(f"{name} must be a number")
-    parsed = float(value)
+    try:
+        parsed = float(value)
+    except (OverflowError, ValueError) as error:
+        raise ConfigurationError(f"{name} must be a finite number") from error
     if not math.isfinite(parsed) or parsed <= 0:
         raise ConfigurationError(f"{name} must be positive")
     return parsed
@@ -371,11 +387,28 @@ def _identity_aliases(value: object) -> tuple[IdentityAlias, ...]:
 
 def _platform_key(value: object, name: str) -> str:
     key = _text(value, name)
-    if _PLATFORM_KEY.fullmatch(key) is None:
+    if _NUMERIC_PLATFORM_KEY.fullmatch(key) is not None:
+        return key
+    platform, separator, identifier = key.partition(":")
+    if (
+        platform != "itch"
+        or not separator
+        or len(identifier) > _MAX_ITCH_IDENTIFIER_LENGTH
+        or _ITCH_IDENTIFIER.fullmatch(identifier) is None
+    ):
         raise ConfigurationError(
             f"{name} must be an exact itch, steam, or roblox platform key"
         )
     return key
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ConfigurationError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
 
 
 def _path(value: object, name: str) -> Path:
