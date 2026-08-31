@@ -5,10 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from datetime import date as Date
 from datetime import datetime, timezone
+from decimal import Decimal
+import ipaddress
 import math
 import re
 from types import MappingProxyType
-from typing import Iterable, Mapping, Type, TypeVar
+from typing import Mapping, Type, TypeVar
 from urllib.parse import urlsplit
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -48,6 +50,11 @@ _PLATFORM_ID = re.compile(
 _SURFACE = re.compile(
     r"[a-z0-9](?:[a-z0-9]|[_-](?=[a-z0-9])){0,63}\Z"
 )
+_HOSTNAME = re.compile(
+    r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}"
+    r"[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}"
+    r"[A-Za-z0-9])?))*\Z"
+)
 _WARNING_CODE = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
 _DOMAIN = re.compile(
     r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
@@ -62,6 +69,22 @@ _UTC_TEXT = re.compile(
 
 
 T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class _ObservationIdParts:
+    raw: str
+    platform: str
+    platform_id: str
+    surface: str
+    observed_at: datetime
+
+
+@dataclass(frozen=True)
+class _PlatformKeyParts:
+    raw: str
+    platform: str
+    platform_id: str
 
 
 def _error(message: str) -> InputValidationError:
@@ -146,7 +169,7 @@ def _literal(value: object, name: str, allowed: frozenset[str]) -> str:
     return parsed
 
 
-def _compact_utc_timestamp(value: object, name: str) -> str:
+def _compact_utc_timestamp(value: object, name: str) -> datetime:
     parsed = _text(value, name, 16)
     try:
         instant = datetime.strptime(parsed, "%Y%m%dT%H%M%SZ")
@@ -154,7 +177,7 @@ def _compact_utc_timestamp(value: object, name: str) -> str:
         raise _error(f"{name} must contain a valid compact UTC timestamp") from error
     if instant.strftime("%Y%m%dT%H%M%SZ") != parsed:
         raise _error(f"{name} must contain a canonical compact UTC timestamp")
-    return parsed
+    return instant.replace(tzinfo=timezone.utc)
 
 
 def _run_id(value: object) -> str:
@@ -189,7 +212,7 @@ def _surface(value: object, name: str = "surface") -> str:
     return parsed
 
 
-def _observation_id(value: object) -> str:
+def _parse_observation_id(value: object) -> _ObservationIdParts:
     parsed = _text(value, "observation_id", 240)
     parts = parsed.split(":")
     if len(parts) != 4:
@@ -197,11 +220,13 @@ def _observation_id(value: object) -> str:
             "observation_id must be platform:platform_id:surface:timestamp"
         )
     platform, platform_id, surface, timestamp = parts
-    _platform(platform)
-    _platform_id(platform_id)
-    _surface(surface)
-    _compact_utc_timestamp(timestamp, "observation_id timestamp")
-    return parsed
+    return _ObservationIdParts(
+        raw=parsed,
+        platform=_platform(platform),
+        platform_id=_platform_id(platform_id),
+        surface=_surface(surface),
+        observed_at=_compact_utc_timestamp(timestamp, "observation_id timestamp"),
+    )
 
 
 def _uuid(value: object, name: str) -> str:
@@ -219,14 +244,16 @@ def _platform(value: object, name: str = "platform") -> str:
     return _literal(value, name, _PLATFORMS)
 
 
-def _platform_key(value: object) -> str:
+def _parse_platform_key(value: object) -> _PlatformKeyParts:
     parsed = _text(value, "platform_key", 136)
     platform, separator, platform_id = parsed.partition(":")
     if not separator or not platform_id or ":" in platform_id:
         raise _error("platform_key must contain a platform and platform ID")
-    _platform(platform)
-    _platform_id(platform_id)
-    return parsed
+    return _PlatformKeyParts(
+        raw=parsed,
+        platform=_platform(platform),
+        platform_id=_platform_id(platform_id),
+    )
 
 
 def _domain(value: object, name: str) -> str:
@@ -260,21 +287,36 @@ def _timezone_name(value: object) -> str:
     parsed = _text(value, "timezone", 128)
     try:
         ZoneInfo(parsed)
-    except ZoneInfoNotFoundError as error:
+    except (ZoneInfoNotFoundError, ValueError) as error:
         raise _error(f"unknown timezone: {parsed}") from error
     return parsed
 
 
 def _https_url(value: object, name: str) -> str:
     parsed = _text(value, name, 8192)
-    split = urlsplit(parsed)
+    try:
+        split = urlsplit(parsed)
+        hostname = split.hostname
+        port = split.port
+    except ValueError as error:
+        raise _error(f"{name} must be a valid HTTPS URL") from error
     if (
         split.scheme != "https"
         or not split.netloc
+        or hostname is None
         or split.username is not None
         or split.password is not None
     ):
         raise _error(f"{name} must be an HTTPS URL without credentials")
+    if split.netloc.endswith(":"):
+        raise _error(f"{name} must not contain an empty port")
+    if port is not None and port < 1:
+        raise _error(f"{name} must use a valid numeric port")
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        if _HOSTNAME.fullmatch(hostname) is None:
+            raise _error(f"{name} must contain a valid hostname")
     return parsed
 
 
@@ -404,11 +446,52 @@ def _date(value: object, name: str) -> Date:
 
 
 def _sequence(value: object, name: str) -> tuple[object, ...]:
-    if isinstance(value, (str, bytes, bytearray, Mapping)) or not isinstance(
-        value, Iterable
-    ):
+    if not isinstance(value, (list, tuple)):
         raise _error(f"{name} must be an array")
     return tuple(value)
+
+
+def _parsed_observation_ids(
+    value: object,
+    name: str = "observation_ids",
+) -> tuple[_ObservationIdParts, ...]:
+    parsed = tuple(_parse_observation_id(item) for item in _sequence(value, name))
+    if not parsed:
+        raise _error(f"{name} must not be empty")
+    if len({item.raw for item in parsed}) != len(parsed):
+        raise _error(f"{name} must not contain duplicates")
+    return parsed
+
+
+def _heat_reference_fields(
+    platform_key: object,
+    surface: object,
+    observation_ids: object,
+) -> tuple[str, str, tuple[str, ...]]:
+    key = _parse_platform_key(platform_key)
+    parsed_surface = _surface(surface)
+    references = _parsed_observation_ids(observation_ids)
+    for reference in references:
+        if (
+            reference.platform != key.platform
+            or reference.platform_id != key.platform_id
+        ):
+            raise _error("observation reference does not match platform_key")
+        if reference.surface != parsed_surface:
+            raise _error("observation reference does not match heat surface")
+    return key.raw, parsed_surface, tuple(item.raw for item in references)
+
+
+def _one_decimal_number(
+    value: object,
+    name: str,
+    maximum: float,
+) -> float:
+    parsed = _number(value, name, 0, maximum)
+    decimal_value = Decimal(str(parsed))
+    if decimal_value != decimal_value.quantize(Decimal("0.1")):
+        raise _error(f"{name} must have at most one decimal place")
+    return parsed
 
 
 def _text_tuple(
@@ -604,21 +687,36 @@ class PlatformObservation:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
-        object.__setattr__(self, "observation_id", _observation_id(self.observation_id))
+        observation_id = _parse_observation_id(self.observation_id)
+        object.__setattr__(self, "observation_id", observation_id.raw)
         object.__setattr__(self, "run_id", _run_id(self.run_id))
-        object.__setattr__(self, "platform", _platform(self.platform))
-        object.__setattr__(self, "platform_id", _platform_id(self.platform_id))
+        platform = _platform(self.platform)
+        platform_id = _platform_id(self.platform_id)
+        object.__setattr__(self, "platform", platform)
+        object.__setattr__(self, "platform_id", platform_id)
         object.__setattr__(self, "provider", _text(self.provider, "provider", 128))
-        object.__setattr__(self, "surface", _surface(self.surface))
+        surface = _surface(self.surface)
+        object.__setattr__(self, "surface", surface)
         object.__setattr__(self, "geo", _country(self.geo))
         object.__setattr__(self, "locale", _locale(self.locale))
         object.__setattr__(self, "query_parameters", _frozen_mapping(self.query_parameters, "query_parameters"))
         object.__setattr__(self, "metric_definition_version", _integer(self.metric_definition_version, "metric_definition_version", minimum=1))
-        object.__setattr__(self, "observed_at", _utc_datetime(self.observed_at, "observed_at"))
+        observed_at = _utc_datetime(self.observed_at, "observed_at")
+        object.__setattr__(self, "observed_at", observed_at)
         object.__setattr__(self, "release_at", _optional_utc_datetime(self.release_at, "release_at"))
         object.__setattr__(self, "source_rank", _optional_integer(self.source_rank, "source_rank", minimum=1))
         object.__setattr__(self, "raw_metrics", _frozen_mapping(self.raw_metrics, "raw_metrics"))
         object.__setattr__(self, "evidence_urls", _text_tuple(self.evidence_urls, "evidence_urls", validator=lambda item: _https_url(item, "evidence_url")))
+        if (
+            observation_id.platform != platform
+            or observation_id.platform_id != platform_id
+            or observation_id.surface != surface
+            or observation_id.observed_at != observed_at
+        ):
+            raise _error(
+                "observation_id provenance must exactly match platform, "
+                "platform_id, surface, and observed_at"
+            )
 
     def to_dict(self) -> dict[str, object]:
         return _to_dict(self)
@@ -776,8 +874,12 @@ class ExternalEvidence:
     def __post_init__(self) -> None:
         object.__setattr__(self, "source", _text(self.source, "source", 253))
         object.__setattr__(self, "url", _https_url(self.url, "url"))
-        object.__setattr__(self, "published_at", _utc_datetime(self.published_at, "published_at"))
-        object.__setattr__(self, "observed_at", _utc_datetime(self.observed_at, "observed_at"))
+        published_at = _utc_datetime(self.published_at, "published_at")
+        observed_at = _utc_datetime(self.observed_at, "observed_at")
+        if published_at > observed_at:
+            raise _error("published_at must not be later than observed_at")
+        object.__setattr__(self, "published_at", published_at)
+        object.__setattr__(self, "observed_at", observed_at)
         object.__setattr__(self, "author_relation", _literal(self.author_relation, "author_relation", _AUTHOR_RELATIONS))
         object.__setattr__(self, "engagement_count", _optional_integer(self.engagement_count, "engagement_count", minimum=0))
         object.__setattr__(self, "evidence_kind", _text(self.evidence_kind, "evidence_kind", 128))
@@ -933,9 +1035,14 @@ class PlatformHeat:
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
         object.__setattr__(self, "run_id", _run_id(self.run_id))
-        object.__setattr__(self, "platform_key", _platform_key(self.platform_key))
-        object.__setattr__(self, "surface", _surface(self.surface))
-        object.__setattr__(self, "observation_ids", _text_tuple(self.observation_ids, "observation_ids", allow_empty=False, validator=_observation_id))
+        platform_key, surface, observation_ids = _heat_reference_fields(
+            self.platform_key,
+            self.surface,
+            self.observation_ids,
+        )
+        object.__setattr__(self, "platform_key", platform_key)
+        object.__setattr__(self, "surface", surface)
+        object.__setattr__(self, "observation_ids", observation_ids)
         object.__setattr__(self, "heat", _number(self.heat, "heat", 0, 100))
 
     def to_dict(self) -> dict[str, object]:
@@ -960,9 +1067,14 @@ class NormalizedHeat:
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
         object.__setattr__(self, "run_id", _run_id(self.run_id))
-        object.__setattr__(self, "platform_key", _platform_key(self.platform_key))
-        object.__setattr__(self, "surface", _surface(self.surface))
-        object.__setattr__(self, "observation_ids", _text_tuple(self.observation_ids, "observation_ids", allow_empty=False, validator=_observation_id))
+        platform_key, surface, observation_ids = _heat_reference_fields(
+            self.platform_key,
+            self.surface,
+            self.observation_ids,
+        )
+        object.__setattr__(self, "platform_key", platform_key)
+        object.__setattr__(self, "surface", surface)
+        object.__setattr__(self, "observation_ids", observation_ids)
         object.__setattr__(self, "heat", _number(self.heat, "heat", 0, 100))
         object.__setattr__(self, "platform_score", _number(self.platform_score, "platform_score", 0, 30))
 
@@ -994,11 +1106,31 @@ class ScoredOpportunity:
         object.__setattr__(self, "run_id", _run_id(self.run_id))
         object.__setattr__(self, "opportunity_id", _uuid(self.opportunity_id, "opportunity_id"))
         object.__setattr__(self, "demand_state", _literal(self.demand_state, "demand_state", _DEMAND_STATES))
-        object.__setattr__(self, "platform_score", _number(self.platform_score, "platform_score", 0, 30))
-        object.__setattr__(self, "demand_score", _number(self.demand_score, "demand_score", 0, 30))
-        object.__setattr__(self, "external_score", _number(self.external_score, "external_score", 0, 20))
-        object.__setattr__(self, "seo_score", _number(self.seo_score, "seo_score", 0, 20))
-        object.__setattr__(self, "total_score", _number(self.total_score, "total_score", 0, 100))
+        platform_score = _one_decimal_number(
+            self.platform_score, "platform_score", 30
+        )
+        demand_score = _one_decimal_number(self.demand_score, "demand_score", 30)
+        external_score = _one_decimal_number(
+            self.external_score, "external_score", 20
+        )
+        seo_score = _one_decimal_number(self.seo_score, "seo_score", 20)
+        total_score = _one_decimal_number(self.total_score, "total_score", 100)
+        expected_total = sum(
+            Decimal(str(score))
+            for score in (
+                platform_score,
+                demand_score,
+                external_score,
+                seo_score,
+            )
+        ).quantize(Decimal("0.1"))
+        if Decimal(str(total_score)) != expected_total:
+            raise _error("total_score must equal the sum of component scores")
+        object.__setattr__(self, "platform_score", platform_score)
+        object.__setattr__(self, "demand_score", demand_score)
+        object.__setattr__(self, "external_score", external_score)
+        object.__setattr__(self, "seo_score", seo_score)
+        object.__setattr__(self, "total_score", total_score)
         object.__setattr__(self, "action", _literal(self.action, "action", _ACTIONS))
         object.__setattr__(self, "warnings", _typed_tuple(self.warnings, "warnings", WarningRecord))
 
@@ -1114,9 +1246,23 @@ class CommandManifest:
         object.__setattr__(self, "phase", _literal(self.phase, "phase", _PHASES))
         object.__setattr__(self, "report_json", _path_text(self.report_json, "report_json"))
         object.__setattr__(self, "report_markdown", _path_text(self.report_markdown, "report_markdown"))
-        object.__setattr__(self, "source_health", _typed_tuple(self.source_health, "source_health", SourceHealth))
+        source_health = _typed_tuple(
+            self.source_health,
+            "source_health",
+            SourceHealth,
+        )
+        outstanding_tasks = _typed_tuple(
+            self.outstanding_tasks,
+            "outstanding_tasks",
+            OutstandingTask,
+        )
+        if any(health.run_id != self.run_id for health in source_health):
+            raise _error("source_health run_id must match manifest run_id")
+        if any(task.run_id != self.run_id for task in outstanding_tasks):
+            raise _error("outstanding_tasks run_id must match manifest run_id")
+        object.__setattr__(self, "source_health", source_health)
         object.__setattr__(self, "warnings", _typed_tuple(self.warnings, "warnings", WarningRecord))
-        object.__setattr__(self, "outstanding_tasks", _typed_tuple(self.outstanding_tasks, "outstanding_tasks", OutstandingTask))
+        object.__setattr__(self, "outstanding_tasks", outstanding_tasks)
 
     def to_dict(self) -> dict[str, object]:
         return _to_dict(self)
@@ -1143,9 +1289,23 @@ class PreliminaryResult:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
         object.__setattr__(self, "run_id", _run_id(self.run_id))
         object.__setattr__(self, "candidates", _typed_tuple(self.candidates, "candidates", GameIdentity))
-        object.__setattr__(self, "source_health", _typed_tuple(self.source_health, "source_health", SourceHealth))
+        source_health = _typed_tuple(
+            self.source_health,
+            "source_health",
+            SourceHealth,
+        )
+        outstanding_tasks = _typed_tuple(
+            self.outstanding_tasks,
+            "outstanding_tasks",
+            OutstandingTask,
+        )
+        if any(health.run_id != self.run_id for health in source_health):
+            raise _error("source_health run_id must match preliminary run_id")
+        if any(task.run_id != self.run_id for task in outstanding_tasks):
+            raise _error("outstanding_tasks run_id must match preliminary run_id")
+        object.__setattr__(self, "source_health", source_health)
         object.__setattr__(self, "warnings", _typed_tuple(self.warnings, "warnings", WarningRecord))
-        object.__setattr__(self, "outstanding_tasks", _typed_tuple(self.outstanding_tasks, "outstanding_tasks", OutstandingTask))
+        object.__setattr__(self, "outstanding_tasks", outstanding_tasks)
 
     def to_dict(self) -> dict[str, object]:
         return _to_dict(self)

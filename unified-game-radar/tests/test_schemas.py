@@ -40,7 +40,7 @@ from unified_game_radar.schemas import (
 
 RUN_ID = "20260831T020000Z-a1b2c3d4"
 OPPORTUNITY_ID = "0f840f6f-5c62-4ca6-9d53-e0be9ab2740b"
-OBSERVATION_ID = "steam:123456:most-played:20260831T020000Z"
+OBSERVATION_ID = "steam:123456:most_played:20260831T020000Z"
 OBSERVED_AT = datetime(2026, 8, 31, 2, tzinfo=timezone.utc)
 PUBLISHED_AT = datetime(2026, 8, 31, 6, tzinfo=timezone.utc)
 
@@ -170,7 +170,7 @@ def build_instances() -> tuple[object, ...]:
         schema_version=1,
         run_id=RUN_ID,
         platform_key="steam:123456",
-        surface="released",
+        surface="most_played",
         observation_ids=(OBSERVATION_ID,),
         heat=72.5,
     )
@@ -178,7 +178,7 @@ def build_instances() -> tuple[object, ...]:
         schema_version=1,
         run_id=RUN_ID,
         platform_key="steam:123456",
-        surface="released",
+        surface="most_played",
         observation_ids=(OBSERVATION_ID,),
         heat=72.5,
         platform_score=15.0,
@@ -606,15 +606,37 @@ class SchemaValidationTests(unittest.TestCase):
 
     def test_observation_ids_are_structured_and_validated_in_all_references(self) -> None:
         by_type = {type(instance): instance for instance in build_instances()}
-        valid_ids = (
-            "itch:studio.example-game:newest:20240229T235959Z",
-            "steam:123456:most_played:20260831T020000Z",
-            "roblox:game_123:up-and-coming:20260831T020000Z",
+        valid_observations = (
+            (
+                "itch:studio.example-game:newest:20240229T235959Z",
+                "itch",
+                "studio.example-game",
+                "newest",
+                "2024-02-29T23:59:59Z",
+            ),
+            (
+                "steam:123456:most_played:20260831T020000Z",
+                "steam",
+                "123456",
+                "most_played",
+                "2026-08-31T02:00:00Z",
+            ),
+            (
+                "roblox:game_123:up-and-coming:20260831T020000Z",
+                "roblox",
+                "game_123",
+                "up-and-coming",
+                "2026-08-31T02:00:00Z",
+            ),
         )
-        for valid in valid_ids:
+        for valid, platform, platform_id, surface, observed_at in valid_observations:
             with self.subTest(valid=valid):
                 payload = by_type[PlatformObservation].to_dict()
                 payload["observation_id"] = valid
+                payload["platform"] = platform
+                payload["platform_id"] = platform_id
+                payload["surface"] = surface
+                payload["observed_at"] = observed_at
                 parsed = PlatformObservation.from_dict(payload)
                 self.assertEqual(parsed.observation_id, valid)
                 self.assertEqual(parsed.to_dict()["observation_id"], valid)
@@ -647,6 +669,49 @@ class SchemaValidationTests(unittest.TestCase):
                     )
                     with self.assertRaises(InputValidationError):
                         schema_type.from_dict(payload)
+
+    def test_observation_id_provenance_must_match_observation_fields(self) -> None:
+        observation = next(
+            instance
+            for instance in build_instances()
+            if isinstance(instance, PlatformObservation)
+        )
+        mismatches = (
+            ("observation_id", "itch:123456:most_played:20260831T020000Z"),
+            ("observation_id", "steam:999999:most_played:20260831T020000Z"),
+            ("observation_id", "steam:123456:newest:20260831T020000Z"),
+            ("observation_id", "steam:123456:most_played:20260831T020001Z"),
+            ("observed_at", "2026-08-31T02:00:00.100Z"),
+        )
+        for field_name, value in mismatches:
+            with self.subTest(field=field_name, value=value):
+                payload = observation.to_dict()
+                payload[field_name] = value
+                with self.assertRaises(InputValidationError):
+                    PlatformObservation.from_dict(payload)
+
+    def test_heat_references_match_platform_key_and_surface_with_history(self) -> None:
+        by_type = {type(instance): instance for instance in build_instances()}
+        historical_ids = [
+            "steam:123456:most_played:20260830T020000Z",
+            "steam:123456:most_played:20260831T020000Z",
+        ]
+        for schema_type in (PlatformHeat, NormalizedHeat):
+            payload = by_type[schema_type].to_dict()
+            payload["observation_ids"] = historical_ids
+            parsed = schema_type.from_dict(payload)
+            self.assertEqual(parsed.observation_ids, tuple(historical_ids))
+
+            for invalid in (
+                "itch:123456:most_played:20260830T020000Z",
+                "steam:999999:most_played:20260830T020000Z",
+                "steam:123456:newest:20260830T020000Z",
+            ):
+                with self.subTest(schema=schema_type.__name__, invalid=invalid):
+                    changed = by_type[schema_type].to_dict()
+                    changed["observation_ids"] = [invalid]
+                    with self.assertRaises(InputValidationError):
+                        schema_type.from_dict(changed)
 
     def test_observation_envelope_contains_only_typed_observations(self) -> None:
         envelope = next(
@@ -759,6 +824,28 @@ class SchemaValidationTests(unittest.TestCase):
         payload["evidence_urls"] = ["http://example.com/evidence"]
         with self.assertRaises(InputValidationError):
             PlatformObservation.from_dict(payload)
+
+    def test_malformed_urls_and_timezones_never_leak_value_error(self) -> None:
+        by_type = {type(instance): instance for instance in build_instances()}
+        record_payload = by_type[PlatformRecord].to_dict()
+        for invalid in (
+            "https://[::1",
+            "https://example.com:bad/path",
+            "https://example.com:/empty-port",
+            "https:///missing-host",
+            "https://:443/path",
+        ):
+            with self.subTest(url=invalid):
+                record_payload["url"] = invalid
+                with self.assertRaises(InputValidationError):
+                    PlatformRecord.from_dict(record_payload)
+
+        trends_payload = by_type[TrendEvidence].to_dict()
+        for invalid in ("/etc/passwd", "../UTC", "Mars/Olympus", ""):
+            with self.subTest(timezone=invalid):
+                trends_payload["timezone"] = invalid
+                with self.assertRaises(InputValidationError):
+                    TrendEvidence.from_dict(trends_payload)
 
     def test_optional_unavailable_values_remain_null_not_zero(self) -> None:
         unavailable_point = TrendPoint(date(2026, 8, 31), None, False)
@@ -983,6 +1070,106 @@ class SchemaValidationTests(unittest.TestCase):
                 ):
                     payload = by_type[schema_type].to_dict()
                     payload[field_name] = {"nested": {"value": invalid}}
+                    with self.assertRaises(InputValidationError):
+                        schema_type.from_dict(payload)
+
+    def test_parent_records_reject_nested_records_from_other_runs(self) -> None:
+        by_type = {type(instance): instance for instance in build_instances()}
+        other_run = "20260831T030000Z-deadbeef"
+        for parent_type in (CommandManifest, PreliminaryResult):
+            for child_field in ("source_health", "outstanding_tasks"):
+                with self.subTest(
+                    parent=parent_type.__name__, child_field=child_field
+                ):
+                    payload = by_type[parent_type].to_dict()
+                    child = dict(payload[child_field][0])
+                    child["run_id"] = other_run
+                    payload[child_field] = [child]
+                    with self.assertRaises(InputValidationError):
+                        parent_type.from_dict(payload)
+
+    def test_scored_opportunity_requires_one_decimal_and_exact_total(self) -> None:
+        score = next(
+            instance
+            for instance in build_instances()
+            if isinstance(instance, ScoredOpportunity)
+        )
+        for field_name in (
+            "platform_score",
+            "demand_score",
+            "external_score",
+            "seo_score",
+            "total_score",
+        ):
+            with self.subTest(field=field_name):
+                payload = score.to_dict()
+                payload[field_name] = 1.23
+                with self.assertRaises(InputValidationError):
+                    ScoredOpportunity.from_dict(payload)
+
+        payload = score.to_dict()
+        payload["total_score"] = 62.9
+        with self.assertRaises(InputValidationError):
+            ScoredOpportunity.from_dict(payload)
+
+        payload.update(
+            platform_score=0.1,
+            demand_score=0.2,
+            external_score=0.3,
+            seo_score=0.4,
+            total_score=1.0,
+        )
+        floating_sum = ScoredOpportunity.from_dict(payload)
+        self.assertEqual(floating_sum.total_score, 1.0)
+
+        payload.update(
+            platform_score=30.0,
+            demand_score=30.0,
+            external_score=20.0,
+            seo_score=20.0,
+            total_score=100.0,
+        )
+        self.assertEqual(ScoredOpportunity.from_dict(payload).total_score, 100.0)
+
+    def test_external_evidence_cannot_be_published_in_the_future(self) -> None:
+        external = next(
+            instance
+            for instance in build_instances()
+            if isinstance(instance, ExternalEvidence)
+        )
+        payload = external.to_dict()
+        payload["published_at"] = payload["observed_at"]
+        self.assertEqual(
+            ExternalEvidence.from_dict(payload).published_at,
+            ExternalEvidence.from_dict(payload).observed_at,
+        )
+
+        payload["published_at"] = "2026-08-31T06:00:01Z"
+        with self.assertRaises(InputValidationError):
+            ExternalEvidence.from_dict(payload)
+
+    def test_sequence_boundaries_accept_only_lists_or_tuples(self) -> None:
+        by_type = {type(instance): instance for instance in build_instances()}
+        cases = (
+            (RadarRun, "platforms", ("steam",)),
+            (SerpEvidence, "missing_intents", ("guide",)),
+            (PlatformHeat, "observation_ids", (OBSERVATION_ID,)),
+        )
+        for schema_type, field_name, valid in cases:
+            for accepted in (list(valid), tuple(valid)):
+                payload = by_type[schema_type].to_dict()
+                payload[field_name] = accepted
+                parsed = schema_type.from_dict(payload)
+                self.assertIsInstance(getattr(parsed, field_name), tuple)
+
+            for rejected in (set(valid), (item for item in valid), "steam"):
+                with self.subTest(
+                    schema=schema_type.__name__,
+                    field=field_name,
+                    rejected_type=type(rejected).__name__,
+                ):
+                    payload = by_type[schema_type].to_dict()
+                    payload[field_name] = rejected
                     with self.assertRaises(InputValidationError):
                         schema_type.from_dict(payload)
 
