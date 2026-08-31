@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "run_id": "{{RUN_ID}}",
+  "opportunity_id": "{{OPPORTUNITY_ID}}",
+  "observed_at": "2026-08-31T08:20:00Z",
+  "trends": {
+    "query": "{{GAME_NAME}} game",
+    "query_type": "search_term",
+    "timeframe": "now 7-d",
+    "geo": "US",
+    "category": 0,
+    "property": "web",
+    "timezone": "Asia/Shanghai",
+    "points": [
+      {"date": "2026-08-24", "value": 0, "complete": true},
+      {"date": "2026-08-25", "value": 0, "complete": true},
+      {"date": "2026-08-26", "value": 100, "complete": true},
+      {"date": "2026-08-27", "value": 30, "complete": true},
+      {"date": "2026-08-28", "value": 20, "complete": true},
+      {"date": "2026-08-29", "value": 10, "complete": true},
+      {"date": "2026-08-30", "value": 15, "complete": true},
+      {"date": "2026-08-31", "value": 12, "complete": false}
+    ],
+    "comparison_term": "gpts",
+    "comparison_average": 41,
+    "evidence_url": "https://trends.google.com/trends/explore?q=single-spike-game",
+    "raw_artifact": "data/raw/evidence-single-spike.json",
+    "observed_at": "2026-08-31T08:20:00Z"
+  },
+  "autocomplete_queries": [
+    {
+      "schema_version": 1,
+      "query": "{{GAME_NAME}} guide",
+      "observed_at": "2026-08-31T08:20:00Z",
+      "source_url": "https://www.google.com/complete/search?q=single-spike-guide"
+    },
+    {
+      "schema_version": 1,
+      "query": "{{GAME_NAME}} codes",
+      "observed_at": "2026-08-31T08:20:00Z",
+      "source_url": "https://www.google.com/complete/search?q=single-spike-codes"
+    }
+  ],
+  "related_queries": [
+    {
+      "schema_version": 1,
+      "query": "{{GAME_NAME}} wiki",
+      "observed_at": "2026-08-31T08:20:00Z",
+      "source_url": "https://trends.google.com/trends/explore?q=single-spike-wiki"
+    },
+    {
+      "schema_version": 1,
+      "query": "{{GAME_NAME}} walkthrough",
+      "observed_at": "2026-08-31T08:20:00Z",
+      "source_url": "https://trends.google.com/trends/explore?q=single-spike-walkthrough"
+    }
+  ],
+  "external_evidence": [
+    {
+      "source": "youtube.com",
+      "url": "https://youtube.com/watch?v={{OPPORTUNITY_ID}}",
+      "published_at": "2026-08-30T08:20:00Z",
+      "observed_at": "2026-08-31T08:20:00Z",
+      "author_relation": "independent",
+      "engagement_count": 25000,
+      "evidence_kind": "gameplay"
+    },
+    {
+      "source": "reddit.com",
+      "url": "https://reddit.com/r/games/comments/{{OPPORTUNITY_ID}}/signal/",
+      "published_at": "2026-08-29T08:20:00Z",
+      "observed_at": "2026-08-31T08:20:00Z",
+      "author_relation": "independent",
+      "engagement_count": 5000,
+      "evidence_kind": "discussion"
+    }
+  ],
+  "serp": {
+    "query": "{{GAME_NAME}} game",
+    "relevant_nonofficial_results": 0,
+    "guide_results": 0,
+    "missing_intents": ["guide", "codes", "answers", "wiki"],
+    "evidence_url": "https://www.google.com/search?q=single-spike-game",
+    "observed_at": "2026-08-31T08:20:00Z"
+  }
+}

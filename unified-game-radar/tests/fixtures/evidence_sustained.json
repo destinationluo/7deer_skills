@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "run_id": "{{RUN_ID}}",
+  "opportunity_id": "{{OPPORTUNITY_ID}}",
+  "observed_at": "2026-08-31T08:20:00Z",
+  "trends": {
+    "query": "{{GAME_NAME}} game",
+    "query_type": "search_term",
+    "timeframe": "now 7-d",
+    "geo": "US",
+    "category": 0,
+    "property": "web",
+    "timezone": "Asia/Shanghai",
+    "points": [
+      {"date": "2026-08-24", "value": 10, "complete": true},
+      {"date": "2026-08-25", "value": 20, "complete": true},
+      {"date": "2026-08-26", "value": 35, "complete": true},
+      {"date": "2026-08-27", "value": 50, "complete": true},
+      {"date": "2026-08-28", "value": 35, "complete": true},
+      {"date": "2026-08-29", "value": 40, "complete": true},
+      {"date": "2026-08-30", "value": 38, "complete": true},
+      {"date": "2026-08-31", "value": 42, "complete": false}
+    ],
+    "comparison_term": "gpts",
+    "comparison_average": 41,
+    "evidence_url": "https://trends.google.com/trends/explore?q=sustained-game",
+    "raw_artifact": "data/raw/evidence-sustained.json",
+    "observed_at": "2026-08-31T08:20:00Z"
+  },
+  "autocomplete_queries": [
+    {
+      "schema_version": 1,
+      "query": "{{GAME_NAME}} guide",
+      "observed_at": "2026-08-31T08:20:00Z",
+      "source_url": "https://www.google.com/complete/search?q=sustained-guide"
+    },
+    {
+      "schema_version": 1,
+      "query": "{{GAME_NAME}} codes",
+      "observed_at": "2026-08-31T08:20:00Z",
+      "source_url": "https://www.google.com/complete/search?q=sustained-codes"
+    }
+  ],
+  "related_queries": [
+    {
+      "schema_version": 1,
+      "query": "{{GAME_NAME}} wiki",
+      "observed_at": "2026-08-31T08:20:00Z",
+      "source_url": "https://trends.google.com/trends/explore?q=sustained-wiki"
+    },
+    {
+      "schema_version": 1,
+      "query": "{{GAME_NAME}} walkthrough",
+      "observed_at": "2026-08-31T08:20:00Z",
+      "source_url": "https://trends.google.com/trends/explore?q=sustained-walkthrough"
+    }
+  ],
+  "external_evidence": [
+    {
+      "source": "youtube.com",
+      "url": "https://youtube.com/watch?v={{OPPORTUNITY_ID}}",
+      "published_at": "2026-08-30T08:20:00Z",
+      "observed_at": "2026-08-31T08:20:00Z",
+      "author_relation": "independent",
+      "engagement_count": 25000,
+      "evidence_kind": "gameplay"
+    },
+    {
+      "source": "reddit.com",
+      "url": "https://reddit.com/r/games/comments/{{OPPORTUNITY_ID}}/signal/",
+      "published_at": "2026-08-29T08:20:00Z",
+      "observed_at": "2026-08-31T08:20:00Z",
+      "author_relation": "independent",
+      "engagement_count": 5000,
+      "evidence_kind": "discussion"
+    }
+  ],
+  "serp": {
+    "query": "{{GAME_NAME}} game",
+    "relevant_nonofficial_results": 0,
+    "guide_results": 0,
+    "missing_intents": ["guide", "codes", "answers", "wiki"],
+    "evidence_url": "https://www.google.com/search?q=sustained-game",
+    "observed_at": "2026-08-31T08:20:00Z"
+  }
+}
