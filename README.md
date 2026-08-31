@@ -1,6 +1,6 @@
 ﻿# 🛠️ 7Deer Skills — Agent Skills 开放标准技能库
 
-> 32 个可复用的 AI Agent 技能模块，基于 [Agent Skills 开放标准](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)构建。
+> 33 个可复用的 AI Agent 技能模块，基于 [Agent Skills 开放标准](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)构建。
 > 克隆到项目中，你的 AI Agent 即可自动发现并加载这些能力。
 
 这是一个开源技能库，包含了从实际项目中提炼出来的可复用代码模块和指令模板。
@@ -122,11 +122,12 @@ cp -r 7deer_skills/google-trends-to-pages .agent/skills/
 ### 游戏 & 数据情报
 | # | 技能名称 | 描述 | 适用场景 |
 |---|---------|------|---------|
-| 12 | **steam-game-radar** | Steam 官方趋势扫描 + 本地 SteamDB 榜单导入，分开评估已发布/未发布游戏 | Steam 选品与 SEO 机会 |
-| 13 | **html5-game-radar** | HTML5 浏览器可玩游戏发现，不与 Steam 候选集或评分混合 | Web 游戏机会发现 |
-| 14 | **itchio-new-game-hunt** | itch.io 新游戏挖掘与趋势追踪 | 独立游戏选品 |
-| 15 | **youtube-game-scout** | YouTube 游戏趋势扫描与候选挖掘 | 游戏内容情报 |
-| 16 | **x-demand-radar** | X/Twitter 需求信号与热点扫描 | 需求与趋势情报 |
+| 12 | **unified-game-radar** | itch.io、Steam、Roblox 统一候选榜；零需求与单次尖峰不可进入“值得做” | 每日热词游戏监控 |
+| 13 | **steam-game-radar** | 已弃用的 Steam 手动兼容入口；当前监控转入统一雷达 | Steam 单平台手动扫描 |
+| 14 | **html5-game-radar** | 已弃用的 itch.io/HTML5 手动兼容入口；当前监控转入统一雷达 | Web 游戏手动扫描 |
+| 15 | **itchio-new-game-hunt** | itch.io 新游戏挖掘与趋势追踪 | 独立游戏选品 |
+| 16 | **youtube-game-scout** | YouTube 游戏趋势扫描与候选挖掘 | 游戏内容情报 |
+| 17 | **x-demand-radar** | X/Twitter 需求信号与热点扫描 | 需求与趋势情报 |
 
 ### 外链建设
 | # | 技能名称 | 描述 | 适用场景 |
@@ -330,6 +331,10 @@ intent = classify_intent("how to get six eyes jujutsu infinite")
 │   └── references/
 │       ├── steering-template.md
 │       └── setup-checklist.md
+├── unified-game-radar/                # itch.io + Steam + Roblox 统一机会榜
+│   ├── SKILL.md
+│   ├── scripts/game_radar.py
+│   └── references/
 ├── site-keyword-research/             # 整站关键词研究
 │   ├── SKILL.md
 │   └── references/
@@ -404,7 +409,7 @@ OPENAI_API_KEY=your_openai_api_key_here
 
 ## 📊 技能统计
 
-- **总技能数**: 32 个
+- **总技能数**: 33 个
 - **P0 核心技能**: 3 个
 - **代码行数**: 15,000+ 行
 - **文档页数**: 70+ 页
@@ -427,6 +432,10 @@ OPENAI_API_KEY=your_openai_api_key_here
 ---
 
 ## 📝 更新日志
+
+### 2026-09-01
+- 🎮 添加 **unified-game-radar**（itch.io、Steam、Roblox 统一候选榜与搜索需求硬门槛）
+- 📊 技能总数 → 33
 
 ### 2026-08-24
 - 🎮 添加 **steam-game-radar**（Steam 官方趋势、本地 SteamDB 导入、SEO 评分与定时路由）
