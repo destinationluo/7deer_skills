@@ -720,6 +720,92 @@ class FinalOrchestrationTests(unittest.TestCase):
         self.assertEqual(json_path.read_bytes(), expected_json)
         self.assertEqual(markdown_path.read_bytes(), expected_markdown)
 
+    def test_historical_report_ignores_platforms_linked_by_future_run(self) -> None:
+        first_run = scan_run(
+            self.config,
+            self.store,
+            {
+                "steam": FixtureCollector(
+                    "steam",
+                    lambda run: (
+                        observation(
+                            run,
+                            platform="steam",
+                            platform_id="901",
+                            name="Cross Platform Signal",
+                            rank=1,
+                            players=20_000,
+                        ),
+                    ),
+                )
+            },
+            lambda: STARTED_AT,
+            SequenceIdFactory((IDENTITY_IDS[0],)),
+            ("steam",),
+            started_at=STARTED_AT,
+            run_id=RUN_ID,
+        )
+        first_manifest = report_run(
+            self.config,
+            self.store,
+            first_run.run_id,
+            lambda: STARTED_AT + timedelta(minutes=1),
+        )
+        first_bytes = Path(first_manifest.report_json).read_bytes()
+        first_report = json.loads(first_bytes)
+        self.assertEqual(
+            [
+                row["platform"]
+                for row in first_report["candidates"][0]["platforms"]
+            ],
+            ["steam"],
+        )
+
+        future_started_at = STARTED_AT + timedelta(days=1)
+
+        def unexpected_identity() -> str:
+            raise AssertionError(
+                "the future platform should link to the existing identity"
+            )
+
+        future_run = scan_run(
+            self.config,
+            self.store,
+            {
+                "itch": FixtureCollector(
+                    "itch",
+                    lambda run: (
+                        observation(
+                            run,
+                            platform="itch",
+                            platform_id="cross-platform-signal",
+                            name="Cross Platform Signal",
+                            rank=1,
+                            players=0,
+                        ),
+                    ),
+                )
+            },
+            lambda: future_started_at,
+            unexpected_identity,
+            ("itch",),
+            started_at=future_started_at,
+            run_id="20260901T080000Z-22222222",
+        )
+        self.assertEqual(
+            future_run.candidates[0].opportunity_id,
+            first_run.candidates[0].opportunity_id,
+        )
+
+        rebuilt = report_run(
+            self.config,
+            self.store,
+            first_run.run_id,
+            lambda: STARTED_AT + timedelta(minutes=1),
+        )
+
+        self.assertEqual(Path(rebuilt.report_json).read_bytes(), first_bytes)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 # Unified Game Opportunity Radar Design
 
-**Status:** Approved by user on 2026-08-31  
+**Status:** Approved by user on 2026-08-31
 **Goal:** Build one local Agent Skill that scans itch.io, Steam, and Roblox, stores comparable historical snapshots, enforces real-search-demand gates, and publishes one daily ranked opportunity report. A future adapter may import the versioned report into `https://web-game-data.vercel.app/overview`, but the local radar must run independently.
 
 ## Context

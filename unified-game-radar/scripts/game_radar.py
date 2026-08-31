@@ -186,7 +186,8 @@ def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def _read_json(path: Path) -> object:
     try:
-        raw = path.read_bytes()
+        with path.open("rb") as handle:
+            raw = handle.read(_MAX_INPUT_BYTES + 1)
     except OSError as error:
         raise InputValidationError(f"unable to read input: {path}") from error
     if len(raw) > _MAX_INPUT_BYTES:

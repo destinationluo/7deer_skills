@@ -498,6 +498,54 @@ def _link_identities(
     )
 
 
+def _project_identities_to_run_records(
+    identities: Sequence[GameIdentity],
+    records: Sequence[PlatformRecord],
+) -> tuple[GameIdentity, ...]:
+    """Return identity IDs with only metadata observed by the active run."""
+
+    records_by_key = {platform_key(record): record for record in records}
+    projected: list[GameIdentity] = []
+    projected_keys: set[str] = set()
+    for identity in identities:
+        identity_keys = {
+            platform_key(record) for record in identity.platform_records
+        }
+        current_keys = tuple(sorted(identity_keys.intersection(records_by_key)))
+        if not current_keys:
+            continue
+        current_records = tuple(records_by_key[key] for key in current_keys)
+        projected_keys.update(current_keys)
+        projected.append(
+            GameIdentity(
+                schema_version=1,
+                opportunity_id=identity.opportunity_id,
+                name=identity.name,
+                normalized_name=identity.normalized_name,
+                developer=next(
+                    (
+                        record.developer
+                        for record in current_records
+                        if record.developer is not None
+                    ),
+                    None,
+                ),
+                official_domain=next(
+                    (
+                        record.official_domain
+                        for record in current_records
+                        if record.official_domain is not None
+                    ),
+                    None,
+                ),
+                platform_records=current_records,
+            )
+        )
+    if projected_keys != set(records_by_key):
+        raise ValueError("run platform records must all have a linked identity")
+    return tuple(projected)
+
+
 def _number(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -901,7 +949,10 @@ def _rebuild_scoring_context(
 ) -> tuple[tuple[GameIdentity, ...], dict[str, float]]:
     observations = _verified_run_observations(store, run)
     records = _platform_records(observations)
-    identities = _link_identities(config, store, records, id_factory)
+    identities = _project_identities_to_run_records(
+        _link_identities(config, store, records, id_factory),
+        records,
+    )
     heats = _platform_heats(run, store, observations)
     normalized = _normalized_heats(heats, config.heat_floor)
     candidates = _select_candidates(

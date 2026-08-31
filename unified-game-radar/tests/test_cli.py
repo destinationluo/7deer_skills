@@ -224,6 +224,28 @@ class CliTests(unittest.TestCase):
                     input_path if has_input else None,
                 )
 
+    def test_json_input_read_is_bounded_before_parsing(self) -> None:
+        class RecordingReader:
+            def __init__(self) -> None:
+                self.read_sizes: list[int] = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self, size: int = -1) -> bytes:
+                self.read_sizes.append(size)
+                return b"{}"
+
+        reader = RecordingReader()
+        with mock.patch.object(Path, "open", return_value=reader):
+            payload = game_radar._read_json(self.root / "bounded.json")
+
+        self.assertEqual(payload, {})
+        self.assertEqual(reader.read_sizes, [game_radar._MAX_INPUT_BYTES + 1])
+
     def test_lock_is_released_when_runner_raises(self) -> None:
         events: list[tuple[str, object]] = []
 
