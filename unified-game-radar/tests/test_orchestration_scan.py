@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -16,7 +18,9 @@ from unified_game_radar.collectors.base import (
     CollectorResult,
     PendingRawPayload,
 )
+from unified_game_radar.artifacts import persist_raw_artifact
 from unified_game_radar.config import RadarConfig
+from unified_game_radar.errors import PersistenceError
 from unified_game_radar.orchestration import scan_run
 from unified_game_radar.schemas import (
     PlatformObservation,
@@ -198,7 +202,10 @@ class FixtureCollector:
                 provider=f"{self.platform}_fixture",
                 artifact_name=f"{self.platform}_fixture.json",
                 observed_at=run.started_at,
-                payload={"authorization": "must-not-be-rendered", "rows": [1]},
+                payload={
+                    "authorization": "must-not-be-rendered",
+                    "rows": [{"metadata": {"api_token": "nested-secret"}}],
+                },
             ),
         ) if self.pending else ()
         return CollectorResult(
@@ -248,15 +255,46 @@ class ScanRunTests(unittest.TestCase):
         )
         unselected = FixtureCollector("roblox", lambda run: ())
         ids = SequenceIdFactory()
+        artifacts = []
 
-        result = scan_run(
-            config(self.root),
-            self.store,
-            {"steam": steam, "roblox": unselected},
-            lambda: NOW,
-            ids,
-            ("steam", "itch"),
-        )
+        def persist(*args, **kwargs):
+            artifact = persist_raw_artifact(*args, **kwargs)
+            artifacts.append(artifact)
+            return artifact
+
+        insert_observation = self.store.insert_observation
+
+        def insert_after_artifact(item: PlatformObservation) -> None:
+            expected = (
+                self.root
+                / "data"
+                / "raw"
+                / item.run_id
+                / "steam_fixture"
+                / "steam_fixture.json"
+            )
+            self.assertTrue(expected.is_file())
+            insert_observation(item)
+
+        with (
+            mock.patch(
+                "unified_game_radar.orchestration.persist_raw_artifact",
+                side_effect=persist,
+            ),
+            mock.patch.object(
+                self.store,
+                "insert_observation",
+                side_effect=insert_after_artifact,
+            ),
+        ):
+            result = scan_run(
+                config(self.root),
+                self.store,
+                {"steam": steam, "roblox": unselected},
+                lambda: NOW,
+                ids,
+                ("steam", "itch"),
+            )
 
         self.assertEqual(result.run_id, "20260831T160000Z-11111111")
         persisted = self.store.get_run(result.run_id)
@@ -280,6 +318,80 @@ class ScanRunTests(unittest.TestCase):
         )
         self.assertEqual(len(result.candidates), 1)
         self.assertNotIn("must-not-be-rendered", repr(steam.calls[0]))
+        self.assertEqual(len(artifacts), 1)
+        raw_path = Path(artifacts[0].path)
+        raw_bytes = raw_path.read_bytes()
+        self.assertEqual(
+            json.loads(raw_bytes),
+            {
+                "authorization": "[REDACTED]",
+                "rows": [{"metadata": {"api_token": "[REDACTED]"}}],
+            },
+        )
+        self.assertNotIn(b"must-not-be-rendered", raw_bytes)
+        self.assertNotIn(b"nested-secret", raw_bytes)
+        self.assertEqual(
+            artifacts[0].sha256,
+            hashlib.sha256(raw_bytes).hexdigest(),
+        )
+
+    def test_artifact_failure_preserves_previous_collector_but_rolls_back_current(self) -> None:
+        itch = FixtureCollector(
+            "itch",
+            lambda run: (
+                observation(
+                    run,
+                    platform="itch",
+                    platform_id="kept",
+                    name="Kept Itch",
+                    developer="Studio I",
+                    surface="popular",
+                    rank=1,
+                ),
+            ),
+        )
+        steam = FixtureCollector(
+            "steam",
+            lambda run: (
+                observation(
+                    run,
+                    platform="steam",
+                    platform_id="20",
+                    name="Rejected Steam",
+                    developer="Studio S",
+                    surface="most_played",
+                    rank=1,
+                ),
+            ),
+            pending=True,
+        )
+
+        with (
+            mock.patch(
+                "unified_game_radar.orchestration.persist_raw_artifact",
+                side_effect=PersistenceError("artifact write failed"),
+            ),
+            self.assertRaises(PersistenceError),
+        ):
+            scan_run(
+                config(self.root),
+                self.store,
+                {"itch": itch, "steam": steam},
+                lambda: NOW,
+                SequenceIdFactory(),
+                ("itch", "steam"),
+            )
+
+        run_id = "20260831T160000Z-11111111"
+        self.assertIsNotNone(self.store.get_source_health(run_id, "itch"))
+        self.assertIsNone(self.store.get_source_health(run_id, "steam"))
+        with sqlite3.connect(self.store.path) as connection:
+            platforms = connection.execute(
+                "SELECT platform FROM observations WHERE run_id = ? "
+                "ORDER BY platform",
+                (run_id,),
+            ).fetchall()
+        self.assertEqual(platforms, [("itch",)])
 
     def test_collector_failures_are_isolated_and_use_stale_fallback_when_available(self) -> None:
         prior_at = NOW - timedelta(hours=48)

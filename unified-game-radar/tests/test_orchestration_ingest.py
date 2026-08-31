@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 from pathlib import Path
 import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -17,10 +20,12 @@ from unified_game_radar.collectors.itch import (
     parse_itch_envelope,
 )
 from unified_game_radar.collectors.roblox import parse_roblox_envelope
+from unified_game_radar.artifacts import persist_raw_artifact
 from unified_game_radar.config import RadarConfig
 from unified_game_radar.errors import (
     IdempotencyConflictError,
     InputValidationError,
+    PersistenceError,
 )
 from unified_game_radar.orchestration import ingest_run, scan_run
 from unified_game_radar.schemas import (
@@ -323,6 +328,88 @@ class IngestRunTests(unittest.TestCase):
         self.assertEqual(first_health.status, "partial")
         self.assertEqual(second_health.status, "fresh")
         self.assertEqual(len(observation_ids(self.store.path, RUN_ID)), 2)
+        raw_dir = self.root / "data" / "raw" / RUN_ID / "itch_agent_browser"
+        self.assertEqual(
+            tuple(path.name for path in sorted(raw_dir.glob("*.json"))),
+            (
+                "itch_newest_20260831t020500z.json",
+                "itch_popular_20260831t020500z.json",
+            ),
+        )
+
+    def test_browser_ingest_persists_itch_and_roblox_raw_before_observations(self) -> None:
+        self.create_run()
+        artifacts = []
+
+        def persist(*args, **kwargs):
+            artifact = persist_raw_artifact(*args, **kwargs)
+            artifacts.append(artifact)
+            return artifact
+
+        insert_observation = self.store.insert_observation
+
+        def insert_after_artifact(item) -> None:
+            expected = (
+                self.root
+                / "data"
+                / "raw"
+                / item.run_id
+                / f"{item.platform}_agent_browser"
+                / f"{item.platform}_{item.surface}_20260831t020500z.json"
+            )
+            self.assertTrue(expected.is_file())
+            insert_observation(item)
+
+        ids = SequenceIdFactory()
+        with (
+            mock.patch(
+                "unified_game_radar.orchestration.persist_raw_artifact",
+                side_effect=persist,
+            ),
+            mock.patch.object(
+                self.store,
+                "insert_observation",
+                side_effect=insert_after_artifact,
+            ),
+        ):
+            self.ingest(itch_envelope(), ids=ids)
+            self.ingest(roblox_envelope(), ids=ids)
+
+        self.assertEqual(
+            tuple(artifact.provider for artifact in artifacts),
+            ("itch_agent_browser", "roblox_agent_browser"),
+        )
+        for artifact in artifacts:
+            raw_bytes = Path(artifact.path).read_bytes()
+            self.assertEqual(
+                artifact.sha256,
+                hashlib.sha256(raw_bytes).hexdigest(),
+            )
+            self.assertEqual(
+                raw_bytes,
+                json.dumps(
+                    json.loads(raw_bytes),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8"),
+            )
+
+    def test_browser_artifact_failure_writes_no_health_or_observation(self) -> None:
+        radar_run = run(platforms=("itch",))
+        self.store.create_run(radar_run)
+
+        with (
+            mock.patch(
+                "unified_game_radar.orchestration.persist_raw_artifact",
+                side_effect=PersistenceError("artifact write failed"),
+            ),
+            self.assertRaises(PersistenceError),
+        ):
+            self.ingest(itch_envelope())
+
+        self.assertIsNone(self.store.get_source_health(RUN_ID, "itch"))
+        self.assertEqual(observation_ids(self.store.path, RUN_ID), ())
 
     def test_scan_keeps_browser_task_when_collector_health_is_partial(self) -> None:
         class PartialItchCollector:

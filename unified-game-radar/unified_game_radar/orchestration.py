@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import re
 from uuid import UUID
 
+from .artifacts import persist_raw_artifact
 from .collectors.base import (
     Collector,
     CollectorResult,
@@ -59,6 +61,13 @@ _BROWSER_COHORT = {
     "itch": ITCH_DISCOVERY,
     "roblox": ROBLOX_GLOBAL,
 }
+
+
+@dataclass(frozen=True)
+class _ParsedBrowserIngest:
+    observed_at: datetime
+    surfaces: tuple[str, ...]
+    observations: tuple[PlatformObservation, ...]
 
 
 def _utc_seconds(value: object, name: str) -> datetime:
@@ -208,9 +217,19 @@ def _validate_collector_result(
 
 
 def _persist_collector_result(
+    config: RadarConfig,
     store: RadarStore,
     result: CollectorResult,
 ) -> None:
+    for pending in result.pending_raw_payloads:
+        persist_raw_artifact(
+            config,
+            pending.run_id,
+            pending.provider,
+            pending.artifact_name,
+            pending.payload,
+            pending.observed_at,
+        )
     with store.transaction():
         store.save_source_health(result.health)
         for observation in result.observations:
@@ -273,7 +292,7 @@ def _collect_selected(
                 outstanding.append(_outstanding_browser_task(run, platform))
             continue
 
-        _persist_collector_result(store, result)
+        _persist_collector_result(config, store, result)
         results.append(result)
         health_rows.append(result.health)
         warnings.extend(result.health.warnings)
@@ -886,7 +905,7 @@ def _parse_browser_observations(
         Callable[[object, RadarRun], object],
     ],
     now: datetime,
-) -> tuple[PlatformObservation, ...]:
+) -> _ParsedBrowserIngest:
     parser = parser_registry.get(collector)
     if not callable(parser):
         raise InputValidationError(
@@ -917,7 +936,13 @@ def _parse_browser_observations(
         raise InputValidationError(
             "parsed browser observations do not match the ingest target"
         )
-    return observations
+    return _ParsedBrowserIngest(
+        observed_at=envelope_observed_at,
+        surfaces=tuple(
+            sorted({observation.surface for observation in observations})
+        ),
+        observations=observations,
+    )
 
 
 def _validate_ingest_now(run: RadarRun, now: datetime) -> None:
@@ -993,12 +1018,29 @@ def _ingest_health(
 
 
 def _persist_ingest(
+    config: RadarConfig,
     store: RadarStore,
-    observations: Sequence[PlatformObservation],
+    run: RadarRun,
+    collector: str,
+    envelope: Mapping[str, object],
+    parsed: _ParsedBrowserIngest,
     health: SourceHealth,
 ) -> None:
+    surface_key = "_".join(parsed.surfaces) or "empty"
+    artifact_name = (
+        f"{collector}_{surface_key}_"
+        f"{parsed.observed_at.strftime('%Y%m%dt%H%M%Sz')}.json"
+    )
+    persist_raw_artifact(
+        config,
+        run.run_id,
+        f"{collector}_agent_browser",
+        artifact_name,
+        envelope,
+        parsed.observed_at,
+    )
     with store.transaction():
-        for observation in observations:
+        for observation in parsed.observations:
             store.insert_observation(observation)
         store.save_source_health(health)
 
@@ -1115,13 +1157,14 @@ def ingest_run(
     run, collector = _ingest_target(store, run_id, envelope)
     now = _utc_seconds(clock(), "clock")
     _validate_ingest_now(run, now)
-    observations = _parse_browser_observations(
+    parsed = _parse_browser_observations(
         run,
         collector,
         envelope,
         parser_registry,
         now,
     )
+    observations = parsed.observations
     _validate_ingest_observation_times(observations, now)
     active_observations = _active_ingest_observations(
         store,
@@ -1137,7 +1180,15 @@ def ingest_run(
         active_observations,
         now,
     )
-    _persist_ingest(store, observations, health)
+    _persist_ingest(
+        config,
+        store,
+        run,
+        collector,
+        envelope,
+        parsed,
+        health,
+    )
     candidates = _rebuild_candidates(config, store, run, id_factory)
     health_rows, warnings, outstanding = _result_context(store, run)
     return PreliminaryResult(
