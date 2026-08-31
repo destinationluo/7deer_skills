@@ -9,17 +9,11 @@ import unicodedata
 
 from .config import IdentityAlias
 from .errors import InputValidationError
+from .platform_keys import canonical_platform_key, validate_platform_key
 from .schemas import GameIdentity, PlatformRecord
 
 
 _MAX_NAME_LENGTH = 512
-_MAX_PLATFORM_ID_LENGTH = 128
-_MAX_SAFE_INTEGER = 2**53 - 1
-_NUMERIC_ID = re.compile(r"[1-9][0-9]*\Z", flags=re.ASCII)
-_ITCH_ID = re.compile(
-    r"[a-z0-9]+(?:[-_.][a-z0-9]+)*\Z",
-    flags=re.ASCII,
-)
 _ASCII_DOMAIN_LABEL = re.compile(
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z",
     flags=re.ASCII,
@@ -68,13 +62,21 @@ def normalize_developer(value: str) -> str:
 
 
 def canonical_domain(value: str | None) -> str | None:
-    """Normalize a bare official domain, rejecting URL-like or unsafe input."""
+    """Normalize a bare domain with the stdlib IDNA 2003 codec.
+
+    Version 1 is intentionally standard-library-only.  Labels that do not
+    round-trip under Python's IDNA 2003 codec are rejected instead of being
+    assigned a second, incompatible modern-IDNA key.
+    """
 
     if value is None:
         return None
+    raw = _validated_text(value, "official_domain", 253).translate(
+        str.maketrans({"\u3002": ".", "\uff0e": ".", "\uff61": "."})
+    )
     raw = unicodedata.normalize(
         "NFKC",
-        _validated_text(value, "official_domain", 253),
+        raw,
     )
     if any(character.isspace() for character in raw):
         raise _invalid("official_domain must not contain whitespace")
@@ -91,13 +93,7 @@ def canonical_domain(value: str | None) -> str | None:
     unicode_labels = raw.split(".")
     if len(unicode_labels) < 2 or any(not label for label in unicode_labels):
         raise _invalid("official_domain must contain a registrable-looking domain")
-    try:
-        labels = tuple(
-            label.encode("idna").decode("ascii").lower()
-            for label in unicode_labels
-        )
-    except (UnicodeError, UnicodeDecodeError) as error:
-        raise _invalid("official_domain contains an invalid IDNA label") from error
+    labels = tuple(_canonical_idna_label(label) for label in unicode_labels)
 
     if any(_ASCII_DOMAIN_LABEL.fullmatch(label) is None for label in labels):
         raise _invalid("official_domain contains an invalid label")
@@ -114,33 +110,26 @@ def canonical_domain(value: str | None) -> str | None:
     raise _invalid("official_domain must not be an IP literal")
 
 
-def _canonical_key(platform: object, platform_id: object) -> str:
-    if platform not in {"itch", "steam", "roblox"}:
-        raise _invalid("platform must be itch, steam, or roblox")
-    if not isinstance(platform_id, str) or not platform_id:
-        raise _invalid("platform_id must be nonempty text")
-    if len(platform_id) > _MAX_PLATFORM_ID_LENGTH:
-        raise _invalid("platform_id is too long")
+def _canonical_idna_label(label: str) -> str:
+    """Return one lowercase ASCII label after an IDNA 2003 round trip."""
 
-    if platform in {"steam", "roblox"}:
-        if _NUMERIC_ID.fullmatch(platform_id) is None:
-            raise _invalid(f"{platform} platform_id must be a positive ASCII integer")
-        if int(platform_id) > _MAX_SAFE_INTEGER:
-            raise _invalid(f"{platform} platform_id exceeds the JSON safe integer limit")
-    elif _ITCH_ID.fullmatch(platform_id) is None:
-        raise _invalid(
-            "itch platform_id must be a lowercase safe slug without repeated separators"
-        )
-    return f"{platform}:{platform_id}"
+    try:
+        try:
+            ascii_label = label.encode("ascii").decode("ascii").lower()
+        except UnicodeEncodeError:
+            ascii_label = label.encode("idna").decode("ascii").lower()
+            decoded = ascii_label.encode("ascii").decode("idna")
+            if decoded.encode("idna").decode("ascii").lower() != ascii_label:
+                raise UnicodeError("IDNA label does not round-trip")
+            return ascii_label
 
-
-def _canonical_key_text(value: object, name: str) -> str:
-    if not isinstance(value, str) or not value or value != value.strip():
-        raise _invalid(f"{name} must be an exact platform key")
-    platform, separator, platform_id = value.partition(":")
-    if not separator or not platform_id or ":" in platform_id:
-        raise _invalid(f"{name} must be an exact platform key")
-    return _canonical_key(platform, platform_id)
+        if ascii_label.startswith("xn--"):
+            decoded = ascii_label.encode("ascii").decode("idna")
+            if decoded.encode("idna").decode("ascii").lower() != ascii_label:
+                raise UnicodeError("A-label does not round-trip")
+        return ascii_label
+    except UnicodeError as error:
+        raise _invalid("official_domain contains an invalid IDNA label") from error
 
 
 def platform_key(record: PlatformRecord) -> str:
@@ -148,7 +137,7 @@ def platform_key(record: PlatformRecord) -> str:
 
     if not isinstance(record, PlatformRecord):
         raise _invalid("record must be a PlatformRecord")
-    return _canonical_key(record.platform, record.platform_id)
+    return canonical_platform_key(record.platform, record.platform_id)
 
 
 def _validated_aliases(
@@ -165,8 +154,8 @@ def _validated_aliases(
     for alias in aliases:
         if not isinstance(alias, IdentityAlias) or alias.schema_version != 1:
             raise _invalid("aliases must contain version-1 IdentityAlias objects")
-        source = _canonical_key_text(alias.source, "alias source")
-        target = _canonical_key_text(alias.target, "alias target")
+        source = validate_platform_key(alias.source, "alias source")
+        target = validate_platform_key(alias.target, "alias target")
         links.append((source, target))
     return tuple(links)
 

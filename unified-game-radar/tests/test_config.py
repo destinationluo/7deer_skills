@@ -306,6 +306,15 @@ class RadarConfigTests(unittest.TestCase):
             with self.subTest(key=repr(key)), self.assertRaises(ConfigurationError):
                 IdentityAlias(1, key, "roblox:456")
 
+    def test_identity_alias_numeric_ids_respect_json_safe_boundary(self) -> None:
+        IdentityAlias(1, f"steam:{2**53 - 1}", "roblox:1")
+
+        for invalid in (2**53, 10**400):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ConfigurationError) as captured:
+                    IdentityAlias(1, f"steam:{invalid}", "roblox:1")
+                self.assertIsInstance(captured.exception.__cause__, InputValidationError)
+
     def test_enabled_platforms_are_exact_and_ordered(self) -> None:
         for platforms in (
             [],

@@ -16,10 +16,15 @@ from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .errors import InputValidationError
+from .platform_keys import (
+    MAX_SAFE_PLATFORM_ID,
+    parse_platform_key,
+    validate_platform,
+    validate_platform_id,
+)
 
 
 _SCHEMA_VERSION = 1
-_PLATFORMS = frozenset({"itch", "steam", "roblox"})
 _RUN_MODES = frozenset({"scheduled", "manual"})
 _PHASES = frozenset({"preliminary", "final"})
 _SOURCE_STATUSES = frozenset(
@@ -40,12 +45,9 @@ _OUTSTANDING_ACTIONS = frozenset(
 )
 _AUTHOR_RELATIONS = frozenset({"independent", "developer", "unknown"})
 _MISSING_INTENTS = frozenset({"guide", "codes", "answers", "wiki"})
-MAX_SAFE_INTEGER = 2**53 - 1
+MAX_SAFE_INTEGER = MAX_SAFE_PLATFORM_ID
 _RUN_ID = re.compile(
     r"(?P<timestamp>\d{8}T\d{6}Z)-(?P<suffix>[0-9a-f]{8,32})\Z"
-)
-_PLATFORM_ID = re.compile(
-    r"[A-Za-z0-9](?:[A-Za-z0-9]|[._-](?=[A-Za-z0-9])){0,127}\Z"
 )
 _SURFACE = re.compile(
     r"[a-z0-9](?:[a-z0-9]|[_-](?=[a-z0-9])){0,63}\Z"
@@ -192,14 +194,12 @@ def _run_id(value: object) -> str:
     return parsed
 
 
-def _platform_id(value: object, name: str = "platform_id") -> str:
-    parsed = _text(value, name, 128)
-    if _PLATFORM_ID.fullmatch(parsed) is None:
-        raise _error(
-            f"{name} must be a 1-128 character safe ASCII token without "
-            "leading, trailing, or consecutive separators"
-        )
-    return parsed
+def _platform_id(
+    platform: object,
+    value: object,
+    name: str = "platform_id",
+) -> str:
+    return validate_platform_id(platform, value, name)
 
 
 def _surface(value: object, name: str = "surface") -> str:
@@ -220,10 +220,11 @@ def _parse_observation_id(value: object) -> _ObservationIdParts:
             "observation_id must be platform:platform_id:surface:timestamp"
         )
     platform, platform_id, surface, timestamp = parts
+    parsed_platform = _platform(platform)
     return _ObservationIdParts(
         raw=parsed,
-        platform=_platform(platform),
-        platform_id=_platform_id(platform_id),
+        platform=parsed_platform,
+        platform_id=_platform_id(parsed_platform, platform_id),
         surface=_surface(surface),
         observed_at=_compact_utc_timestamp(timestamp, "observation_id timestamp"),
     )
@@ -241,18 +242,15 @@ def _uuid(value: object, name: str) -> str:
 
 
 def _platform(value: object, name: str = "platform") -> str:
-    return _literal(value, name, _PLATFORMS)
+    return validate_platform(value, name)
 
 
 def _parse_platform_key(value: object) -> _PlatformKeyParts:
-    parsed = _text(value, "platform_key", 136)
-    platform, separator, platform_id = parsed.partition(":")
-    if not separator or not platform_id or ":" in platform_id:
-        raise _error("platform_key must contain a platform and platform ID")
+    platform, platform_id = parse_platform_key(value)
     return _PlatformKeyParts(
-        raw=parsed,
-        platform=_platform(platform),
-        platform_id=_platform_id(platform_id),
+        raw=f"{platform}:{platform_id}",
+        platform=platform,
+        platform_id=platform_id,
     )
 
 
@@ -613,8 +611,13 @@ class PlatformRecord:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
-        object.__setattr__(self, "platform", _platform(self.platform))
-        object.__setattr__(self, "platform_id", _platform_id(self.platform_id))
+        platform = _platform(self.platform)
+        object.__setattr__(self, "platform", platform)
+        object.__setattr__(
+            self,
+            "platform_id",
+            _platform_id(platform, self.platform_id),
+        )
         object.__setattr__(self, "name", _text(self.name, "name", 512))
         object.__setattr__(self, "developer", _optional_text(self.developer, "developer", 512))
         object.__setattr__(self, "official_domain", _optional_domain(self.official_domain, "official_domain"))
@@ -689,7 +692,7 @@ class PlatformObservation:
         object.__setattr__(self, "observation_id", observation_id.raw)
         object.__setattr__(self, "run_id", _run_id(self.run_id))
         platform = _platform(self.platform)
-        platform_id = _platform_id(self.platform_id)
+        platform_id = _platform_id(platform, self.platform_id)
         object.__setattr__(self, "platform", platform)
         object.__setattr__(self, "platform_id", platform_id)
         object.__setattr__(self, "provider", _text(self.provider, "provider", 128))

@@ -18,6 +18,11 @@ from unified_game_radar.identity import (
     normalize_name,
     platform_key,
 )
+from unified_game_radar.platform_keys import (
+    MAX_SAFE_PLATFORM_ID,
+    canonical_platform_key,
+    parse_platform_key,
+)
 from unified_game_radar.schemas import GameIdentity, PlatformRecord
 
 
@@ -99,6 +104,31 @@ class DomainNormalizationTests(unittest.TestCase):
         )
         self.assertIsNone(canonical_domain(None))
 
+    def test_unicode_and_alabel_domains_are_equivalent_under_idna_2003(self) -> None:
+        unicode_domain = canonical_domain("例え.テスト")
+        alabel_domain = canonical_domain("xn--r8jz45g.xn--zckzah")
+
+        self.assertEqual(unicode_domain, "xn--r8jz45g.xn--zckzah")
+        self.assertEqual(alabel_domain, unicode_domain)
+
+    def test_unicode_dot_separators_are_normalized_before_label_parsing(self) -> None:
+        for separator in ("\u3002", "\uff0e", "\uff61"):
+            with self.subTest(separator=repr(separator)):
+                self.assertEqual(
+                    canonical_domain(f"例え{separator}テスト"),
+                    "xn--r8jz45g.xn--zckzah",
+                )
+
+    def test_rejects_invalid_or_non_roundtripping_alabels(self) -> None:
+        for value in ("xn--a.example", "xn--strae-oqa.de"):
+            with self.subTest(value=value):
+                with self.assertRaises(InputValidationError):
+                    canonical_domain(value)
+
+    def test_idna_2003_transitional_mapping_is_documented_and_deterministic(self) -> None:
+        self.assertEqual(canonical_domain("faß.de"), "fass.de")
+        self.assertEqual(canonical_domain("straße.de"), "strasse.de")
+
     def test_rejects_non_domain_inputs(self) -> None:
         invalid = (
             "https://example.com",
@@ -137,15 +167,28 @@ class PlatformKeyTests(unittest.TestCase):
 
     def test_rejects_noncanonical_or_unbounded_identifiers(self) -> None:
         invalid = (
-            record(platform="steam", platform_id="01"),
-            record(platform="roblox", platform_id=str(2**53)),
-            record(platform="steam", platform_id="1.0"),
-            record(platform="itch", platform_id="Uppercase"),
+            ("steam", "01"),
+            ("roblox", str(2**53)),
+            ("steam", "1.0"),
+            ("itch", "Uppercase"),
         )
-        for value in invalid:
-            with self.subTest(value=value.platform_id):
+        for platform, platform_id in invalid:
+            with self.subTest(platform=platform, platform_id=platform_id):
                 with self.assertRaises(InputValidationError):
-                    platform_key(value)
+                    record(platform=platform, platform_id=platform_id)
+
+    def test_shared_platform_key_helper_round_trips_boundaries(self) -> None:
+        valid = (
+            ("steam", str(MAX_SAFE_PLATFORM_ID)),
+            ("roblox", "1"),
+            ("itch", "author-game_1.2"),
+        )
+        for platform, platform_id in valid:
+            with self.subTest(platform=platform, platform_id=platform_id):
+                key = canonical_platform_key(platform, platform_id)
+                self.assertEqual(parse_platform_key(key), (platform, platform_id))
+
+        self.assertEqual(MAX_SAFE_PLATFORM_ID, 2**53 - 1)
 
 
 class IdentityMatchingTests(unittest.TestCase):
@@ -252,6 +295,15 @@ class IdentityMatchingTests(unittest.TestCase):
         for ordering in permutations(identities):
             self.assertIsNone(match_identity(candidate, ordering))
 
+    def test_duplicate_metadata_matches_for_same_opportunity_are_stable(self) -> None:
+        candidate = record("Echo", "Studio A", "roblox", "8")
+        identities = (
+            identity_for(record("Echo", "Studio A", "steam", "1"), IDS[0]),
+            identity_for(record("Echo", "Studio A", "itch", "echo"), IDS[0]),
+        )
+
+        self.assertEqual(match_identity(candidate, identities), IDS[0])
+
     def test_ambiguous_alias_matches_return_none(self) -> None:
         candidate = record("New", "New", "roblox", "8")
         identities = (
@@ -264,6 +316,19 @@ class IdentityMatchingTests(unittest.TestCase):
         )
         self.assertIsNone(match_identity(candidate, identities, aliases))
 
+    def test_duplicate_alias_matches_for_same_opportunity_are_stable(self) -> None:
+        candidate = record("New", "New", "roblox", "8")
+        identities = (
+            identity_for(record("One", "One", "steam", "1"), IDS[0]),
+            identity_for(record("Two", "Two", "itch", "two"), IDS[0]),
+        )
+        aliases = (
+            IdentityAlias(1, "steam:1", "roblox:8"),
+            IdentityAlias(1, "itch:two", "roblox:8"),
+        )
+
+        self.assertEqual(match_identity(candidate, identities, aliases), IDS[0])
+
     def test_rejects_malformed_alias_values_instead_of_loose_parsing(self) -> None:
         candidate = record(platform="roblox", platform_id="2")
         stored = identity_for(record(platform="steam", platform_id="1"))
@@ -271,7 +336,6 @@ class IdentityMatchingTests(unittest.TestCase):
             ({"source": "steam:1", "target": "roblox:2"},),
             (object(),),
             {"steam:1": "roblox:2"},
-            (IdentityAlias(1, "steam:1", f"roblox:{2**53}"),),
         )
         for aliases in malformed_values:
             with self.subTest(aliases=aliases):

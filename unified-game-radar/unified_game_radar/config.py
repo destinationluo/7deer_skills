@@ -10,7 +10,8 @@ import re
 from typing import TYPE_CHECKING, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .errors import ConfigurationError
+from .errors import ConfigurationError, InputValidationError
+from .platform_keys import validate_platform_key
 
 if TYPE_CHECKING:
     from steam_game_radar.config import RadarConfig as SteamRadarConfig
@@ -19,15 +20,6 @@ if TYPE_CHECKING:
 _COUNTRY = re.compile(r"[A-Z]{2}", flags=re.ASCII)
 _LOCALE = re.compile(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*")
 _STEAM_LANGUAGE = re.compile(r"[a-z][a-z0-9_]*", flags=re.ASCII)
-_NUMERIC_PLATFORM_KEY = re.compile(
-    r"(?:steam|roblox):[1-9][0-9]*",
-    flags=re.ASCII,
-)
-_ITCH_IDENTIFIER = re.compile(
-    r"[a-z0-9]+(?:[-_.][a-z0-9]+)*",
-    flags=re.ASCII,
-)
-_MAX_ITCH_IDENTIFIER_LENGTH = 128
 _PLATFORM_ORDER = {"itch": 0, "steam": 1, "roblox": 2}
 
 
@@ -386,20 +378,12 @@ def _identity_aliases(value: object) -> tuple[IdentityAlias, ...]:
 
 
 def _platform_key(value: object, name: str) -> str:
-    key = _text(value, name)
-    if _NUMERIC_PLATFORM_KEY.fullmatch(key) is not None:
-        return key
-    platform, separator, identifier = key.partition(":")
-    if (
-        platform != "itch"
-        or not separator
-        or len(identifier) > _MAX_ITCH_IDENTIFIER_LENGTH
-        or _ITCH_IDENTIFIER.fullmatch(identifier) is None
-    ):
+    try:
+        return validate_platform_key(value, name)
+    except InputValidationError as error:
         raise ConfigurationError(
             f"{name} must be an exact itch, steam, or roblox platform key"
-        )
-    return key
+        ) from error
 
 
 def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

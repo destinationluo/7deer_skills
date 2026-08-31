@@ -622,9 +622,9 @@ class SchemaValidationTests(unittest.TestCase):
                 "2026-08-31T02:00:00Z",
             ),
             (
-                "roblox:game_123:up-and-coming:20260831T020000Z",
+                "roblox:123:up-and-coming:20260831T020000Z",
                 "roblox",
-                "game_123",
+                "123",
                 "up-and-coming",
                 "2026-08-31T02:00:00Z",
             ),
@@ -689,6 +689,70 @@ class SchemaValidationTests(unittest.TestCase):
                 payload[field_name] = value
                 with self.assertRaises(InputValidationError):
                     PlatformObservation.from_dict(payload)
+
+    def test_platform_records_and_observations_enforce_shared_id_boundaries(self) -> None:
+        by_type = {type(instance): instance for instance in build_instances()}
+        record_payload = by_type[PlatformRecord].to_dict()
+        observation_payload = by_type[PlatformObservation].to_dict()
+
+        for schema_type, template in (
+            (PlatformRecord, record_payload),
+            (PlatformObservation, observation_payload),
+        ):
+            accepted = dict(template)
+            accepted["platform_id"] = str(2**53 - 1)
+            if schema_type is PlatformObservation:
+                accepted["observation_id"] = (
+                    f"steam:{2**53 - 1}:most_played:20260831T020000Z"
+                )
+            self.assertEqual(
+                schema_type.from_dict(accepted).platform_id,
+                str(2**53 - 1),
+            )
+
+            for invalid in (str(2**53), str(10**400)):
+                with self.subTest(schema=schema_type.__name__, invalid=invalid):
+                    changed = dict(template)
+                    changed["platform_id"] = invalid
+                    if schema_type is PlatformObservation:
+                        changed["observation_id"] = (
+                            f"steam:{invalid}:most_played:20260831T020000Z"
+                        )
+                    with self.assertRaises(InputValidationError):
+                        schema_type.from_dict(changed)
+
+        for invalid in (str(2**53), str(10**400)):
+            changed_observation = dict(observation_payload)
+            changed_observation["observation_id"] = (
+                f"steam:{invalid}:most_played:20260831T020000Z"
+            )
+            with self.subTest(boundary="observation_id", invalid=invalid):
+                with self.assertRaises(InputValidationError):
+                    PlatformObservation.from_dict(changed_observation)
+
+        for schema_type in (PlatformHeat, NormalizedHeat):
+            template = by_type[schema_type].to_dict()
+            accepted = dict(template)
+            accepted["platform_key"] = f"steam:{2**53 - 1}"
+            accepted["observation_ids"] = [
+                f"steam:{2**53 - 1}:most_played:20260831T020000Z"
+            ]
+            self.assertEqual(
+                schema_type.from_dict(accepted).platform_key,
+                f"steam:{2**53 - 1}",
+            )
+
+            for invalid in (str(2**53), str(10**400)):
+                changed = dict(template)
+                changed["platform_key"] = f"steam:{invalid}"
+                changed["observation_ids"] = [
+                    f"steam:{invalid}:most_played:20260831T020000Z"
+                ]
+                with self.subTest(
+                    schema=schema_type.__name__, boundary="heat", invalid=invalid
+                ):
+                    with self.assertRaises(InputValidationError):
+                        schema_type.from_dict(changed)
 
     def test_heat_references_match_platform_key_and_allow_multi_surface_history(self) -> None:
         by_type = {type(instance): instance for instance in build_instances()}
