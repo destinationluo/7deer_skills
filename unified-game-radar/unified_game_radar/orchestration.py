@@ -13,7 +13,10 @@ from .collectors.base import (
     CollectorResult,
     classify_source_health,
 )
+from .collectors.itch import build_itch_observations
+from .collectors.roblox import build_roblox_observations
 from .config import RadarConfig
+from .errors import InputValidationError
 from .identity import match_identity, normalize_name, platform_key
 from .normalize import (
     ITCH_DISCOVERY,
@@ -276,7 +279,7 @@ def _collect_selected(
         warnings.extend(result.health.warnings)
         if (
             platform in _BROWSER_SURFACES
-            and result.health.status not in {"fresh", "partial"}
+            and result.health.status != "fresh"
         ):
             outstanding.append(_outstanding_browser_task(run, platform))
 
@@ -343,6 +346,29 @@ def _platform_records(
     return tuple(
         _record_from_observations(grouped[key]) for key in sorted(grouped)
     )
+
+
+def _run_observations(
+    store: RadarStore,
+    run_id: str,
+) -> tuple[PlatformObservation, ...]:
+    rows = store._fetchall(  # type: ignore[attr-defined]
+        """
+        SELECT canonical_json FROM observations
+        WHERE run_id = ?
+        ORDER BY observation_id
+        """,
+        (run_id,),
+    )
+    observations: list[PlatformObservation] = []
+    for row in rows:
+        if len(row) != 1 or not isinstance(row[0], str):
+            raise ValueError("stored observation row is invalid")
+        observation = PlatformObservation.from_dict(json.loads(row[0]))
+        if observation.run_id != run_id:
+            raise ValueError("stored observation run_id is invalid")
+        observations.append(observation)
+    return tuple(observations)
 
 
 def _merge_record(identity: GameIdentity, record: PlatformRecord) -> GameIdentity:
@@ -779,16 +805,9 @@ def _rebuild_candidates(
     config: RadarConfig,
     store: RadarStore,
     run: RadarRun,
-    results: Sequence[CollectorResult],
     id_factory: Callable[[], str],
 ) -> tuple[GameIdentity, ...]:
-    observations = tuple(
-        observation
-        for result in results
-        for observation in result.observations
-    )
-    # Pending payloads deliberately remain attached to `results` until this
-    # rebuild completes. Task 12A owns their redaction and artifact writes.
+    observations = _run_observations(store, run.run_id)
     records = _platform_records(observations)
     identities = _link_identities(config, store, records, id_factory)
     heats = _platform_heats(run, store, observations)
@@ -798,6 +817,174 @@ def _rebuild_candidates(
         normalized,
         config.preliminary_top_n,
     )
+
+
+def _run_is_finalized(store: RadarStore, run_id: str) -> bool:
+    row = store._fetchone(  # type: ignore[attr-defined]
+        """
+        SELECT 1 FROM evidence WHERE run_id = ?
+        UNION ALL
+        SELECT 1 FROM scores WHERE run_id = ?
+        LIMIT 1
+        """,
+        (run_id, run_id),
+    )
+    return row is not None
+
+
+def _ingest_target(
+    store: RadarStore,
+    run_id: object,
+    envelope: object,
+) -> tuple[RadarRun, str]:
+    if not isinstance(run_id, str):
+        raise InputValidationError("run_id must be text")
+    run = store.get_run(run_id)
+    if run is None:
+        raise InputValidationError("ingest run was not found")
+    if _run_is_finalized(store, run.run_id):
+        raise InputValidationError("ingest run is finalized")
+    if not isinstance(envelope, Mapping):
+        raise InputValidationError("browser envelope must be a mapping")
+    if envelope.get("run_id") != run.run_id:
+        raise InputValidationError("browser envelope run_id must match ingest run_id")
+    collector = validate_platform(envelope.get("collector"), "collector")
+    if collector not in _BROWSER_SURFACES:
+        raise InputValidationError("collector must be itch or roblox")
+    if collector not in run.platforms:
+        raise InputValidationError("originating run did not select collector")
+    return run, collector
+
+
+def _parse_browser_observations(
+    run: RadarRun,
+    collector: str,
+    envelope: Mapping[str, object],
+    parser_registry: Mapping[
+        str,
+        Callable[[object, RadarRun], object],
+    ],
+) -> tuple[PlatformObservation, ...]:
+    parser = parser_registry.get(collector)
+    if not callable(parser):
+        raise InputValidationError(
+            f"browser parser is not configured for {collector}"
+        )
+    parsed = parser(envelope, run)
+    if collector == "itch":
+        observations = build_itch_observations(run, parsed)  # type: ignore[arg-type]
+    else:
+        observations = build_roblox_observations(run, parsed)  # type: ignore[arg-type]
+    if any(
+        observation.run_id != run.run_id
+        or observation.platform != collector
+        for observation in observations
+    ):
+        raise InputValidationError(
+            "parsed browser observations do not match the ingest target"
+        )
+    return observations
+
+
+def _browser_capabilities(
+    collector: str,
+    observations: Sequence[PlatformObservation],
+) -> dict[str, bool]:
+    global_surfaces = {
+        observation.surface
+        for observation in observations
+        if observation.query_parameters.get("surface_scope") == "global"
+    }
+    return {
+        surface: surface in global_surfaces
+        for surface in _BROWSER_SURFACES[collector]
+    }
+
+
+def _active_ingest_observations(
+    store: RadarStore,
+    run: RadarRun,
+    collector: str,
+    observations: Sequence[PlatformObservation],
+) -> tuple[PlatformObservation, ...]:
+    by_id = {
+        observation.observation_id: observation
+        for observation in _run_observations(store, run.run_id)
+        if observation.platform == collector
+    }
+    for observation in observations:
+        by_id[observation.observation_id] = observation
+    return tuple(by_id[key] for key in sorted(by_id))
+
+
+def _ingest_health(
+    config: RadarConfig,
+    store: RadarStore,
+    run: RadarRun,
+    collector: str,
+    observations: Sequence[PlatformObservation],
+    now: datetime,
+) -> SourceHealth:
+    return classify_source_health(
+        run_id=run.run_id,
+        now=now,
+        attempted=True,
+        active_observations=observations,
+        capabilities=_browser_capabilities(collector, observations),
+        fallback_observed_at=_latest_observed_at(
+            store,
+            collector,
+            run.started_at,
+        ),
+        warnings=(),
+        fresh_hours=config.fresh_hours,
+        stale_fallback_hours=config.stale_fallback_hours,
+        collector=collector,
+    )
+
+
+def _persist_ingest(
+    store: RadarStore,
+    observations: Sequence[PlatformObservation],
+    health: SourceHealth,
+) -> None:
+    with store.transaction():
+        for observation in observations:
+            store.insert_observation(observation)
+        store.save_source_health(health)
+
+
+def _result_context(
+    store: RadarStore,
+    run: RadarRun,
+) -> tuple[
+    tuple[SourceHealth, ...],
+    tuple[WarningRecord, ...],
+    tuple[OutstandingTask, ...],
+]:
+    health_rows = tuple(
+        health
+        for platform in run.platforms
+        if (health := store.get_source_health(run.run_id, platform)) is not None
+    )
+    warnings = tuple(
+        warning
+        for health in health_rows
+        for warning in health.warnings
+    )
+    health_by_collector = {
+        health.collector: health for health in health_rows
+    }
+    outstanding = tuple(
+        _outstanding_browser_task(run, platform)
+        for platform in run.platforms
+        if platform in _BROWSER_SURFACES
+        and (
+            platform not in health_by_collector
+            or health_by_collector[platform].status != "fresh"
+        )
+    )
+    return health_rows, warnings, outstanding
 
 
 def scan_run(
@@ -841,7 +1028,6 @@ def scan_run(
         config,
         store,
         run,
-        results,
         id_factory,
     )
     return PreliminaryResult(
@@ -854,4 +1040,62 @@ def scan_run(
     )
 
 
-__all__ = ["scan_run"]
+def ingest_run(
+    config: RadarConfig,
+    store: RadarStore,
+    run_id: str,
+    envelope: Mapping[str, object],
+    parser_registry: Mapping[
+        str,
+        Callable[[object, RadarRun], object],
+    ],
+    clock: Callable[[], datetime],
+    id_factory: Callable[[], str],
+) -> PreliminaryResult:
+    """Persist one strict browser envelope and deterministically rebuild."""
+
+    if not isinstance(config, RadarConfig):
+        raise TypeError("config must be RadarConfig")
+    if not isinstance(store, RadarStore):
+        raise TypeError("store must be RadarStore")
+    if not isinstance(parser_registry, Mapping):
+        raise TypeError("parser_registry must be a mapping")
+    if not callable(clock) or not callable(id_factory):
+        raise TypeError("clock and id_factory must be callable")
+
+    run, collector = _ingest_target(store, run_id, envelope)
+    now = _utc_seconds(clock(), "clock")
+    observations = _parse_browser_observations(
+        run,
+        collector,
+        envelope,
+        parser_registry,
+    )
+    active_observations = _active_ingest_observations(
+        store,
+        run,
+        collector,
+        observations,
+    )
+    health = _ingest_health(
+        config,
+        store,
+        run,
+        collector,
+        active_observations,
+        now,
+    )
+    _persist_ingest(store, observations, health)
+    candidates = _rebuild_candidates(config, store, run, id_factory)
+    health_rows, warnings, outstanding = _result_context(store, run)
+    return PreliminaryResult(
+        schema_version=1,
+        run_id=run.run_id,
+        candidates=candidates,
+        source_health=health_rows,
+        warnings=warnings,
+        outstanding_tasks=outstanding,
+    )
+
+
+__all__ = ["ingest_run", "scan_run"]
