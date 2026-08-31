@@ -293,6 +293,228 @@ class ArtifactTests(unittest.TestCase):
             self.persist({"safe": 2})
         self.assertEqual(path.read_bytes(), canonical_bytes({"safe": 1}))
 
+    @unittest.skipUnless(os.name == "posix", "secure descriptor assertions need POSIX")
+    def test_identical_retry_revalidates_the_returned_pathname(self) -> None:
+        artifact = self.persist({"safe": 1})
+        destination = Path(artifact.path)
+        provider_dir = destination.parent
+        moved_provider_dir = provider_dir.with_name("steam_official-moved")
+        real_read_existing_at = artifacts_module._read_existing_at
+        swapped = False
+
+        def swap_provider_then_read(
+            parent_descriptor: int,
+            name: str,
+            expected: bytes,
+        ):
+            nonlocal swapped
+            if not swapped:
+                provider_dir.rename(moved_provider_dir)
+                provider_dir.mkdir()
+                (provider_dir / name).write_bytes(b"poison")
+                swapped = True
+            return real_read_existing_at(parent_descriptor, name, expected)
+
+        with mock.patch(
+            "unified_game_radar.artifacts._read_existing_at",
+            side_effect=swap_provider_then_read,
+        ), self.assertRaises(PersistenceError):
+            self.persist({"safe": 1})
+
+        self.assertEqual(destination.read_bytes(), b"poison")
+        self.assertEqual(
+            (moved_provider_dir / destination.name).read_bytes(),
+            canonical_bytes({"safe": 1}),
+        )
+
+    @unittest.skipUnless(os.name == "posix", "secure descriptor assertions need POSIX")
+    def test_new_install_revalidates_path_after_temporary_cleanup(self) -> None:
+        provider_dir = (
+            self.root / "data/raw" / RUN_ID / "steam_official"
+        )
+        moved_provider_dir = provider_dir.with_name("steam_official-moved")
+        destination_name = "steam_store.json"
+        real_cleanup = artifacts_module._cleanup_temporary_file
+        swapped = False
+
+        def cleanup_then_swap(
+            parent_descriptor: int,
+            name: str,
+            *args: object,
+        ) -> None:
+            nonlocal swapped
+            real_cleanup(parent_descriptor, name, *args)
+            if not swapped:
+                provider_dir.rename(moved_provider_dir)
+                provider_dir.mkdir()
+                (provider_dir / destination_name).write_bytes(b"poison")
+                swapped = True
+
+        with mock.patch(
+            "unified_game_radar.artifacts._cleanup_temporary_file",
+            side_effect=cleanup_then_swap,
+        ), self.assertRaises(PersistenceError):
+            self.persist({"safe": True})
+
+        self.assertEqual((provider_dir / destination_name).read_bytes(), b"poison")
+        self.assertEqual(
+            (moved_provider_dir / destination_name).read_bytes(),
+            canonical_bytes({"safe": True}),
+        )
+
+    @unittest.skipUnless(os.name == "posix", "secure descriptor assertions need POSIX")
+    def test_failed_install_cleanup_never_unlinks_a_concurrent_replacement(
+        self,
+    ) -> None:
+        destination_name = "steam_store.json"
+        moved_name = "installed-by-this-call.json"
+        replacement = b"unrelated-replacement"
+        real_cleanup = artifacts_module._cleanup_installed_artifact
+        replaced = False
+
+        def replace_before_cleanup(
+            parent_descriptor: int,
+            name: str,
+            *args: object,
+        ) -> None:
+            nonlocal replaced
+            if not replaced:
+                os.rename(
+                    name,
+                    moved_name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                )
+                descriptor = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+                try:
+                    os.write(descriptor, replacement)
+                finally:
+                    os.close(descriptor)
+                replaced = True
+            real_cleanup(parent_descriptor, name, *args)
+
+        with mock.patch(
+            "unified_game_radar.artifacts._verify_installed_artifact",
+            side_effect=PersistenceError("injected verification failure"),
+        ), mock.patch(
+            "unified_game_radar.artifacts._cleanup_installed_artifact",
+            side_effect=replace_before_cleanup,
+        ), self.assertRaises(PersistenceError):
+            self.persist({"safe": True})
+
+        provider_dir = (
+            self.root / "data/raw" / RUN_ID / "steam_official"
+        )
+        self.assertTrue(replaced)
+        self.assertEqual((provider_dir / destination_name).read_bytes(), replacement)
+        self.assertEqual(
+            (provider_dir / moved_name).read_bytes(),
+            canonical_bytes({"safe": True}),
+        )
+
+    @unittest.skipUnless(os.name == "posix", "secure descriptor assertions need POSIX")
+    def test_temporary_cleanup_never_unlinks_a_concurrent_replacement(self) -> None:
+        replacement = b"unrelated-temporary-replacement"
+        real_cleanup = artifacts_module._cleanup_temporary_file
+        replacement_name: str | None = None
+
+        def replace_before_cleanup(
+            parent_descriptor: int,
+            name: str,
+            *args: object,
+        ) -> None:
+            nonlocal replacement_name
+            moved_name = f"{name}.installed-by-this-call"
+            os.rename(
+                name,
+                moved_name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+            try:
+                os.write(descriptor, replacement)
+            finally:
+                os.close(descriptor)
+            replacement_name = name
+            real_cleanup(parent_descriptor, name, *args)
+
+        with mock.patch(
+            "unified_game_radar.artifacts._cleanup_temporary_file",
+            side_effect=replace_before_cleanup,
+        ):
+            artifact = self.persist({"safe": True})
+
+        provider_dir = Path(artifact.path).parent
+        self.assertIsNotNone(replacement_name)
+        self.assertEqual(
+            (provider_dir / str(replacement_name)).read_bytes(),
+            replacement,
+        )
+        self.assertEqual(
+            Path(artifact.path).read_bytes(),
+            canonical_bytes({"safe": True}),
+        )
+
+    @unittest.skipUnless(os.name == "posix", "secure descriptor assertions need POSIX")
+    def test_poisoned_link_is_removed_from_the_official_name_when_unlink_fails(
+        self,
+    ) -> None:
+        outside = self.root / "outside.json"
+        outside.write_bytes(b"poison")
+        destination_name = "steam_store.json"
+        real_link = os.link
+        real_unlink = os.unlink
+
+        def replace_temporary_before_link(
+            source: object,
+            target: object,
+            **kwargs: object,
+        ) -> None:
+            source_dir_fd = kwargs["src_dir_fd"]
+            real_unlink(source, dir_fd=source_dir_fd)  # type: ignore[arg-type]
+            os.symlink(outside, source, dir_fd=source_dir_fd)
+            real_link(source, target, **kwargs)
+
+        def reject_retired_unlink(path: object, **kwargs: object) -> None:
+            if str(path).endswith(".cleanup.tmp"):
+                raise OSError("injected retired-entry unlink failure")
+            real_unlink(path, **kwargs)  # type: ignore[arg-type]
+
+        with mock.patch(
+            "unified_game_radar.artifacts.os.link",
+            side_effect=replace_temporary_before_link,
+        ), mock.patch(
+            "unified_game_radar.artifacts.os.unlink",
+            side_effect=reject_retired_unlink,
+        ), self.assertRaises(PersistenceError):
+            self.persist({"safe": True})
+
+        destination = (
+            self.root
+            / "data/raw"
+            / RUN_ID
+            / "steam_official"
+            / destination_name
+        )
+        self.assertFalse(os.path.lexists(destination))
+        self.assertEqual(outside.read_bytes(), b"poison")
+
+        recovered = self.persist({"safe": True})
+
+        self.assertEqual(Path(recovered.path), destination)
+        self.assertEqual(destination.read_bytes(), canonical_bytes({"safe": True}))
+
     def test_persist_enforces_original_and_redacted_byte_limits(self) -> None:
         with self.assertRaises(InputValidationError):
             self.persist(

@@ -402,18 +402,29 @@ def _atomic_install(
     lock_descriptor: int | None = None
     temporary_descriptor: int | None = None
     temporary_name: str | None = None
+    temporary_status: os.stat_result | None = None
     installed_status: os.stat_result | None = None
+    committed_status: os.stat_result | None = None
     committed = False
     try:
         _require_secure_install_support()
         _validate_write_confinement(confinement)
         parent_descriptor = _open_write_parent(confinement)
         lock_descriptor = _lock_provider_budget(parent_descriptor)
-        if _read_existing_at(
+        existing_status = _read_existing_at(
             parent_descriptor,
             destination.name,
             serialized,
-        ) is True:
+        )
+        if existing_status is not None:
+            _verify_returned_artifact(
+                destination,
+                confinement,
+                parent_descriptor,
+                existing_status,
+                serialized,
+            )
+            committed_status = existing_status
             committed = True
             return
         current_usage = _provider_usage(parent_descriptor)
@@ -442,17 +453,39 @@ def _atomic_install(
                 follow_symlinks=False,
             )
         except FileExistsError:
-            if _read_existing_at(
+            existing_status = _read_existing_at(
                 parent_descriptor,
                 destination.name,
                 serialized,
-            ) is True:
+            )
+            if existing_status is not None:
+                _verify_returned_artifact(
+                    destination,
+                    confinement,
+                    parent_descriptor,
+                    existing_status,
+                    serialized,
+                )
+                committed_status = existing_status
                 committed = True
                 return
             raise PersistenceError(
                 "raw artifact destination changed during installation"
             )
         installed_status = temporary_status
+        linked_destination = os.stat(
+            destination.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        linked_source = os.stat(
+            temporary_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not _same_entry_identity(linked_destination, linked_source):
+            raise PersistenceError("raw artifact installed link identity is unsafe")
+        installed_status = linked_destination
         _verify_installed_artifact(
             parent_descriptor,
             destination.name,
@@ -471,6 +504,14 @@ def _atomic_install(
             temporary_status,
             serialized,
         )
+        _verify_returned_artifact(
+            destination,
+            confinement,
+            parent_descriptor,
+            temporary_status,
+            serialized,
+        )
+        committed_status = temporary_status
         committed = True
     except (IdempotencyConflictError, PersistenceError):
         raise
@@ -487,14 +528,35 @@ def _atomic_install(
             _cleanup_installed_artifact(
                 parent_descriptor,
                 destination.name,
+                installed_status,
                 cleanup_errors,
             )
-        if temporary_name is not None and parent_descriptor is not None:
+        if (
+            temporary_name is not None
+            and temporary_status is not None
+            and parent_descriptor is not None
+        ):
             _cleanup_temporary_file(
                 parent_descriptor,
                 temporary_name,
+                temporary_status,
                 cleanup_errors,
             )
+        if (
+            committed
+            and committed_status is not None
+            and parent_descriptor is not None
+        ):
+            try:
+                _verify_returned_artifact(
+                    destination,
+                    confinement,
+                    parent_descriptor,
+                    committed_status,
+                    serialized,
+                )
+            except (PersistenceError, OSError) as error:
+                cleanup_errors.append(error)
         for descriptor in (
             temporary_descriptor,
             lock_descriptor,
@@ -624,9 +686,16 @@ def _provider_usage(parent_descriptor: int) -> int:
         names = sorted(entry.name for entry in entries)
     for name in names:
         status = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if name.endswith(".tmp"):
+            if not (
+                stat.S_ISREG(status.st_mode)
+                or stat.S_ISLNK(status.st_mode)
+            ):
+                raise PersistenceError("unsafe raw provider temporary entry")
+            continue
         if stat.S_ISLNK(status.st_mode):
             raise PersistenceError("unsafe symlink found in raw provider directory")
-        if name == _BUDGET_LOCK_NAME or name.endswith(".tmp"):
+        if name == _BUDGET_LOCK_NAME:
             if not stat.S_ISREG(status.st_mode):
                 raise PersistenceError("unsafe raw provider control file")
             continue
@@ -679,7 +748,7 @@ def _read_existing_at(
     parent_descriptor: int,
     name: str,
     expected: bytes,
-) -> bool | None:
+) -> os.stat_result | None:
     try:
         descriptor = os.open(name, _file_open_flags(), dir_fd=parent_descriptor)
     except FileNotFoundError:
@@ -709,7 +778,7 @@ def _read_existing_at(
                 "existing raw artifact descriptor cleanup also failed",
             )
     if actual == expected:
-        return True
+        return status
     raise IdempotencyConflictError(
         "raw artifact path was reused with changed content"
     )
@@ -754,6 +823,61 @@ def _verify_installed_artifact(
         raise PersistenceError("installed raw artifact path changed")
 
 
+def _verify_returned_artifact(
+    destination: Path,
+    confinement: _WriteConfinement,
+    parent_descriptor: int,
+    expected_status: os.stat_result,
+    expected: bytes,
+) -> None:
+    """Revalidate the caller-visible pathname immediately before success."""
+
+    descriptor: int | None = None
+    try:
+        _validate_write_confinement(confinement)
+        descriptor = os.open(destination, _file_open_flags())
+        opened = os.fstat(descriptor)
+        if not _same_regular_inode(expected_status, opened):
+            raise PersistenceError("returned raw artifact identity is unsafe")
+        actual = _read_bounded(descriptor, len(expected) + 1)
+        if (
+            actual != expected
+            or hashlib.sha256(actual).digest()
+            != hashlib.sha256(expected).digest()
+        ):
+            raise PersistenceError("returned raw artifact content is unsafe")
+        visible = destination.lstat()
+        anchored = os.stat(
+            destination.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not _same_regular_inode(expected_status, visible)
+            or not _same_regular_inode(expected_status, anchored)
+        ):
+            raise PersistenceError("returned raw artifact path changed")
+        _validate_write_confinement(confinement)
+    except PersistenceError:
+        raise
+    except OSError as error:
+        raise PersistenceError("unable to validate returned raw artifact") from error
+    finally:
+        if descriptor is not None:
+            primary_error = sys.exc_info()[1]
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if primary_error is None:
+                    raise PersistenceError(
+                        "unable to close returned raw artifact safely"
+                    ) from error
+                _add_cleanup_note(
+                    primary_error,
+                    "returned raw artifact descriptor cleanup also failed",
+                )
+
+
 def _read_bounded(descriptor: int, maximum: int) -> bytes:
     chunks: list[bytes] = []
     remaining = maximum
@@ -777,9 +901,49 @@ def _same_regular_inode(
     )
 
 
+def _same_entry_identity(
+    expected: os.stat_result,
+    actual: os.stat_result,
+) -> bool:
+    return (
+        stat.S_IFMT(expected.st_mode) == stat.S_IFMT(actual.st_mode)
+        and expected.st_dev == actual.st_dev
+        and expected.st_ino == actual.st_ino
+    )
+
+
 def _cleanup_installed_artifact(
     parent_descriptor: int,
     name: str,
+    expected_status: os.stat_result,
+    errors: list[BaseException],
+) -> None:
+    _retire_owned_entry(
+        parent_descriptor,
+        name,
+        expected_status,
+        errors,
+    )
+
+
+def _cleanup_temporary_file(
+    parent_descriptor: int,
+    name: str,
+    expected_status: os.stat_result,
+    errors: list[BaseException],
+) -> None:
+    _retire_owned_entry(
+        parent_descriptor,
+        name,
+        expected_status,
+        errors,
+    )
+
+
+def _retire_owned_entry(
+    parent_descriptor: int,
+    name: str,
+    expected_status: os.stat_result,
     errors: list[BaseException],
 ) -> None:
     try:
@@ -789,23 +953,76 @@ def _cleanup_installed_artifact(
     except OSError as error:
         errors.append(error)
         return
-    try:
-        os.unlink(name, dir_fd=parent_descriptor)
-    except OSError as error:
-        errors.append(error)
+    if not _same_entry_identity(expected_status, visible):
+        return
 
-
-def _cleanup_temporary_file(
-    parent_descriptor: int,
-    name: str,
-    errors: list[BaseException],
-) -> None:
+    retired_name = _unused_retired_name(parent_descriptor, name, errors)
+    if retired_name is None:
+        return
     try:
-        os.unlink(name, dir_fd=parent_descriptor)
+        os.rename(
+            name,
+            retired_name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
     except FileNotFoundError:
         return
     except OSError as error:
         errors.append(error)
+        return
+
+    try:
+        retired = os.stat(
+            retired_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        errors.append(error)
+        return
+    if not _same_entry_identity(expected_status, retired):
+        errors.append(PersistenceError("raw artifact cleanup identity changed"))
+        return
+
+    try:
+        still_owned = os.stat(
+            retired_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not _same_entry_identity(expected_status, still_owned):
+            errors.append(PersistenceError("raw artifact cleanup identity changed"))
+            return
+        os.unlink(retired_name, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        errors.append(error)
+
+
+def _unused_retired_name(
+    parent_descriptor: int,
+    name: str,
+    errors: list[BaseException],
+) -> str | None:
+    for _ in range(128):
+        candidate = f".{name}.{secrets.token_hex(16)}.cleanup.tmp"
+        try:
+            os.stat(
+                candidate,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return candidate
+        except OSError as error:
+            errors.append(error)
+            return None
+    errors.append(PersistenceError("unable to allocate raw cleanup pathname"))
+    return None
 
 
 def _raise_or_note_cleanup_errors(
