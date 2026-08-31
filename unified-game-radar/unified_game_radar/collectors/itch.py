@@ -9,7 +9,7 @@ actions.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 import re
@@ -208,19 +208,19 @@ def _game_url(value: object) -> tuple[str, str]:
     parsed, hostname = _itch_url(value, "game_url")
     split = urlsplit(parsed)
     host_parts = hostname.split(".")
-    path = split.path.strip("/")
+    path_match = re.fullmatch(r"/([^/]+)/?", split.path)
     if (
         len(host_parts) != 3
         or host_parts[-2:] != ["itch", "io"]
         or host_parts[0] in {"www", "itch"}
-        or not path
-        or "/" in path
+        or path_match is None
         or split.query
         or split.fragment
         or "?" in parsed
         or "#" in parsed
     ):
         raise _invalid("game_url must be a canonical creator.itch.io/game-slug URL")
+    path = path_match.group(1)
     platform_id = f"{host_parts[0]}.{path}"
     try:
         platform_id = validate_platform_id("itch", platform_id)
@@ -397,6 +397,20 @@ def _deduplicate_rows(rows: Sequence[ItchBrowserRow]) -> tuple[ItchBrowserRow, .
     return tuple(unique)
 
 
+def _validated_envelope_rows(
+    run: RadarRun,
+    envelope: ItchBrowserEnvelope,
+) -> tuple[ItchBrowserRow, ...]:
+    """Recheck run-bound invariants at every untrusted construction boundary."""
+
+    if envelope.observed_at < run.started_at:
+        raise _invalid("itch envelope observed_at must not precede run started_at")
+    for row in envelope.rows:
+        if row.observed_at != envelope.observed_at:
+            raise _invalid("row observed_at must match envelope observed_at")
+    return _deduplicate_rows(envelope.rows)
+
+
 def parse_itch_envelope(
     value: object,
     run: RadarRun,
@@ -416,7 +430,7 @@ def parse_itch_envelope(
         raise _invalid("rows must be an array")
     if len(payload["rows"]) > MAX_ROWS:
         raise _invalid(f"rows must not contain more than {MAX_ROWS} records")
-    rows = _deduplicate_rows(tuple(_parse_row(item) for item in payload["rows"]))
+    rows = tuple(_parse_row(item) for item in payload["rows"])
     envelope = ItchBrowserEnvelope(
         schema_version=payload["schema_version"],  # type: ignore[arg-type]
         run_id=payload["run_id"],  # type: ignore[arg-type]
@@ -427,8 +441,9 @@ def parse_itch_envelope(
         observed_at=_utc_seconds(payload["observed_at"], "envelope observed_at"),
         rows=rows,
     )
-    if envelope.observed_at < run.started_at:
-        raise _invalid("itch envelope observed_at must not precede run started_at")
+    validated_rows = _validated_envelope_rows(run, envelope)
+    if validated_rows != envelope.rows:
+        envelope = replace(envelope, rows=validated_rows)
     return envelope
 
 
@@ -474,8 +489,9 @@ def build_itch_observations(
     if "itch" not in run.platforms:
         raise _invalid("originating run did not select itch")
 
+    rows = _validated_envelope_rows(run, envelope)
     observations: list[PlatformObservation] = []
-    for row in envelope.rows:
+    for row in rows:
         _, platform_id = _game_url(row.game_url)
         collector_eligible, author_non_spam, exclusion_reasons = _eligibility(row)
         observation_id = (

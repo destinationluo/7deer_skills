@@ -218,6 +218,9 @@ class ItchRowValidationTests(unittest.TestCase):
         for value in (
             "https://itch.io/signal-garden",
             "https://tiny-studio.itch.io/",
+            "https://tiny-studio.itch.io///signal-garden///",
+            "https://tiny-studio.itch.io//signal-garden",
+            "https://tiny-studio.itch.io/signal-garden//",
             "https://tiny-studio.itch.io/signal-garden/devlog",
             "https://tiny-studio.itch.io/signal-garden?ref=feed",
             "https://tiny-studio.itch.io/signal-garden#comments",
@@ -374,6 +377,39 @@ class ItchObservationBuildTests(unittest.TestCase):
                 radar_run(),
                 replace(parsed, collector="steam"),
             )
+
+    def test_build_rejects_a_direct_envelope_that_precedes_the_run(self) -> None:
+        parsed = parse_itch_envelope(valid_envelope(), radar_run())
+        before_run = datetime(2026, 8, 31, 1, 59, 59, tzinfo=timezone.utc)
+        direct = replace(
+            parsed,
+            observed_at=before_run,
+            rows=(replace(parsed.rows[0], observed_at=before_run),),
+        )
+
+        with self.assertRaises(InputValidationError):
+            build_itch_observations(radar_run(), direct)
+
+    def test_build_deduplicates_identical_direct_rows_and_rejects_conflicts(self) -> None:
+        parsed = parse_itch_envelope(valid_envelope(), radar_run())
+        identical = ItchBrowserEnvelope(
+            schema_version=parsed.schema_version,
+            run_id=parsed.run_id,
+            collector=parsed.collector,
+            geo=parsed.geo,
+            locale=parsed.locale,
+            metric_definition_version=parsed.metric_definition_version,
+            observed_at=parsed.observed_at,
+            rows=(parsed.rows[0], parsed.rows[0]),
+        )
+        self.assertEqual(len(build_itch_observations(radar_run(), identical)), 1)
+
+        conflict = replace(
+            parsed,
+            rows=(parsed.rows[0], replace(parsed.rows[0], rank=4)),
+        )
+        with self.assertRaises(InputValidationError):
+            build_itch_observations(radar_run(), conflict)
 
 
 if __name__ == "__main__":
