@@ -784,17 +784,38 @@ class FinalOrchestrationTests(unittest.TestCase):
                             players=0,
                         ),
                     ),
-                )
+                ),
+                "steam": FixtureCollector(
+                    "steam",
+                    lambda run: (
+                        observation(
+                            run,
+                            platform="steam",
+                            platform_id="901",
+                            name="Cross Platform Signal Updated",
+                            rank=1,
+                            players=25_000,
+                        ),
+                    ),
+                ),
             },
             lambda: future_started_at,
             unexpected_identity,
-            ("itch",),
+            ("itch", "steam"),
             started_at=future_started_at,
             run_id="20260901T080000Z-22222222",
         )
         self.assertEqual(
             future_run.candidates[0].opportunity_id,
             first_run.candidates[0].opportunity_id,
+        )
+        identity_state = self.store._fetchall(
+            "SELECT opportunity_id, canonical_json FROM game_identities "
+            "ORDER BY opportunity_id"
+        )
+        platform_state = self.store._fetchall(
+            "SELECT platform, platform_id, opportunity_id, canonical_json "
+            "FROM platform_records ORDER BY platform, platform_id"
         )
 
         rebuilt = report_run(
@@ -805,6 +826,20 @@ class FinalOrchestrationTests(unittest.TestCase):
         )
 
         self.assertEqual(Path(rebuilt.report_json).read_bytes(), first_bytes)
+        self.assertEqual(
+            self.store._fetchall(
+                "SELECT opportunity_id, canonical_json FROM game_identities "
+                "ORDER BY opportunity_id"
+            ),
+            identity_state,
+        )
+        self.assertEqual(
+            self.store._fetchall(
+                "SELECT platform, platform_id, opportunity_id, canonical_json "
+                "FROM platform_records ORDER BY platform, platform_id"
+            ),
+            platform_state,
+        )
 
 
 if __name__ == "__main__":

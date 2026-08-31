@@ -516,34 +516,75 @@ def _project_identities_to_run_records(
             continue
         current_records = tuple(records_by_key[key] for key in current_keys)
         projected_keys.update(current_keys)
-        projected.append(
-            GameIdentity(
-                schema_version=1,
-                opportunity_id=identity.opportunity_id,
-                name=identity.name,
-                normalized_name=identity.normalized_name,
-                developer=next(
-                    (
-                        record.developer
-                        for record in current_records
-                        if record.developer is not None
-                    ),
-                    None,
-                ),
-                official_domain=next(
-                    (
-                        record.official_domain
-                        for record in current_records
-                        if record.official_domain is not None
-                    ),
-                    None,
-                ),
-                platform_records=current_records,
-            )
-        )
+        projected.append(_run_scoped_identity(identity, current_records))
     if projected_keys != set(records_by_key):
         raise ValueError("run platform records must all have a linked identity")
     return tuple(projected)
+
+
+def _run_scoped_identity(
+    identity: GameIdentity,
+    records: Sequence[PlatformRecord],
+) -> GameIdentity:
+    current_records = tuple(sorted(records, key=platform_key))
+    if not current_records:
+        raise ValueError("run-scoped identity requires platform records")
+    return GameIdentity(
+        schema_version=1,
+        opportunity_id=identity.opportunity_id,
+        name=identity.name,
+        normalized_name=identity.normalized_name,
+        developer=next(
+            (
+                record.developer
+                for record in current_records
+                if record.developer is not None
+            ),
+            None,
+        ),
+        official_domain=next(
+            (
+                record.official_domain
+                for record in current_records
+                if record.official_domain is not None
+            ),
+            None,
+        ),
+        platform_records=current_records,
+    )
+
+
+def _load_run_linked_identities(
+    store: RadarStore,
+    records: Sequence[PlatformRecord],
+) -> tuple[GameIdentity, ...]:
+    identities_by_id = {
+        identity.opportunity_id: identity for identity in _load_identities(store)
+    }
+    records_by_identity: dict[str, list[PlatformRecord]] = {}
+    for record in records:
+        row = store._fetchone(  # type: ignore[attr-defined]
+            """
+            SELECT opportunity_id FROM platform_records
+            WHERE platform = ? AND platform_id = ?
+            """,
+            (record.platform, record.platform_id),
+        )
+        if (
+            row is None
+            or len(row) != 1
+            or not isinstance(row[0], str)
+            or row[0] not in identities_by_id
+        ):
+            raise ValueError("persisted run record has no valid identity binding")
+        records_by_identity.setdefault(row[0], []).append(record)
+    return tuple(
+        _run_scoped_identity(
+            identities_by_id[opportunity_id],
+            records_by_identity[opportunity_id],
+        )
+        for opportunity_id in sorted(records_by_identity)
+    )
 
 
 def _number(value: object) -> float | None:
@@ -946,13 +987,18 @@ def _rebuild_scoring_context(
     store: RadarStore,
     run: RadarRun,
     id_factory: Callable[[], str],
+    *,
+    persist_identity_links: bool = True,
 ) -> tuple[tuple[GameIdentity, ...], dict[str, float]]:
     observations = _verified_run_observations(store, run)
     records = _platform_records(observations)
-    identities = _project_identities_to_run_records(
-        _link_identities(config, store, records, id_factory),
-        records,
-    )
+    if persist_identity_links:
+        identities = _project_identities_to_run_records(
+            _link_identities(config, store, records, id_factory),
+            records,
+        )
+    else:
+        identities = _load_run_linked_identities(store, records)
     heats = _platform_heats(run, store, observations)
     normalized = _normalized_heats(heats, config.heat_floor)
     candidates = _select_candidates(
@@ -1213,6 +1259,7 @@ def _persisted_preliminary_result(
         store,
         run,
         _existing_identity_only,
+        persist_identity_links=False,
     )
     health, warnings, outstanding = _result_context(store, run)
     return (
