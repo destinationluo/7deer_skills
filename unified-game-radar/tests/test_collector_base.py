@@ -379,6 +379,32 @@ class CollectorContractTests(unittest.TestCase):
                 with self.assertRaises(InputValidationError):
                     PendingRawPayload(**{**valid, **invalid})
 
+    def test_pending_payload_secrets_are_excluded_from_record_reprs(self) -> None:
+        secret_values = (
+            "top-secret-token-value",
+            "private-cookie-value",
+        )
+        pending = make_pending_payload(
+            payload={
+                "token": secret_values[0],
+                "headers": {"cookie": secret_values[1]},
+            }
+        )
+        result = CollectorResult(
+            collector="steam",
+            observations=(make_observation(),),
+            health=make_health(),
+            raw_artifacts=(),
+            pending_raw_payloads=(pending,),
+        )
+
+        for rendered in (repr(pending), repr(result)):
+            with self.subTest(rendered=rendered):
+                self.assertNotIn("token", rendered)
+                self.assertNotIn("cookie", rendered)
+                for secret in secret_values:
+                    self.assertNotIn(secret, rendered)
+
 
 class SourceHealthClassificationTests(unittest.TestCase):
     def test_empty_not_attempted_is_not_run(self) -> None:

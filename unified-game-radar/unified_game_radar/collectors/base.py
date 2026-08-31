@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import math
 import re
@@ -232,7 +232,7 @@ class PendingRawPayload:
     provider: str
     artifact_name: str
     observed_at: datetime
-    payload: object
+    payload: object = field(repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_id", _pending_run_id(self.run_id))
