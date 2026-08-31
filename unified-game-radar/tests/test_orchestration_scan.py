@@ -499,6 +499,212 @@ class ScanRunTests(unittest.TestCase):
             ("History Rocket", "Steady Itch"),
         )
 
+    def test_roblox_counts_one_two_and_three_compatible_daily_appearances(self) -> None:
+        def collector() -> FixtureCollector:
+            return FixtureCollector(
+                "roblox",
+                lambda run: (
+                    observation(
+                        run,
+                        platform="roblox",
+                        platform_id="41",
+                        name="Persistent Roblox",
+                        developer="Studio R",
+                        surface="rising",
+                        rank=50,
+                        raw_metrics={"concurrent_players": 100},
+                    ),
+                ),
+            )
+
+        first = scan_run(
+            config(self.root, heat_floor=19),
+            self.store,
+            {"roblox": collector()},
+            lambda: NOW - timedelta(hours=48),
+            SequenceIdFactory(),
+            ("roblox",),
+        )
+        second = scan_run(
+            config(self.root, heat_floor=19),
+            self.store,
+            {"roblox": collector()},
+            lambda: NOW - timedelta(hours=24),
+            SequenceIdFactory(),
+            ("roblox",),
+        )
+        third = scan_run(
+            config(self.root, heat_floor=22),
+            self.store,
+            {"roblox": collector()},
+            lambda: NOW,
+            SequenceIdFactory(),
+            ("roblox",),
+        )
+
+        self.assertEqual(first.candidates, ())
+        self.assertEqual(
+            tuple(item.name for item in second.candidates),
+            ("Persistent Roblox",),
+        )
+        self.assertEqual(
+            tuple(item.name for item in third.candidates),
+            ("Persistent Roblox",),
+        )
+
+    def test_itch_first_seen_uses_platform_history_instead_of_resetting_daily(self) -> None:
+        prior_at = NOW - timedelta(days=8)
+        prior = RadarRun(
+            schema_version=1,
+            run_id="20260823T160000Z-99999999",
+            started_at=prior_at,
+            mode="scheduled",
+            platforms=("itch",),
+            publish_daily=False,
+        )
+        self.store.create_run(prior)
+        self.store.insert_observation(
+            observation(
+                prior,
+                platform="itch",
+                platform_id="old-game",
+                name="Old Itch Game",
+                developer="Studio I",
+                surface="newest",
+                rank=50,
+                observed_at=prior_at,
+            )
+        )
+        collector = FixtureCollector(
+            "itch",
+            lambda run: (
+                observation(
+                    run,
+                    platform="itch",
+                    platform_id="old-game",
+                    name="Old Itch Game",
+                    developer="Studio I",
+                    surface="popular",
+                    rank=50,
+                ),
+            ),
+        )
+
+        result = scan_run(
+            config(self.root, heat_floor=50),
+            self.store,
+            {"itch": collector},
+            lambda: NOW,
+            SequenceIdFactory(),
+            ("itch",),
+        )
+
+        self.assertEqual(result.candidates, ())
+
+    def test_itch_first_seen_accepts_current_browser_observation_after_run_start(self) -> None:
+        collector = FixtureCollector(
+            "itch",
+            lambda run: (
+                observation(
+                    run,
+                    platform="itch",
+                    platform_id="browser-late",
+                    name="Browser Late",
+                    developer="Studio I",
+                    surface="popular",
+                    rank=50,
+                    observed_at=run.started_at + timedelta(hours=2),
+                ),
+            ),
+        )
+
+        result = scan_run(
+            config(self.root, heat_floor=50),
+            self.store,
+            {"itch": collector},
+            lambda: NOW,
+            SequenceIdFactory(),
+            ("itch",),
+        )
+
+        self.assertEqual(
+            tuple(item.name for item in result.candidates),
+            ("Browser Late",),
+        )
+
+    def test_itch_compatible_popular_rank_improvement_changes_candidate_order(self) -> None:
+        prior_at = NOW - timedelta(hours=24)
+        prior = RadarRun(
+            schema_version=1,
+            run_id=PRIOR_RUN_ID,
+            started_at=prior_at,
+            mode="scheduled",
+            platforms=("itch",),
+            publish_daily=False,
+        )
+        self.store.create_run(prior)
+        self.store.insert_observation(
+            observation(
+                prior,
+                platform="itch",
+                platform_id="static",
+                name="Alpha Static",
+                developer="Studio I",
+                surface="popular",
+                rank=5,
+                observed_at=prior_at,
+            )
+        )
+        self.store.insert_observation(
+            observation(
+                prior,
+                platform="itch",
+                platform_id="rising",
+                name="Zulu Rising",
+                developer="Studio I",
+                surface="popular",
+                rank=30,
+                observed_at=prior_at,
+            )
+        )
+        collector = FixtureCollector(
+            "itch",
+            lambda run: (
+                observation(
+                    run,
+                    platform="itch",
+                    platform_id="static",
+                    name="Alpha Static",
+                    developer="Studio I",
+                    surface="popular",
+                    rank=5,
+                ),
+                observation(
+                    run,
+                    platform="itch",
+                    platform_id="rising",
+                    name="Zulu Rising",
+                    developer="Studio I",
+                    surface="popular",
+                    rank=10,
+                ),
+            ),
+        )
+
+        result = scan_run(
+            config(self.root),
+            self.store,
+            {"itch": collector},
+            lambda: NOW,
+            SequenceIdFactory(),
+            ("itch",),
+        )
+
+        self.assertEqual(
+            tuple(item.name for item in result.candidates),
+            ("Zulu Rising", "Alpha Static"),
+        )
+
     def test_repeated_scan_reuses_persisted_identity_and_stable_order(self) -> None:
         def rows(run: RadarRun):
             return (

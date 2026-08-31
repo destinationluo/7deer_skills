@@ -451,37 +451,70 @@ def _compatible_previous(
     )
 
 
+def _earliest_observed_at(
+    store: RadarStore,
+    observation: PlatformObservation,
+    at_or_before: datetime,
+) -> datetime | None:
+    row = store._fetchone(  # type: ignore[attr-defined]
+        """
+        SELECT MIN(observed_at) FROM observations
+        WHERE platform = ?
+          AND platform_id = ?
+          AND observed_at <= ?
+        """,
+        (
+            observation.platform,
+            observation.platform_id,
+            at_or_before.isoformat().replace("+00:00", "Z"),
+        ),
+    )
+    if row is None or row[0] is None or not isinstance(row[0], str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+        return _utc_seconds(parsed, "stored observation timestamp")
+    except ValueError:
+        return None
+
+
 def _itch_heat(
     run: RadarRun,
+    store: RadarStore,
     key: str,
     rows: Sequence[PlatformObservation],
 ) -> PlatformHeat | None:
     ordered = tuple(sorted(rows, key=lambda item: item.observation_id))
-    facts = next(
-        (
-            row
-            for row in ordered
-            if row.surface == "popular"
+    popular = tuple(row for row in ordered if row.surface == "popular")
+    facts = min(
+        popular,
+        key=lambda row: (
+            row.source_rank if row.source_rank is not None else 10**9,
+            row.observation_id,
         ),
-        ordered[0],
+        default=ordered[0],
     )
     eligible = facts.raw_metrics.get("collector_eligible") is True
     if not eligible:
         return None
-    popular_ranks = tuple(
-        row.source_rank
-        for row in ordered
-        if row.surface == "popular" and row.source_rank is not None
+    previous = _compatible_previous(store, facts) if popular else None
+    first_seen = _earliest_observed_at(store, facts, facts.observed_at)
+    age_hours = (
+        max(0.0, (run.started_at - first_seen).total_seconds() / 3600)
+        if first_seen is not None
+        else None
     )
-    first_seen = min(row.observed_at for row in ordered)
-    age_hours = max(0.0, (run.started_at - first_seen).total_seconds() / 3600)
     return score_itch_heat(
         ItchHeatInput(
             run_id=run.run_id,
             platform_key=key,
             observation_ids=tuple(row.observation_id for row in ordered),
             first_seen_age_hours=age_hours,
-            popular_rank=min(popular_ranks) if popular_ranks else None,
+            popular_rank=facts.source_rank if popular else None,
+            previous_popular_rank=(
+                previous.source_rank if previous is not None else None
+            ),
+            rank_history_compatible=previous is not None,
             originality=(
                 facts.raw_metrics.get("originality")
                 if isinstance(facts.raw_metrics.get("originality"), str)
@@ -588,6 +621,23 @@ def _steam_heat(
     )
 
 
+def _consecutive_compatible_appearances(
+    store: RadarStore,
+    current: PlatformObservation,
+    previous: PlatformObservation | None,
+) -> int:
+    count = 1
+    seen = {current.observation_id}
+    cursor = previous
+    while cursor is not None and cursor.observation_id not in seen:
+        seen.add(cursor.observation_id)
+        count += 1
+        if count == 3:
+            return count
+        cursor = _compatible_previous(store, cursor)
+    return count
+
+
 def _roblox_heat(
     run: RadarRun,
     store: RadarStore,
@@ -641,7 +691,11 @@ def _roblox_heat(
                     ),
                     concurrent_players=current_players,
                     consecutive_compatible_appearances=(
-                        2 if previous is not None else 1
+                        _consecutive_compatible_appearances(
+                            store,
+                            current,
+                            previous,
+                        )
                     ),
                 )
             )
@@ -664,7 +718,7 @@ def _platform_heats(
         rows = grouped[key]
         platform = rows[0].platform
         if platform == "itch":
-            heat = _itch_heat(run, key, rows)
+            heat = _itch_heat(run, store, key, rows)
         elif platform == "steam":
             heat = _steam_heat(run, store, key, rows)
         else:
