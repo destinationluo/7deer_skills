@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -8,13 +9,14 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
-
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
+import unified_game_radar.artifacts as artifacts_module
 from unified_game_radar.artifacts import (
     persist_raw_artifact,
     prune_raw_artifacts,
@@ -152,7 +154,13 @@ class ArtifactTests(unittest.TestCase):
 
         artifact = self.persist(payload)
 
-        expected_path = self.root / "data/raw" / RUN_ID / "steam_store.json"
+        expected_path = (
+            self.root
+            / "data/raw"
+            / RUN_ID
+            / "steam_official"
+            / "steam_store.json"
+        )
         self.assertEqual(Path(artifact.path), expected_path)
         self.assertEqual(expected_path.read_bytes(), expected_bytes)
         self.assertEqual(artifact.schema_version, 1)
@@ -163,12 +171,18 @@ class ArtifactTests(unittest.TestCase):
 
     def test_persist_uses_atomic_sibling_install(self) -> None:
         real_link = os.link
-        installations: list[tuple[Path, Path]] = []
+        installations: list[tuple[str, str, object, object]] = []
 
         def recording_link(source: object, target: object, **kwargs: object) -> None:
-            del kwargs
-            installations.append((Path(source), Path(target)))
-            real_link(source, target)
+            installations.append(
+                (
+                    str(source),
+                    str(target),
+                    kwargs.get("src_dir_fd"),
+                    kwargs.get("dst_dir_fd"),
+                )
+            )
+            real_link(source, target, **kwargs)
 
         with mock.patch(
             "unified_game_radar.artifacts.os.link",
@@ -177,11 +191,92 @@ class ArtifactTests(unittest.TestCase):
             artifact = self.persist({"safe": True})
 
         self.assertEqual(len(installations), 1)
-        temporary, destination = installations[0]
-        self.assertEqual(temporary.parent, destination.parent)
-        self.assertEqual(destination, Path(artifact.path))
-        self.assertFalse(temporary.exists())
-        self.assertEqual(json.loads(destination.read_text("utf-8")), {"safe": True})
+        temporary, destination, source_parent, destination_parent = installations[0]
+        self.assertTrue(temporary.startswith(".steam_store.json."))
+        self.assertTrue(temporary.endswith(".tmp"))
+        self.assertEqual(destination, "steam_store.json")
+        self.assertEqual(source_parent, destination_parent)
+        artifact_path = Path(artifact.path)
+        self.assertEqual(list(artifact_path.parent.glob(".*.tmp")), [])
+        self.assertEqual(json.loads(artifact_path.read_text("utf-8")), {"safe": True})
+
+    @unittest.skipUnless(os.name == "posix", "secure descriptor assertions need POSIX")
+    def test_persist_never_accepts_a_replaced_temporary_path(self) -> None:
+        outside = self.root / "outside.json"
+        outside.write_bytes(b"outside-must-not-be-linked")
+        real_link = os.link
+
+        def replace_temporary_before_link(
+            source: object,
+            target: object,
+            **kwargs: object,
+        ) -> None:
+            source_dir_fd = kwargs.get("src_dir_fd")
+            if source_dir_fd is None:
+                source_path = Path(source)  # type: ignore[arg-type]
+                source_path.unlink()
+                source_path.symlink_to(outside)
+            else:
+                os.unlink(source, dir_fd=source_dir_fd)  # type: ignore[arg-type]
+                os.symlink(
+                    outside,
+                    source,
+                    dir_fd=source_dir_fd,
+                )
+            real_link(source, target, **kwargs)
+
+        with mock.patch(
+            "unified_game_radar.artifacts.os.link",
+            side_effect=replace_temporary_before_link,
+        ), self.assertRaises(PersistenceError):
+            self.persist({"safe": True})
+
+        self.assertEqual(outside.read_bytes(), b"outside-must-not-be-linked")
+        destination = (
+            self.root
+            / "data/raw"
+            / RUN_ID
+            / "steam_official"
+            / "steam_store.json"
+        )
+        self.assertFalse(destination.exists())
+
+    @unittest.skipUnless(os.name == "posix", "secure descriptor assertions need POSIX")
+    def test_persist_removes_a_hardlinked_temporary_replacement(self) -> None:
+        outside = self.root / "outside.json"
+        outside.write_bytes(b"outside-must-not-be-installed")
+        real_link = os.link
+
+        def replace_temporary_before_link(
+            source: object,
+            target: object,
+            **kwargs: object,
+        ) -> None:
+            source_dir_fd = kwargs["src_dir_fd"]
+            os.unlink(source, dir_fd=source_dir_fd)  # type: ignore[arg-type]
+            real_link(
+                outside,
+                source,
+                dst_dir_fd=source_dir_fd,
+                follow_symlinks=False,
+            )
+            real_link(source, target, **kwargs)
+
+        with mock.patch(
+            "unified_game_radar.artifacts.os.link",
+            side_effect=replace_temporary_before_link,
+        ), self.assertRaises(PersistenceError):
+            self.persist({"safe": True})
+
+        self.assertEqual(outside.read_bytes(), b"outside-must-not-be-installed")
+        destination = (
+            self.root
+            / "data/raw"
+            / RUN_ID
+            / "steam_official"
+            / "steam_store.json"
+        )
+        self.assertFalse(destination.exists())
 
     def test_identical_retry_is_noop_and_changed_content_conflicts(self) -> None:
         first = self.persist({"safe": 1})
@@ -210,6 +305,74 @@ class ArtifactTests(unittest.TestCase):
                 config=self.config(raw_max_bytes_per_provider=15),
             )
         self.assertFalse((self.root / "data/raw").exists())
+
+    def test_provider_budget_is_cumulative_per_run_and_provider(self) -> None:
+        first = {"payload": "a" * 18}
+        second = {"payload": "b" * 18}
+        self.assertLess(len(canonical_bytes(first)), 50)
+        self.assertLess(len(canonical_bytes(second)), 50)
+        self.assertGreater(
+            len(canonical_bytes(first)) + len(canonical_bytes(second)),
+            50,
+        )
+        config = self.config(raw_max_bytes_per_provider=50)
+
+        self.persist(first, config=config, artifact_name="first.json")
+        with self.assertRaises(InputValidationError):
+            self.persist(second, config=config, artifact_name="second.json")
+
+        self.persist(
+            second,
+            config=config,
+            provider="itch_browser",
+            artifact_name="second.json",
+        )
+        provider_root = self.root / "data/raw" / RUN_ID
+        self.assertTrue((provider_root / "steam_official/first.json").is_file())
+        self.assertFalse((provider_root / "steam_official/second.json").exists())
+        self.assertTrue((provider_root / "itch_browser/second.json").is_file())
+
+    @unittest.skipUnless(os.name == "posix", "provider locking requires POSIX")
+    def test_concurrent_provider_writes_cannot_oversubscribe_budget(self) -> None:
+        config = self.config(raw_max_bytes_per_provider=50)
+        provider_root = (
+            config.data_dir / "raw" / RUN_ID / "steam_official"
+        )
+        barrier = threading.Barrier(2)
+
+        def write(name: str, fill: str) -> object:
+            barrier.wait(timeout=5)
+            try:
+                return self.persist(
+                    {"payload": fill * 18},
+                    config=config,
+                    artifact_name=name,
+                )
+            except Exception as error:
+                return error
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = tuple(
+                executor.map(
+                    lambda arguments: write(*arguments),
+                    (("first.json", "a"), ("second.json", "b")),
+                )
+            )
+
+        self.assertEqual(
+            sum(not isinstance(result, Exception) for result in results),
+            1,
+        )
+        self.assertEqual(
+            sum(isinstance(result, InputValidationError) for result in results),
+            1,
+        )
+        artifacts = tuple(provider_root.glob("*.json"))
+        self.assertEqual(len(artifacts), 1)
+        self.assertLessEqual(
+            sum(path.stat().st_size for path in artifacts),
+            config.raw_max_bytes_per_provider,
+        )
 
     def test_persist_rejects_traversal_identifiers_before_creating_raw_root(
         self,
@@ -248,7 +411,7 @@ class ArtifactTests(unittest.TestCase):
             self.persist({}, config=self.config(data_dir=run_link_data))
 
         file_link_data = self.root / "file-link-data"
-        run_dir = file_link_data / "raw" / RUN_ID
+        run_dir = file_link_data / "raw" / RUN_ID / "steam_official"
         run_dir.mkdir(parents=True)
         outside_file = outside / "outside.json"
         outside_file.write_bytes(b"outside-must-survive")
@@ -297,6 +460,53 @@ class ArtifactTests(unittest.TestCase):
 
         self.assertEqual(outside.read_text("utf-8"), "outside")
 
+    def test_prune_refuses_symlinked_data_dir_without_deleting_target(self) -> None:
+        outside_data = self.root / "outside-data"
+        outside_artifact = outside_data / "raw" / RUN_ID / "old.json"
+        outside_artifact.parent.mkdir(parents=True)
+        outside_artifact.write_text("{}", encoding="utf-8")
+        old = (NOW - timedelta(days=15)).timestamp()
+        os.utime(outside_artifact, (old, old))
+        linked_data = self.root / "linked-data"
+        linked_data.symlink_to(outside_data, target_is_directory=True)
+
+        with self.assertRaises(PersistenceError):
+            prune_raw_artifacts(
+                self.config(data_dir=linked_data, raw_retention_days=14),
+                NOW,
+            )
+
+        self.assertTrue(outside_artifact.is_file())
+
+    def test_existing_artifact_close_failure_is_not_silently_ignored(self) -> None:
+        path = self.root / "existing.json"
+        expected = canonical_bytes({"safe": True})
+        path.write_bytes(expected)
+
+        with mock.patch(
+            "unified_game_radar.artifacts.os.close",
+            side_effect=OSError("private close detail"),
+        ), self.assertRaises(PersistenceError) as captured:
+            artifacts_module._read_existing(path, expected)
+
+        self.assertNotIn("private close detail", str(captured.exception))
+
+    def test_temporary_cleanup_failure_is_reported(self) -> None:
+        real_unlink = os.unlink
+
+        def fail_temporary_cleanup(path: object, **kwargs: object) -> None:
+            if str(path).endswith(".tmp"):
+                raise OSError("private cleanup detail")
+            real_unlink(path, **kwargs)  # type: ignore[arg-type]
+
+        with mock.patch(
+            "unified_game_radar.artifacts.os.unlink",
+            side_effect=fail_temporary_cleanup,
+        ), self.assertRaises(PersistenceError) as captured:
+            self.persist({"safe": True})
+
+        self.assertNotIn("private cleanup detail", str(captured.exception))
+
     def test_filesystem_failures_are_mapped_and_temporary_file_is_cleaned(self) -> None:
         with mock.patch(
             "unified_game_radar.artifacts.os.link",
@@ -305,7 +515,7 @@ class ArtifactTests(unittest.TestCase):
             self.persist({"safe": True})
 
         self.assertNotIn("private disk detail", str(captured.exception))
-        run_dir = self.root / "data/raw" / RUN_ID
+        run_dir = self.root / "data/raw" / RUN_ID / "steam_official"
         self.assertEqual(list(run_dir.glob(".*.tmp")), [])
 
         expired = run_dir / "expired.json"
@@ -330,7 +540,7 @@ class ArtifactTests(unittest.TestCase):
             self.persist({"safe": True})
 
         self.assertNotIn("destination raced", str(captured.exception))
-        run_dir = self.root / "data/raw" / RUN_ID
+        run_dir = self.root / "data/raw" / RUN_ID / "steam_official"
         self.assertEqual(list(run_dir.glob(".*.tmp")), [])
 
     @unittest.skipUnless(os.name == "posix", "secure descriptor assertions need POSIX")

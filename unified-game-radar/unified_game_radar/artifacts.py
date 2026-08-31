@@ -12,9 +12,14 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import sys
-import tempfile
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - secure persistence fails closed below.
+    fcntl = None  # type: ignore[assignment]
 
 from .config import RadarConfig
 from .errors import (
@@ -36,6 +41,7 @@ _ARTIFACT_NAME = re.compile(
     r"[a-z0-9](?:[a-z0-9_-]{0,126}[a-z0-9])?\.json\Z",
     flags=re.ASCII,
 )
+_BUDGET_LOCK_NAME = ".provider-budget.lock"
 
 
 @dataclass(frozen=True)
@@ -103,7 +109,9 @@ def persist_raw_artifact(
             "redacted raw provider artifact exceeds configured size"
         )
 
-    destination = Path(config.data_dir) / "raw" / run_id / artifact_name
+    destination = (
+        Path(config.data_dir) / "raw" / run_id / provider / artifact_name
+    )
     artifact = RawArtifact(
         schema_version=1,
         run_id=run_id,
@@ -112,8 +120,18 @@ def persist_raw_artifact(
         observed_at=observed_at,
         sha256=hashlib.sha256(redacted).hexdigest(),
     )
-    path, confinement = _prepare_raw_destination(config, run_id, artifact_name)
-    _atomic_install(path, redacted, confinement)
+    path, confinement = _prepare_raw_destination(
+        config,
+        run_id,
+        provider,
+        artifact_name,
+    )
+    _atomic_install(
+        path,
+        redacted,
+        confinement,
+        config.raw_max_bytes_per_provider,
+    )
     return artifact
 
 
@@ -132,7 +150,7 @@ def prune_raw_artifacts(
     raw_root = Path(config.data_dir) / "raw"
     raw_root_descriptor: int | None = None
     try:
-        raw_root_descriptor = _open_raw_root(raw_root)
+        raw_root_descriptor = _open_raw_root(Path(config.data_dir), raw_root)
         if raw_root_descriptor is None:
             return ()
         candidates = _prune_candidates(raw_root_descriptor, raw_root)
@@ -292,14 +310,17 @@ def _validate_observed_at(value: object) -> None:
 def _prepare_raw_destination(
     config: RadarConfig,
     run_id: str,
+    provider: str,
     artifact_name: str,
 ) -> tuple[Path, _WriteConfinement]:
     data_dir = Path(config.data_dir)
     raw_root = data_dir / "raw"
-    destination_parent = raw_root / run_id
+    run_root = raw_root / run_id
+    destination_parent = run_root / provider
     try:
         _ensure_real_directory(data_dir, parents=True)
         _ensure_real_directory(raw_root)
+        _ensure_real_directory(run_root)
         _ensure_real_directory(destination_parent)
         confinement = _capture_write_confinement(raw_root, destination_parent)
     except PersistenceError:
@@ -313,7 +334,10 @@ def _ensure_real_directory(path: Path, *, parents: bool = False) -> None:
     try:
         status = path.lstat()
     except FileNotFoundError:
-        path.mkdir(parents=parents, exist_ok=False)
+        try:
+            path.mkdir(parents=parents, exist_ok=False)
+        except FileExistsError:
+            pass
         status = path.lstat()
     if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
         raise PersistenceError("raw artifact path contains an unsafe directory")
@@ -372,45 +396,116 @@ def _atomic_install(
     destination: Path,
     serialized: bytes,
     confinement: _WriteConfinement,
+    provider_budget: int,
 ) -> None:
-    temporary_path: Path | None = None
+    parent_descriptor: int | None = None
+    lock_descriptor: int | None = None
+    temporary_descriptor: int | None = None
+    temporary_name: str | None = None
+    installed_status: os.stat_result | None = None
+    committed = False
     try:
+        _require_secure_install_support()
         _validate_write_confinement(confinement)
-        existing = _read_existing(destination, serialized)
-        if existing is True:
+        parent_descriptor = _open_write_parent(confinement)
+        lock_descriptor = _lock_provider_budget(parent_descriptor)
+        if _read_existing_at(
+            parent_descriptor,
+            destination.name,
+            serialized,
+        ) is True:
+            committed = True
             return
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=destination.parent,
-            prefix=f".{destination.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-            temporary.write(serialized)
-            temporary.flush()
-            os.fsync(temporary.fileno())
+        current_usage = _provider_usage(parent_descriptor)
+        if current_usage + len(serialized) > provider_budget:
+            raise InputValidationError(
+                "raw provider artifacts exceed configured cumulative size"
+            )
+
+        temporary_name, temporary_descriptor = _create_temporary_file(
+            parent_descriptor,
+            destination.name,
+        )
+        _write_all(temporary_descriptor, serialized)
+        os.fsync(temporary_descriptor)
+        temporary_status = os.fstat(temporary_descriptor)
+        if not stat.S_ISREG(temporary_status.st_mode):
+            raise PersistenceError("raw artifact temporary file is unsafe")
+
         _validate_write_confinement(confinement)
         try:
-            os.link(temporary_path, destination, follow_symlinks=False)
+            os.link(
+                temporary_name,
+                destination.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
         except FileExistsError:
-            if _read_existing(destination, serialized) is True:
+            if _read_existing_at(
+                parent_descriptor,
+                destination.name,
+                serialized,
+            ) is True:
+                committed = True
                 return
             raise PersistenceError(
                 "raw artifact destination changed during installation"
             )
+        installed_status = temporary_status
+        _verify_installed_artifact(
+            parent_descriptor,
+            destination.name,
+            temporary_status,
+            serialized,
+        )
+        if _provider_usage(parent_descriptor) > provider_budget:
+            raise PersistenceError(
+                "raw provider budget changed during artifact installation"
+        )
         _validate_write_confinement(confinement)
-        _fsync_parent_directory(destination.parent)
+        _fsync_directory_descriptor(parent_descriptor)
+        _verify_installed_artifact(
+            parent_descriptor,
+            destination.name,
+            temporary_status,
+            serialized,
+        )
+        committed = True
     except (IdempotencyConflictError, PersistenceError):
         raise
     except OSError as error:
         raise PersistenceError("unable to persist raw artifact safely") from error
     finally:
-        if temporary_path is not None:
-            try:
-                temporary_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        primary_error = sys.exc_info()[1]
+        cleanup_errors: list[BaseException] = []
+        if (
+            not committed
+            and installed_status is not None
+            and parent_descriptor is not None
+        ):
+            _cleanup_installed_artifact(
+                parent_descriptor,
+                destination.name,
+                cleanup_errors,
+            )
+        if temporary_name is not None and parent_descriptor is not None:
+            _cleanup_temporary_file(
+                parent_descriptor,
+                temporary_name,
+                cleanup_errors,
+            )
+        for descriptor in (
+            temporary_descriptor,
+            lock_descriptor,
+            parent_descriptor,
+        ):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    cleanup_errors.append(error)
+        _raise_or_note_cleanup_errors(primary_error, cleanup_errors)
 
 
 def _read_existing(destination: Path, expected: bytes) -> bool | None:
@@ -444,13 +539,18 @@ def _read_existing(destination: Path, expected: bytes) -> bool | None:
     except OSError as error:
         raise PersistenceError("unable to inspect existing raw artifact") from error
     finally:
+        primary_error = sys.exc_info()[1]
         try:
             os.close(descriptor)
         except OSError as error:
-            if sys.exc_info()[0] is None:
+            if primary_error is None:
                 raise PersistenceError(
                     "unable to close existing raw artifact safely"
                 ) from error
+            _add_cleanup_note(
+                primary_error,
+                "existing raw artifact descriptor cleanup also failed",
+            )
     if actual == expected:
         return True
     raise IdempotencyConflictError(
@@ -458,35 +558,326 @@ def _read_existing(destination: Path, expected: bytes) -> bool | None:
     )
 
 
-def _fsync_parent_directory(parent: Path) -> None:
-    if os.name != "posix":
-        return
-    descriptor = os.open(parent, _directory_open_flags())
-    try:
-        _fsync_directory_descriptor(descriptor)
-    finally:
-        os.close(descriptor)
+def _require_secure_install_support() -> None:
+    if fcntl is None or os.name != "posix" or not all(
+        hasattr(os, flag) for flag in ("O_DIRECTORY", "O_NOFOLLOW")
+    ):
+        raise PersistenceError("raw persistence requires secure POSIX file access")
 
 
-def _open_raw_root(raw_root: Path) -> int | None:
-    try:
-        expected = raw_root.lstat()
-    except FileNotFoundError:
-        return None
-    if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(expected.st_mode):
-        raise PersistenceError("configured raw root is not a safe directory")
-
-    descriptor = os.open(raw_root, _directory_open_flags())
+def _open_write_parent(confinement: _WriteConfinement) -> int:
+    descriptor = os.open(
+        confinement.destination_parent,
+        _directory_open_flags() | getattr(os, "O_CLOEXEC", 0),
+    )
     try:
         actual = os.fstat(descriptor)
-        if not _same_directory(expected, actual):
-            raise PersistenceError("configured raw root changed during inspection")
+        if (
+            not stat.S_ISDIR(actual.st_mode)
+            or (actual.st_dev, actual.st_ino) != confinement.parent_identity
+        ):
+            raise PersistenceError("raw artifact destination changed during write")
         return descriptor
     except BaseException:
         _close_descriptors((descriptor,))
         raise
 
 
+def _lock_provider_budget(parent_descriptor: int) -> int:
+    if fcntl is None:  # pragma: no cover - guarded by support validation.
+        raise PersistenceError("raw persistence requires provider file locking")
+    base_flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(
+            _BUDGET_LOCK_NAME,
+            base_flags | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+    except FileExistsError:
+        descriptor = os.open(
+            _BUDGET_LOCK_NAME,
+            base_flags,
+            dir_fd=parent_descriptor,
+        )
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise PersistenceError("raw provider budget lock is unsafe")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        visible = os.stat(
+            _BUDGET_LOCK_NAME,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not _same_regular_inode(status, visible):
+            raise PersistenceError("raw provider budget lock changed")
+        return descriptor
+    except BaseException:
+        _close_descriptors((descriptor,))
+        raise
+
+
+def _provider_usage(parent_descriptor: int) -> int:
+    total = 0
+    with os.scandir(parent_descriptor) as entries:
+        names = sorted(entry.name for entry in entries)
+    for name in names:
+        status = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if stat.S_ISLNK(status.st_mode):
+            raise PersistenceError("unsafe symlink found in raw provider directory")
+        if name == _BUDGET_LOCK_NAME or name.endswith(".tmp"):
+            if not stat.S_ISREG(status.st_mode):
+                raise PersistenceError("unsafe raw provider control file")
+            continue
+        if not name.endswith(".json"):
+            if not stat.S_ISREG(status.st_mode):
+                raise PersistenceError("unsafe entry found in raw provider directory")
+            continue
+        if _ARTIFACT_NAME.fullmatch(name) is None or not stat.S_ISREG(status.st_mode):
+            raise PersistenceError("unsafe raw provider artifact found")
+        total += status.st_size
+    return total
+
+
+def _create_temporary_file(
+    parent_descriptor: int,
+    destination_name: str,
+) -> tuple[str, int]:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    for _ in range(128):
+        name = f".{destination_name}.{secrets.token_hex(16)}.tmp"
+        try:
+            descriptor = os.open(
+                name,
+                flags,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+        except FileExistsError:
+            continue
+        return name, descriptor
+    raise PersistenceError("unable to allocate raw artifact temporary file")
+
+
+def _write_all(descriptor: int, content: bytes) -> None:
+    offset = 0
+    while offset < len(content):
+        written = os.write(descriptor, content[offset:])
+        if written <= 0:
+            raise OSError(errno.EIO, "short raw artifact write")
+        offset += written
+
+
+def _read_existing_at(
+    parent_descriptor: int,
+    name: str,
+    expected: bytes,
+) -> bool | None:
+    try:
+        descriptor = os.open(name, _file_open_flags(), dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise PersistenceError("existing raw artifact is unsafe") from error
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise PersistenceError("existing raw artifact is not a regular file")
+        actual = _read_bounded(descriptor, len(expected) + 1)
+    except PersistenceError:
+        raise
+    except OSError as error:
+        raise PersistenceError("unable to inspect existing raw artifact") from error
+    finally:
+        primary_error = sys.exc_info()[1]
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            if primary_error is None:
+                raise PersistenceError(
+                    "unable to close existing raw artifact safely"
+                ) from error
+            _add_cleanup_note(
+                primary_error,
+                "existing raw artifact descriptor cleanup also failed",
+            )
+    if actual == expected:
+        return True
+    raise IdempotencyConflictError(
+        "raw artifact path was reused with changed content"
+    )
+
+
+def _verify_installed_artifact(
+    parent_descriptor: int,
+    name: str,
+    temporary_status: os.stat_result,
+    expected: bytes,
+) -> None:
+    try:
+        descriptor = os.open(name, _file_open_flags(), dir_fd=parent_descriptor)
+    except OSError as error:
+        raise PersistenceError("installed raw artifact is unsafe") from error
+    try:
+        installed = os.fstat(descriptor)
+        if not _same_regular_inode(temporary_status, installed):
+            raise PersistenceError("installed raw artifact identity is unsafe")
+        actual = _read_bounded(descriptor, len(expected) + 1)
+        if (
+            actual != expected
+            or hashlib.sha256(actual).digest()
+            != hashlib.sha256(expected).digest()
+        ):
+            raise PersistenceError("installed raw artifact content is unsafe")
+    finally:
+        primary_error = sys.exc_info()[1]
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            if primary_error is None:
+                raise PersistenceError(
+                    "unable to close installed raw artifact safely"
+                ) from error
+            _add_cleanup_note(
+                primary_error,
+                "installed raw artifact descriptor cleanup also failed",
+            )
+    visible = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if not _same_regular_inode(temporary_status, visible):
+        raise PersistenceError("installed raw artifact path changed")
+
+
+def _read_bounded(descriptor: int, maximum: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = maximum
+    while remaining > 0:
+        chunk = os.read(descriptor, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _same_regular_inode(
+    expected: os.stat_result,
+    actual: os.stat_result,
+) -> bool:
+    return (
+        stat.S_ISREG(actual.st_mode)
+        and expected.st_dev == actual.st_dev
+        and expected.st_ino == actual.st_ino
+    )
+
+
+def _cleanup_installed_artifact(
+    parent_descriptor: int,
+    name: str,
+    errors: list[BaseException],
+) -> None:
+    try:
+        visible = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        errors.append(error)
+        return
+    try:
+        os.unlink(name, dir_fd=parent_descriptor)
+    except OSError as error:
+        errors.append(error)
+
+
+def _cleanup_temporary_file(
+    parent_descriptor: int,
+    name: str,
+    errors: list[BaseException],
+) -> None:
+    try:
+        os.unlink(name, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        errors.append(error)
+
+
+def _raise_or_note_cleanup_errors(
+    primary_error: BaseException | None,
+    cleanup_errors: Sequence[BaseException],
+) -> None:
+    if not cleanup_errors:
+        return
+    if primary_error is not None:
+        _add_cleanup_note(primary_error, "raw artifact cleanup also failed")
+        return
+    raise PersistenceError("unable to clean up raw artifact safely") from cleanup_errors[0]
+
+
+def _add_cleanup_note(error: BaseException, message: str) -> None:
+    if hasattr(error, "add_note"):
+        error.add_note(message)
+
+
+def _open_raw_root(data_dir: Path, raw_root: Path) -> int | None:
+    data_descriptor: int | None = None
+    try:
+        expected_data = data_dir.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(expected_data.st_mode) or not stat.S_ISDIR(
+        expected_data.st_mode
+    ):
+        raise PersistenceError("configured data directory is not safe")
+
+    try:
+        data_descriptor = os.open(data_dir, _directory_open_flags())
+        actual_data = os.fstat(data_descriptor)
+        if not _same_directory(expected_data, actual_data):
+            raise PersistenceError("configured data directory changed")
+        try:
+            expected = os.stat(
+                "raw",
+                dir_fd=data_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(expected.st_mode):
+            raise PersistenceError("configured raw root is not a safe directory")
+        descriptor = os.open(
+            "raw",
+            _directory_open_flags(),
+            dir_fd=data_descriptor,
+        )
+        try:
+            actual = os.fstat(descriptor)
+            if not _same_directory(expected, actual):
+                raise PersistenceError("configured raw root changed during inspection")
+            return descriptor
+        except BaseException:
+            _close_descriptors((descriptor,))
+            raise
+    finally:
+        if data_descriptor is not None:
+            primary_error = sys.exc_info()[1]
+            try:
+                os.close(data_descriptor)
+            except OSError as cleanup_error:
+                if primary_error is None:
+                    raise PersistenceError(
+                        "unable to close configured data directory safely"
+                    ) from cleanup_error
+                _add_cleanup_note(
+                    primary_error,
+                    "configured data directory cleanup also failed",
+                )
 def _prune_candidates(
     raw_root_descriptor: int,
     raw_root: Path,
