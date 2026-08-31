@@ -477,8 +477,6 @@ def _heat_reference_fields(
             or reference.platform_id != key.platform_id
         ):
             raise _error("observation reference does not match platform_key")
-        if reference.surface != parsed_surface:
-            raise _error("observation reference does not match heat surface")
     return key.raw, parsed_surface, tuple(item.raw for item in references)
 
 

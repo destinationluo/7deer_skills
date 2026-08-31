@@ -170,7 +170,7 @@ def build_instances() -> tuple[object, ...]:
         schema_version=1,
         run_id=RUN_ID,
         platform_key="steam:123456",
-        surface="most_played",
+        surface="released",
         observation_ids=(OBSERVATION_ID,),
         heat=72.5,
     )
@@ -178,7 +178,7 @@ def build_instances() -> tuple[object, ...]:
         schema_version=1,
         run_id=RUN_ID,
         platform_key="steam:123456",
-        surface="most_played",
+        surface="released",
         observation_ids=(OBSERVATION_ID,),
         heat=72.5,
         platform_score=15.0,
@@ -690,22 +690,23 @@ class SchemaValidationTests(unittest.TestCase):
                 with self.assertRaises(InputValidationError):
                     PlatformObservation.from_dict(payload)
 
-    def test_heat_references_match_platform_key_and_surface_with_history(self) -> None:
+    def test_heat_references_match_platform_key_and_allow_multi_surface_history(self) -> None:
         by_type = {type(instance): instance for instance in build_instances()}
         historical_ids = [
             "steam:123456:most_played:20260830T020000Z",
-            "steam:123456:most_played:20260831T020000Z",
+            "steam:123456:top_seller:20260830T100000Z",
+            "steam:123456:new_release:20260831T020000Z",
         ]
         for schema_type in (PlatformHeat, NormalizedHeat):
             payload = by_type[schema_type].to_dict()
             payload["observation_ids"] = historical_ids
             parsed = schema_type.from_dict(payload)
             self.assertEqual(parsed.observation_ids, tuple(historical_ids))
+            self.assertEqual(parsed.surface, "released")
 
             for invalid in (
                 "itch:123456:most_played:20260830T020000Z",
                 "steam:999999:most_played:20260830T020000Z",
-                "steam:123456:newest:20260830T020000Z",
             ):
                 with self.subTest(schema=schema_type.__name__, invalid=invalid):
                     changed = by_type[schema_type].to_dict()
