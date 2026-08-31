@@ -18,6 +18,7 @@ from unified_game_radar.schemas import (
     SerpEvidence,
     TrendEvidence,
     TrendPoint,
+    WarningRecord,
 )
 from unified_game_radar.score import (
     action_for,
@@ -117,10 +118,11 @@ def external_row(
     author_relation: str = "independent",
     engagement_count: int | None = 0,
     suffix: str = "one",
+    url: str | None = None,
 ) -> ExternalEvidence:
     return ExternalEvidence(
         source=domain,
-        url=f"https://{domain}/watch/{suffix}",
+        url=url or f"https://{domain}/watch/{suffix}",
         published_at=NOW - published_age,
         observed_at=observed_at,
         author_relation=author_relation,
@@ -264,6 +266,21 @@ class DemandScoreTests(unittest.TestCase):
         )
         self.assertEqual(result, 30.0)
 
+    def test_schema_valid_punctuation_query_is_ignored_beside_valid_support(self) -> None:
+        result = score_demand(
+            opportunity_evidence(
+                (0, 0, 0),
+                autocomplete=(
+                    search_row("GeoSlice codes"),
+                    search_row("!!!"),
+                ),
+            ),
+            game_name="GeoSlice",
+            publication_time=NOW,
+        )
+
+        self.assertEqual(result, 2.0)
+
     def test_missing_or_stale_demand_evidence_scores_zero(self) -> None:
         stale = NOW - timedelta(hours=24, microseconds=1)
         cases = (
@@ -374,6 +391,43 @@ class ExternalSpreadScoreTests(unittest.TestCase):
             )
         )
         self.assertEqual(score_external_spread(rows, publication_time=NOW), 20.0)
+
+    def test_identical_and_canonical_url_duplicates_do_not_inflate_score(self) -> None:
+        original = external_row(
+            url="https://youtube.com/watch/one",
+        )
+        canonical_duplicate = external_row(
+            url="https://WWW.YouTube.com:443/watch/one#comments",
+        )
+        baseline = score_external_spread((original,), publication_time=NOW)
+
+        self.assertEqual(
+            score_external_spread((original, original), publication_time=NOW),
+            baseline,
+        )
+        self.assertEqual(
+            score_external_spread(
+                (canonical_duplicate, original),
+                publication_time=NOW,
+            ),
+            baseline,
+        )
+
+    def test_conflicting_payload_for_canonical_external_url_is_rejected(self) -> None:
+        original = external_row(
+            url="https://youtube.com/watch/one",
+            engagement_count=20,
+        )
+        conflicting = external_row(
+            url="https://www.youtube.com:443/watch/one#top",
+            engagement_count=100,
+        )
+
+        with self.assertRaisesRegex(ValueError, "conflicting external evidence"):
+            score_external_spread(
+                (original, conflicting),
+                publication_time=NOW,
+            )
 
 
 class SeoGapScoreTests(unittest.TestCase):
@@ -646,6 +700,53 @@ class OpportunityScoreTests(unittest.TestCase):
                 publication_time=NOW,
             )
 
+    def test_warning_provenance_is_validated_before_scoring(self) -> None:
+        matching = WarningRecord(
+            schema_version=1,
+            code="search_partial",
+            message="Search evidence was partial.",
+            collector=None,
+            opportunity_id=OPPORTUNITY_ID,
+        )
+        foreign = WarningRecord(
+            schema_version=1,
+            code="foreign_warning",
+            message="This warning belongs to another opportunity.",
+            collector=None,
+            opportunity_id="00000000-0000-4000-8000-000000000099",
+        )
+        result = score_opportunity(
+            run_id=RUN_ID,
+            opportunity_id=OPPORTUNITY_ID,
+            game_name="GeoSlice",
+            platform_score=10,
+            evidence=opportunity_evidence(),
+            publication_time=NOW,
+            warnings=(matching,),
+        )
+        self.assertEqual(result.warnings, (matching,))
+
+        with self.assertRaisesRegex(ValueError, "warning opportunity_id"):
+            score_opportunity(
+                run_id=RUN_ID,
+                opportunity_id=OPPORTUNITY_ID,
+                game_name="GeoSlice",
+                platform_score=10,
+                evidence=opportunity_evidence(),
+                publication_time=NOW,
+                warnings=(foreign,),
+            )
+        with self.assertRaisesRegex(ValueError, "warnings.*WarningRecord"):
+            score_opportunity(
+                run_id=RUN_ID,
+                opportunity_id=OPPORTUNITY_ID,
+                game_name="GeoSlice",
+                platform_score=10,
+                evidence=opportunity_evidence(),
+                publication_time=NOW,
+                warnings=("not-a-warning",),  # type: ignore[arg-type]
+            )
+
     def test_stable_sort_uses_action_total_demand_platform_name_and_id(self) -> None:
         ids = (
             "00000000-0000-4000-8000-000000000001",
@@ -680,6 +781,16 @@ class OpportunityScoreTests(unittest.TestCase):
         )
         ordered = sorted(rows, key=lambda row: opportunity_sort_key(row[0], row[1]))
         self.assertEqual(tuple(row[0].opportunity_id for row in ordered), (first, second))
+
+    def test_sort_rejects_a_name_that_normalizes_to_no_letters_or_numbers(self) -> None:
+        row = scored(
+            "00000000-0000-4000-8000-000000000001",
+            action="watch",
+            total=30,
+        )
+
+        with self.assertRaisesRegex(ValueError, "normalized_name"):
+            opportunity_sort_key(row, "!!!")
 
 
 if __name__ == "__main__":

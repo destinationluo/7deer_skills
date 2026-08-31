@@ -6,9 +6,10 @@ from collections.abc import Iterable, Sequence
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import math
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from .demand import DemandClassification, classify_demand, completed_points
+from .errors import InputValidationError
 from .identity import normalize_name
 from .schemas import (
     ExternalEvidence,
@@ -103,7 +104,7 @@ def _is_relevant_query(game_name: str, query: str) -> bool:
     try:
         normalized_name = normalize_name(game_name)
         normalized_query = normalize_name(query)
-    except (TypeError, ValueError):
+    except (InputValidationError, TypeError, ValueError):
         return False
     prefix = f"{normalized_name} "
     if not normalized_query.startswith(prefix):
@@ -187,12 +188,9 @@ def _qualifying_external_rows(
     evidence: Iterable[ExternalEvidence],
     publication_time: datetime,
 ) -> tuple[ExternalEvidence, ...]:
+    unique_rows = _deduplicate_external_rows(evidence)
     rows: list[ExternalEvidence] = []
-    for index, row in enumerate(evidence):
-        if not isinstance(row, ExternalEvidence):
-            raise ValueError(
-                f"external_evidence[{index}] must be ExternalEvidence"
-            )
+    for row in unique_rows:
         published_age = publication_time - row.published_at
         if (
             row.author_relation == "independent"
@@ -201,6 +199,52 @@ def _qualifying_external_rows(
         ):
             rows.append(row)
     return tuple(rows)
+
+
+def _canonical_evidence_url(url: str) -> str:
+    split = urlsplit(url)
+    hostname = (split.hostname or "").casefold().rstrip(".")
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    port = split.port
+    netloc = hostname if port in (None, 443) else f"{hostname}:{port}"
+    return urlunsplit(
+        ("https", netloc, split.path or "/", split.query, "")
+    )
+
+
+def _external_payload(row: ExternalEvidence) -> tuple[object, ...]:
+    return (
+        row.source,
+        row.published_at,
+        row.observed_at,
+        row.author_relation,
+        row.engagement_count,
+        row.evidence_kind,
+    )
+
+
+def _deduplicate_external_rows(
+    evidence: Iterable[ExternalEvidence],
+) -> tuple[ExternalEvidence, ...]:
+    rows_by_url: dict[str, ExternalEvidence] = {}
+    for index, row in enumerate(evidence):
+        if not isinstance(row, ExternalEvidence):
+            raise ValueError(
+                f"external_evidence[{index}] must be ExternalEvidence"
+            )
+        canonical_url = _canonical_evidence_url(row.url)
+        existing = rows_by_url.get(canonical_url)
+        if existing is not None:
+            if _external_payload(existing) != _external_payload(row):
+                raise ValueError(
+                    "conflicting external evidence for canonical URL"
+                )
+            continue
+        rows_by_url[canonical_url] = row
+    return tuple(rows_by_url[url] for url in sorted(rows_by_url))
 
 
 def _source_domain(row: ExternalEvidence) -> str:
@@ -368,7 +412,7 @@ def score_opportunity(
     platform_score: float,
     evidence: OpportunityEvidence | None,
     publication_time: datetime,
-    warnings: tuple[WarningRecord, ...] = (),
+    warnings: Sequence[WarningRecord] = (),
 ) -> ScoredOpportunity:
     """Build one deterministic scored record without persistence side effects."""
 
@@ -376,6 +420,7 @@ def score_opportunity(
     rounded_platform = _round_one_decimal(
         _bounded_number(platform_score, "platform_score", 30)
     )
+    validated_warnings = _validated_warnings(warnings, opportunity_id)
     if evidence is not None:
         if not isinstance(evidence, OpportunityEvidence):
             raise ValueError("evidence must be OpportunityEvidence or None")
@@ -432,8 +477,24 @@ def score_opportunity(
         seo_score=seo,
         total_score=total,
         action=action,
-        warnings=warnings,
+        warnings=validated_warnings,
     )
+
+
+def _validated_warnings(
+    warnings: Sequence[WarningRecord],
+    opportunity_id: str,
+) -> tuple[WarningRecord, ...]:
+    if isinstance(warnings, (str, bytes)) or not isinstance(warnings, Sequence):
+        raise ValueError("warnings must be a sequence of WarningRecord")
+    result: list[WarningRecord] = []
+    for index, warning in enumerate(warnings):
+        if not isinstance(warning, WarningRecord):
+            raise ValueError(f"warnings[{index}] must be WarningRecord")
+        if warning.opportunity_id not in (None, opportunity_id):
+            raise ValueError("warning opportunity_id must match scored opportunity")
+        result.append(warning)
+    return tuple(result)
 
 
 def opportunity_sort_key(
@@ -448,7 +509,7 @@ def opportunity_sort_key(
         raise ValueError("opportunity action is invalid")
     try:
         name = normalize_name(normalized_name)
-    except (TypeError, ValueError) as error:
+    except (InputValidationError, TypeError, ValueError) as error:
         raise ValueError("normalized_name must be nonempty text") from error
     return (
         _ACTION_PRIORITY[opportunity.action],
