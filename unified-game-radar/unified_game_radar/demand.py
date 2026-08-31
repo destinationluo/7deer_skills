@@ -243,6 +243,31 @@ def _unknown(reason: str) -> DemandClassification:
     return DemandClassification(state="unknown", reason=reason)
 
 
+def _trends_window_is_current(
+    trends: TrendEvidence,
+    publication_time: datetime,
+) -> bool:
+    """Validate the exact local-calendar window supported by v1 evidence."""
+
+    if trends.timeframe != "now 7-d":
+        return False
+    current_day = publication_time.astimezone(ZoneInfo(trends.timezone)).date()
+    first_selected_day = current_day - timedelta(days=7)
+    if any(
+        point.date < first_selected_day or point.date > current_day
+        for point in trends.points
+    ):
+        return False
+    completed_dates = tuple(
+        point.date
+        for point in trends.points
+        if point.complete and point.date < current_day
+    )
+    return bool(completed_dates) and max(completed_dates) == current_day - timedelta(
+        days=1
+    )
+
+
 def _search_contract_is_usable(
     evidence: OpportunityEvidence,
     trends: TrendEvidence,
@@ -287,6 +312,8 @@ def classify_demand(
 ) -> DemandClassification:
     """Apply the hard gate in order: unknown, fail, early_watch, pass."""
 
+    if publication_time is None:
+        return _unknown("missing_publication_time")
     if evidence is None or not isinstance(evidence, OpportunityEvidence):
         return _unknown("missing_evidence")
     trends = evidence.trends
@@ -295,7 +322,7 @@ def classify_demand(
 
     try:
         publication = _utc_instant(
-            publication_time or evidence.observed_at,
+            publication_time,
             "publication_time",
         )
     except ValueError:
@@ -319,6 +346,8 @@ def classify_demand(
     current_day = publication.astimezone(ZoneInfo(trends.timezone)).date()
     if any(point.date > current_day for point in trends.points):
         return _unknown("future_trends_date")
+    if not _trends_window_is_current(trends, publication):
+        return _unknown("invalid_trends_window")
 
     complete = completed_points(trends, publication_time=publication)
     if not complete:

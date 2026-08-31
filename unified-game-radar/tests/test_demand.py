@@ -56,11 +56,15 @@ def evidence(
     trends_observed_at: datetime | None = None,
     raw_artifact: str | None = "data/unified-game-radar/raw/trends.json",
     category: int = 0,
+    timeframe: str = "now 7-d",
+    latest_date: date | None = None,
 ) -> OpportunityEvidence:
     flags = complete or tuple(True for _ in values)
     if len(flags) != len(values):
         raise ValueError("complete flags must match values")
-    first_day = date(2026, 8, 30) - timedelta(days=len(values) - 1)
+    first_day = (latest_date or date(2026, 8, 30)) - timedelta(
+        days=len(values) - 1
+    )
     points = tuple(
         TrendPoint(
             date=first_day + timedelta(days=index),
@@ -72,7 +76,7 @@ def evidence(
     trends = TrendEvidence(
         query=trends_query or f"{game_name} game",
         query_type="search_term",
-        timeframe="now 7-d",
+        timeframe=timeframe,
         geo="US",
         category=category,
         property="web",
@@ -164,6 +168,27 @@ class DailyAggregationTests(unittest.TestCase):
 
 
 class EvidenceContractTests(unittest.TestCase):
+    def test_publication_time_is_required_even_for_fresh_or_old_evidence(self) -> None:
+        cases = (
+            evidence(
+                autocomplete=(suggestion(),),
+            ),
+            evidence(
+                observed_at=NOW - timedelta(days=30),
+                trends_observed_at=NOW - timedelta(days=30),
+                autocomplete=(
+                    suggestion(observed_at=NOW - timedelta(days=30)),
+                ),
+            ),
+        )
+
+        for item in cases:
+            with self.subTest(observed_at=item.observed_at):
+                result = classify_demand(item, game_name="GeoSlice")
+
+                self.assertEqual(result.state, "unknown")
+                self.assertEqual(result.reason, "missing_publication_time")
+
     def test_search_collections_require_typed_rows_not_loose_strings(self) -> None:
         with self.assertRaises(InputValidationError):
             OpportunityEvidence(
@@ -249,6 +274,83 @@ class EvidenceContractTests(unittest.TestCase):
                     "unknown",
                 )
 
+    def test_wrong_trends_timeframe_is_unknown(self) -> None:
+        result = classify_demand(
+            evidence(
+                timeframe="today 1-m",
+                autocomplete=(suggestion(),),
+            ),
+            game_name="GeoSlice",
+            publication_time=NOW,
+        )
+
+        self.assertEqual(result.state, "unknown")
+        self.assertEqual(result.reason, "invalid_trends_window")
+
+    def test_fresh_envelope_with_ancient_trends_dates_is_unknown(self) -> None:
+        result = classify_demand(
+            evidence(
+                latest_date=date(2020, 1, 7),
+                autocomplete=(suggestion(),),
+            ),
+            game_name="GeoSlice",
+            publication_time=NOW,
+        )
+
+        self.assertEqual(result.state, "unknown")
+        self.assertEqual(result.reason, "invalid_trends_window")
+
+    def test_trends_window_must_include_latest_completed_local_day(self) -> None:
+        result = classify_demand(
+            evidence(
+                latest_date=date(2026, 8, 29),
+                autocomplete=(suggestion(),),
+            ),
+            game_name="GeoSlice",
+            publication_time=NOW,
+        )
+
+        self.assertEqual(result.state, "unknown")
+        self.assertEqual(result.reason, "invalid_trends_window")
+
+    def test_now_seven_day_window_calendar_boundaries_are_enforced(self) -> None:
+        at_lower_boundary = evidence(
+            (10, 20, 15, 20, 15, 20, 15),
+            autocomplete=(suggestion(),),
+        )
+        before_lower_boundary = evidence(
+            (10, 20, 15, 20, 15, 20, 15, 20),
+            autocomplete=(suggestion(),),
+        )
+        future_point = evidence(
+            (10, 20, 15),
+            latest_date=date(2026, 9, 1),
+            autocomplete=(suggestion(),),
+        )
+
+        self.assertEqual(
+            classify_demand(
+                at_lower_boundary,
+                game_name="GeoSlice",
+                publication_time=NOW,
+            ).state,
+            "pass",
+        )
+        too_old = classify_demand(
+            before_lower_boundary,
+            game_name="GeoSlice",
+            publication_time=NOW,
+        )
+        self.assertEqual(too_old.state, "unknown")
+        self.assertEqual(too_old.reason, "invalid_trends_window")
+        future = classify_demand(
+            future_point,
+            game_name="GeoSlice",
+            publication_time=NOW,
+        )
+        self.assertEqual(future.state, "unknown")
+        self.assertEqual(future.reason, "future_trends_date")
+
 
 class QueryDisambiguationTests(unittest.TestCase):
     def test_exact_game_intent_disambiguates_name_collision(self) -> None:
@@ -331,6 +433,7 @@ class OrderedDemandGateTests(unittest.TestCase):
         item = evidence(
             (0, 0, 100),
             complete=(True, True, False),
+            latest_date=date(2026, 8, 31),
         )
 
         self.assertEqual(self.classify(item), "early_watch")

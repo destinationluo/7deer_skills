@@ -75,10 +75,17 @@ in peak, retention, and second-wave calculations.
 
 The supported Trends provenance for version 1 is:
 
+- `timeframe`: exactly `now 7-d`
 - `query_type`: `search_term`
 - `category`: `0` (all categories)
 - `property`: `web`
 - a non-null local `raw_artifact` reference
+
+Relative to the explicitly supplied publication instant, every Trends point
+must fall between the current local calendar day minus seven days and the
+current local day, inclusive. The latest completed point must be the preceding
+local calendar day. This prevents a newly captured envelope from presenting an
+old or incomplete time series as current evidence.
 
 The query must be the intended title followed by the exact game-intent modifier
 `game`. This prevents a bare product, person, or software name from receiving
@@ -89,7 +96,8 @@ game-demand credit.
 The envelope, Trends capture, autocomplete rows, related-query rows, and any
 included SERP capture must be no more than 24 hours old at publication and must
 not be future-dated. Exactly 24 hours remains fresh. A stale or malformed
-search claim makes demand `unknown`.
+search claim makes demand `unknown`. Classification callers must provide the
+publication time explicitly; it is never inferred from an evidence timestamp.
 
 Both query arrays contain full `SearchQueryEvidence` objects. Loose strings are
 invalid. A query supports demand only when it begins with the exact normalized
