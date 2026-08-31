@@ -106,11 +106,19 @@ computed from the canonical JSON bytes and is shared by its JSON/Markdown pair:
 {report_dir}/{run_id}.preliminary.{canonical_json_sha256}.md
 {report_dir}/{run_id}.preliminary.latest.json
 {report_dir}/{run_id}.preliminary.latest.md
+{report_dir}/{run_id}.preliminary.revisions.json
 ```
 
 The two `preliminary.latest` files are a recoverable current view; all hashed
-snapshots remain immutable. Identical retries are no-ops. Reusing a final or
-hashed snapshot path with different content is a conflict.
+snapshots remain immutable. The revisions sidecar contains only the run ID,
+content hashes, their consecutive first-persistence revision numbers, and the
+current hash/revision. It never embeds the canonical report payload. Updates
+are serialized by a run-scoped flock opened relative to the anchored report
+directory. A new hash advances the sidecar before the latest pair is written,
+so a retry repairs a partial latest pair. A retry of a known older hash repairs
+only its immutable snapshot and never rolls latest backward. Identical current
+retries are no-ops. Reusing a final or hashed snapshot path with different
+content is a conflict.
 
 The scheduled collection at 10:00 in the configured timezone records only the
 run pair. A final scheduled run at the configured daily publish hour (16:00 by
@@ -132,12 +140,15 @@ therefore cannot invalidate an earlier audit record.
 
 Final persistence order is run JSON, run Markdown, dated JSON, dated Markdown,
 latest JSON, latest Markdown, then the SQLite `Publication`. Preliminary order
-is hashed JSON, hashed Markdown, preliminary-latest JSON, then
-preliminary-latest Markdown. Each file uses an atomic sibling replacement and
-exact-content comparison. Reads, parent creation, and writes remain confined
-to a real configured report directory; the root, `daily`, and controlled child
-parents must not be symlinks. A retry accepts already-correct files and repairs
-missing or incomplete mutable pairs. A retry of an already-recorded historical
+is hashed JSON, hashed Markdown, revision sidecar (for a first-seen hash),
+preliminary-latest JSON, then preliminary-latest Markdown. Each file uses an
+atomic sibling replacement and exact-content comparison. The configured root and
+each child directory are opened with `O_NOFOLLOW`; reads, lock creation,
+temporary creation, fsync, and atomic replacement use those directory handles
+rather than re-resolving pathnames. Replacing the visible root or `daily`
+pathname during a write therefore cannot redirect bytes outside the originally
+anchored report tree. A retry accepts already-correct files and repairs missing
+or incomplete mutable pairs. A retry of an already-recorded historical
 publication returns its original record without rolling back a newer daily
 view. The database write runs in a transaction only after every required file
 succeeds; therefore a file-stage failure cannot create a false publication row.

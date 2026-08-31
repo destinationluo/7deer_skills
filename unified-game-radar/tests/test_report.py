@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import date, datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import tempfile
@@ -250,9 +251,14 @@ class FailAfterWriter:
         self.calls = 0
         self.delegate = FileAtomicWriter()
 
-    def write_text(self, path: Path, content: str) -> None:
+    def write_text_at(
+        self,
+        directory_fd: int,
+        filename: str,
+        content: str,
+    ) -> None:
         self.calls += 1
-        self.delegate.write_text(path, content)
+        self.delegate.write_text_at(directory_fd, filename, content)
         if self.calls == self.fail_on:
             raise OSError(f"failure after write {self.fail_on}")
 
@@ -535,14 +541,26 @@ class RunArtifactTests(unittest.TestCase):
             candidates=(changed_identity, changed_result.candidates[1]),
         )
         second = build_report(changed_result, (), "preliminary")
+        completed_identity = replace(
+            changed_result.candidates[0],
+            name="Signal Garden Complete",
+            normalized_name="signal garden complete",
+        )
+        completed_result = replace(
+            changed_result,
+            candidates=(completed_identity, changed_result.candidates[1]),
+        )
+        third = build_report(completed_result, (), "preliminary")
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             first_paths = persist_run_artifacts(first, root, FileAtomicWriter())
             second_paths = persist_run_artifacts(second, root, FileAtomicWriter())
+            third_paths = persist_run_artifacts(third, root, FileAtomicWriter())
 
             first_hash = hashlib.sha256(canonical_json(first).encode("utf-8")).hexdigest()
             second_hash = hashlib.sha256(canonical_json(second).encode("utf-8")).hexdigest()
+            third_hash = hashlib.sha256(canonical_json(third).encode("utf-8")).hexdigest()
             self.assertNotEqual(first_hash, second_hash)
             self.assertEqual(
                 first_paths,
@@ -561,18 +579,49 @@ class RunArtifactTests(unittest.TestCase):
             self.assertRegex(first_paths[0].name, re.compile(r"[0-9a-f]{64}\.json\Z"))
             self.assertEqual(first_paths[0].read_text("utf-8"), canonical_json(first))
             self.assertEqual(second_paths[0].read_text("utf-8"), canonical_json(second))
+            self.assertEqual(third_paths[0].read_text("utf-8"), canonical_json(third))
             self.assertEqual(
                 (root / f"{RUN_ID}.preliminary.latest.json").read_text("utf-8"),
-                canonical_json(second),
+                canonical_json(third),
             )
             self.assertEqual(
                 (root / f"{RUN_ID}.preliminary.latest.md").read_text("utf-8"),
-                render_markdown(second),
+                render_markdown(third),
+            )
+            revision_index = json.loads(
+                (root / f"{RUN_ID}.preliminary.revisions.json").read_text("utf-8")
+            )
+            self.assertEqual(
+                revision_index,
+                {
+                    "schema_version": 1,
+                    "run_id": RUN_ID,
+                    "current_revision": 3,
+                    "current_sha256": third_hash,
+                    "revisions": [
+                        {"revision": 1, "sha256": first_hash},
+                        {"revision": 2, "sha256": second_hash},
+                        {"revision": 3, "sha256": third_hash},
+                    ],
+                },
+            )
+            self.assertNotIn("candidates", revision_index)
+
+            first_paths[1].unlink()
+            persist_run_artifacts(first, root, FileAtomicWriter())
+            self.assertTrue(first_paths[1].is_file())
+            self.assertEqual(
+                (root / f"{RUN_ID}.preliminary.latest.json").read_text("utf-8"),
+                canonical_json(third),
+            )
+            self.assertEqual(
+                (root / f"{RUN_ID}.preliminary.latest.md").read_text("utf-8"),
+                render_markdown(third),
             )
 
     def test_preliminary_retry_repairs_each_snapshot_and_latest_stage(self) -> None:
         report = build_report(preliminary_result(), (), "preliminary")
-        for fail_on in (1, 2, 3, 4):
+        for fail_on in (1, 2, 3, 4, 5):
             with self.subTest(fail_on=fail_on), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 with self.assertRaises(ReportError):
@@ -590,6 +639,23 @@ class RunArtifactTests(unittest.TestCase):
                     render_markdown(report),
                 )
 
+    def test_preliminary_lock_symlink_is_rejected_without_touching_target(self) -> None:
+        report = build_report(preliminary_result(), (), "preliminary")
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "reports"
+            root.mkdir()
+            outside = base / "outside.lock"
+            outside.write_text("sentinel", "utf-8")
+            lock = root / f".{RUN_ID}.preliminary.lock"
+            lock.symlink_to(outside)
+
+            with self.assertRaises(ReportError):
+                persist_run_artifacts(report, root, FileAtomicWriter())
+
+            self.assertEqual(outside.read_text("utf-8"), "sentinel")
+            self.assertEqual(tuple(root.iterdir()), (lock,))
+
     def test_persist_refuses_symlinked_report_root(self) -> None:
         report = build_report(preliminary_result(), final_scores(), "final")
         with tempfile.TemporaryDirectory() as directory:
@@ -603,6 +669,36 @@ class RunArtifactTests(unittest.TestCase):
                 persist_run_artifacts(report, report_link, FileAtomicWriter())
 
             self.assertEqual(list(outside.iterdir()), [])
+
+    def test_report_root_swap_cannot_write_through_outside_symlink(self) -> None:
+        report = build_report(preliminary_result(), final_scores(), "final")
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "reports"
+            root.mkdir()
+            moved = base / "moved-reports"
+            outside = base / "outside"
+            outside.mkdir()
+            real_replace = os.replace
+            swapped = False
+
+            def attack_replace(source, destination, *args, **kwargs):
+                nonlocal swapped
+                if not swapped:
+                    root.rename(moved)
+                    root.symlink_to(outside, target_is_directory=True)
+                    (outside / Path(source).name).write_text("attacker", "utf-8")
+                    swapped = True
+                return real_replace(source, destination, *args, **kwargs)
+
+            with patch(
+                "unified_game_radar.report.os.replace",
+                side_effect=attack_replace,
+            ):
+                with self.assertRaises(ReportError):
+                    persist_run_artifacts(report, root, FileAtomicWriter())
+
+            self.assertFalse((outside / f"{RUN_ID}.final.json").exists())
 
 
 class DailyPublicationTests(unittest.TestCase):
@@ -847,6 +943,71 @@ class DailyPublicationTests(unittest.TestCase):
 
         with self.assertRaises(ReportError):
             self._publish(run, report, paths)
+
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertIsNone(self.store.get_publication(run.run_id, "final"))
+
+    def test_daily_parent_swap_cannot_write_through_outside_symlink(self) -> None:
+        run = radar_run(
+            run_id="20260908T080000Z-a1b2c3d8",
+            started_at=datetime(2026, 9, 8, 8, tzinfo=timezone.utc),
+        )
+        report, paths = self._prepare(run)
+        daily = self.report_dir / "daily"
+        daily.mkdir()
+        moved = self.report_dir / "moved-daily"
+        outside = self.report_dir.parent / "outside-daily-swap"
+        outside.mkdir()
+        real_replace = os.replace
+        swapped = False
+
+        def attack_replace(source, destination, *args, **kwargs):
+            nonlocal swapped
+            if not swapped:
+                daily.rename(moved)
+                daily.symlink_to(outside, target_is_directory=True)
+                (outside / Path(source).name).write_text("attacker", "utf-8")
+                swapped = True
+            return real_replace(source, destination, *args, **kwargs)
+
+        with patch(
+            "unified_game_radar.report.os.replace",
+            side_effect=attack_replace,
+        ):
+            with self.assertRaises(ReportError):
+                self._publish(run, report, paths)
+
+        self.assertFalse((outside / "2026-09-08.json").exists())
+        self.assertIsNone(self.store.get_publication(run.run_id, "final"))
+
+    def test_daily_parent_swap_after_last_write_prevents_publication(self) -> None:
+        run = radar_run(
+            run_id="20260909T080000Z-a1b2c3d9",
+            started_at=datetime(2026, 9, 9, 8, tzinfo=timezone.utc),
+        )
+        report, paths = self._prepare(run)
+        daily = self.report_dir / "daily"
+        moved = self.report_dir / "moved-daily-after-write"
+        outside = self.report_dir.parent / "outside-daily-after-write"
+        outside.mkdir()
+        real_replace = os.replace
+        replacements = 0
+
+        def attack_after_replace(source, destination, *args, **kwargs):
+            nonlocal replacements
+            result = real_replace(source, destination, *args, **kwargs)
+            replacements += 1
+            if replacements == 4:
+                daily.rename(moved)
+                daily.symlink_to(outside, target_is_directory=True)
+            return result
+
+        with patch(
+            "unified_game_radar.report.os.replace",
+            side_effect=attack_after_replace,
+        ):
+            with self.assertRaises(ReportError):
+                self._publish(run, report, paths)
 
         self.assertEqual(list(outside.iterdir()), [])
         self.assertIsNone(self.store.get_publication(run.run_id, "final"))
