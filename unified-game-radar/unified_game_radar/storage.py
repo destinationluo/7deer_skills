@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import timedelta
 import json
 from pathlib import Path
 import sqlite3
 from typing import Callable, Iterator, Protocol, Sequence
 
-from .errors import PersistenceError
+from .errors import IdempotencyConflictError, PersistenceError
 from .schemas import (
     GameIdentity,
+    OpportunityEvidence,
+    PlatformObservation,
     PlatformRecord,
     Publication,
     RadarRun,
@@ -20,6 +23,7 @@ from .schemas import (
 
 
 _SCHEMA_VERSION = 1
+_MAX_HISTORY_HOURS = 24 * 366 * 100
 
 
 class _Connection(Protocol):
@@ -752,6 +756,185 @@ class RadarStore:
         assert isinstance(restored, SourceHealth)
         return restored
 
+    def insert_observation(self, observation: PlatformObservation) -> bool:
+        """Insert one immutable observation; exact retries are no-ops."""
+
+        observation_dict = observation.to_dict()
+        canonical = _canonical_json(observation_dict)
+        parameters = (
+            observation.observation_id,
+            observation.run_id,
+            observation.platform,
+            observation.platform_id,
+            observation.provider,
+            observation.surface,
+            observation.geo,
+            observation.locale,
+            _canonical_json(observation_dict["query_parameters"]),
+            observation.metric_definition_version,
+            observation_dict["observed_at"],
+            canonical,
+        )
+
+        def insert() -> bool:
+            existing = self._fetchone(
+                """
+                SELECT canonical_json FROM observations
+                WHERE observation_id = ?
+                """,
+                (observation.observation_id,),
+            )
+            if existing is not None:
+                if existing[0] == canonical:
+                    return False
+                raise IdempotencyConflictError(
+                    "observation_id was reused with changed content: "
+                    f"{observation.observation_id}"
+                )
+            self._execute(
+                """
+                INSERT INTO observations(
+                    observation_id, run_id, platform, platform_id, provider,
+                    surface, geo, locale, query_parameters_json,
+                    metric_definition_version, observed_at, canonical_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                parameters,
+            )
+            return True
+
+        return self._immutable_write(insert)
+
+    def insert_evidence(self, evidence: OpportunityEvidence) -> bool:
+        """Insert immutable evidence for one run/opportunity pair."""
+
+        evidence_dict = evidence.to_dict()
+        canonical = _canonical_json(evidence_dict)
+
+        def insert() -> bool:
+            existing = self._fetchone(
+                """
+                SELECT canonical_json FROM evidence
+                WHERE run_id = ? AND opportunity_id = ?
+                """,
+                (evidence.run_id, evidence.opportunity_id),
+            )
+            if existing is not None:
+                if existing[0] == canonical:
+                    return False
+                raise IdempotencyConflictError(
+                    "evidence key was reused with changed content: "
+                    f"{evidence.run_id}/{evidence.opportunity_id}"
+                )
+            self._execute(
+                """
+                INSERT INTO evidence(
+                    run_id, opportunity_id, observed_at, canonical_json
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    evidence.run_id,
+                    evidence.opportunity_id,
+                    evidence_dict["observed_at"],
+                    canonical,
+                ),
+            )
+            return True
+
+        return self._immutable_write(insert)
+
+    def compatible_observation(
+        self,
+        current: PlatformObservation,
+        target_hours: int,
+        tolerance_hours: int,
+    ) -> PlatformObservation | None:
+        """Return the nearest compatible past observation in a safe window."""
+
+        self._validate_history_window(target_hours, tolerance_hours)
+        try:
+            oldest = current.observed_at - timedelta(
+                hours=target_hours + tolerance_hours
+            )
+            newest = current.observed_at - timedelta(
+                hours=target_hours - tolerance_hours
+            )
+        except (OverflowError, ValueError) as error:
+            raise ValueError(
+                "history window is outside the datetime range"
+            ) from error
+
+        current_dict = current.to_dict()
+        query_parameters_json = _canonical_json(
+            current_dict["query_parameters"]
+        )
+        rows = self._fetchall(
+            """
+            SELECT query_parameters_json, canonical_json
+            FROM observations
+            WHERE platform = ?
+              AND platform_id = ?
+              AND provider = ?
+              AND surface = ?
+              AND geo = ?
+              AND locale = ?
+              AND metric_definition_version = ?
+              AND observed_at >= ?
+              AND observed_at <= ?
+              AND observed_at < ?
+            """,
+            (
+                current.platform,
+                current.platform_id,
+                current.provider,
+                current.surface,
+                current.geo,
+                current.locale,
+                current.metric_definition_version,
+                oldest.isoformat().replace("+00:00", "Z"),
+                newest.isoformat().replace("+00:00", "Z"),
+                current_dict["observed_at"],
+            ),
+        )
+
+        candidates: list[PlatformObservation] = []
+        for stored_parameters, canonical in rows:
+            if stored_parameters != query_parameters_json:
+                continue
+            restored = _restore(canonical, PlatformObservation)
+            assert isinstance(restored, PlatformObservation)
+            if (
+                restored.platform != current.platform
+                or restored.platform_id != current.platform_id
+                or restored.provider != current.provider
+                or restored.surface != current.surface
+                or restored.geo != current.geo
+                or restored.locale != current.locale
+                or restored.metric_definition_version
+                != current.metric_definition_version
+                or not oldest <= restored.observed_at <= newest
+                or restored.observed_at >= current.observed_at
+                or _canonical_json(
+                    restored.to_dict()["query_parameters"]
+                )
+                != query_parameters_json
+            ):
+                continue
+            candidates.append(restored)
+
+        if not candidates:
+            return None
+        target_seconds = target_hours * 60 * 60
+        candidates.sort(key=lambda candidate: candidate.observation_id)
+        candidates.sort(key=lambda candidate: candidate.observed_at, reverse=True)
+        candidates.sort(
+            key=lambda candidate: abs(
+                (current.observed_at - candidate.observed_at).total_seconds()
+                - target_seconds
+            )
+        )
+        return candidates[0]
+
     def save_score(self, score: ScoredOpportunity) -> None:
         self._write(
             """
@@ -841,6 +1024,36 @@ class RadarStore:
         with self.transaction():
             self._execute(statement, parameters)
 
+    def _immutable_write(self, operation: Callable[[], bool]) -> bool:
+        if self._in_transaction:
+            return operation()
+        with self.transaction():
+            return operation()
+
+    @staticmethod
+    def _validate_history_window(
+        target_hours: int,
+        tolerance_hours: int,
+    ) -> None:
+        if (
+            type(target_hours) is not int
+            or target_hours <= 0
+            or target_hours > _MAX_HISTORY_HOURS
+        ):
+            raise ValueError(
+                f"target_hours must be an integer from 1 to {_MAX_HISTORY_HOURS}"
+            )
+        if (
+            type(tolerance_hours) is not int
+            or tolerance_hours < 0
+            or tolerance_hours > _MAX_HISTORY_HOURS
+        ):
+            raise ValueError(
+                "tolerance_hours must be a nonnegative bounded integer"
+            )
+        if target_hours <= tolerance_hours:
+            raise ValueError("target_hours must be greater than tolerance_hours")
+
     def _execute(
         self,
         statement: str,
@@ -858,6 +1071,17 @@ class RadarStore:
         parameters: Sequence[object] = (),
     ) -> tuple[object, ...] | None:
         return _fetchone_on(
+            self._require_connection(),
+            statement,
+            parameters,
+        )
+
+    def _fetchall(
+        self,
+        statement: str,
+        parameters: Sequence[object] = (),
+    ) -> list[tuple[object, ...]]:
+        return _fetchall_on(
             self._require_connection(),
             statement,
             parameters,
