@@ -94,6 +94,18 @@ class NameNormalizationTests(unittest.TestCase):
         with self.assertRaises(InputValidationError):
             normalize_developer("\x00Studio")
 
+    def test_rejects_combining_mark_only_identity_text(self) -> None:
+        for value in ("\u0301", "\u0301\u0308"):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(InputValidationError):
+                    normalize_name(value)
+                with self.assertRaises(InputValidationError):
+                    normalize_developer(value)
+
+    def test_accepts_base_letter_with_combining_mark_after_normalization(self) -> None:
+        self.assertEqual(normalize_name("A\u0338"), "a\u0338")
+        self.assertEqual(normalize_developer("A\u0338 Studio"), "a\u0338 studio")
+
 
 class DomainNormalizationTests(unittest.TestCase):
     def test_canonicalizes_case_idna_www_and_one_trailing_dot(self) -> None:

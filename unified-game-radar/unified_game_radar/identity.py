@@ -42,7 +42,10 @@ def _normalize(value: object, name: str) -> str:
         for character in text
     )
     normalized = " ".join(folded.split())
-    if not normalized:
+    if not normalized or not any(
+        unicodedata.category(character)[0] in {"L", "N"}
+        for character in normalized
+    ):
         raise _invalid(f"{name} must contain letters or numbers after normalization")
     if len(normalized) > _MAX_NAME_LENGTH:
         raise _invalid(f"normalized {name} is too long")
