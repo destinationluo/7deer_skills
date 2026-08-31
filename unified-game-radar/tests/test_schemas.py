@@ -96,20 +96,12 @@ def build_instances() -> tuple[object, ...]:
     envelope = ObservationEnvelope(
         schema_version=1,
         run_id=RUN_ID,
-        collector="itch",
-        surface="newest",
+        collector="steam",
+        surface="most_played",
         geo="US",
         locale="en",
         metric_definition_version=1,
-        observations=(
-            {
-                "platform_id": "studio.example-game",
-                "name": "Example Game",
-                "rank": 1,
-                "browser_playable": True,
-                "optional_metric": None,
-            },
-        ),
+        observations=(observation,),
     )
     trend_point = TrendPoint(
         date=date(2026, 8, 30),
@@ -524,8 +516,9 @@ class SchemaRoundTripTests(unittest.TestCase):
             observation.raw_metrics["provenance"]["surfaces"] = ()
         with self.assertRaises(AttributeError):
             observation.raw_metrics["provenance"]["surfaces"].append("new")
-        with self.assertRaises(TypeError):
-            envelope.observations[0]["rank"] = 2
+        self.assertIsInstance(envelope.observations[0], PlatformObservation)
+        with self.assertRaises(FrozenInstanceError):
+            envelope.observations[0].source_rank = 2
         with self.assertRaises(TypeError):
             health.capabilities["charts"] = False
         with self.assertRaises(TypeError):
@@ -579,12 +572,102 @@ class SchemaValidationTests(unittest.TestCase):
             schema_type = type(instance)
             if schema_type not in per_run_types:
                 continue
-            for invalid in ("", " leading", "bad/id", "x" * 256):
+            for invalid in (
+                "",
+                "x",
+                "20260230T020000Z-a1b2c3d4",
+                "20260831T020000Z-abc",
+                "20260831T020000Z-ABCDEF12",
+                "20260831T020000Z-abcdefg!",
+                "20260831T020000Z-" + "a" * 33,
+                "20260831T020000Z-a1b2c3d4/path",
+                "20260831T020000Z-a1b2c3d4\n",
+            ):
                 with self.subTest(schema=schema_type.__name__, invalid=invalid):
                     payload = instance.to_dict()
                     payload["run_id"] = invalid
                     with self.assertRaises(InputValidationError):
                         schema_type.from_dict(payload)
+
+    def test_structured_run_ids_accept_valid_utc_timestamp_and_suffix_bounds(self) -> None:
+        run = next(
+            instance for instance in build_instances() if isinstance(instance, RadarRun)
+        )
+        for valid in (
+            "20240229T235959Z-01234567",
+            "20260831T020000Z-" + "abcdef01" * 4,
+        ):
+            with self.subTest(valid=valid):
+                payload = run.to_dict()
+                payload["run_id"] = valid
+                parsed = RadarRun.from_dict(payload)
+                self.assertEqual(parsed.run_id, valid)
+                self.assertEqual(parsed.to_dict()["run_id"], valid)
+
+    def test_observation_ids_are_structured_and_validated_in_all_references(self) -> None:
+        by_type = {type(instance): instance for instance in build_instances()}
+        valid_ids = (
+            "itch:studio.example-game:newest:20240229T235959Z",
+            "steam:123456:most_played:20260831T020000Z",
+            "roblox:game_123:up-and-coming:20260831T020000Z",
+        )
+        for valid in valid_ids:
+            with self.subTest(valid=valid):
+                payload = by_type[PlatformObservation].to_dict()
+                payload["observation_id"] = valid
+                parsed = PlatformObservation.from_dict(payload)
+                self.assertEqual(parsed.observation_id, valid)
+                self.assertEqual(parsed.to_dict()["observation_id"], valid)
+
+        invalid_ids = (
+            "x",
+            "epic:123:most_played:20260831T020000Z",
+            "steam:-123:most_played:20260831T020000Z",
+            "steam:123-:most_played:20260831T020000Z",
+            "steam:123..456:most_played:20260831T020000Z",
+            "steam:../123:most_played:20260831T020000Z",
+            "steam:123:MostPlayed:20260831T020000Z",
+            "steam:123:most.played:20260831T020000Z",
+            "steam:123:most__played:20260831T020000Z",
+            "steam:123:most_played:20260230T020000Z",
+            "steam:123:most_played:20260831T020000",
+            "steam:123:most_played:20260831T020000Z\n",
+        )
+        for schema_type in (PlatformObservation, PlatformHeat, NormalizedHeat):
+            for invalid in invalid_ids:
+                with self.subTest(schema=schema_type.__name__, invalid=invalid):
+                    payload = by_type[schema_type].to_dict()
+                    field_name = (
+                        "observation_id"
+                        if schema_type is PlatformObservation
+                        else "observation_ids"
+                    )
+                    payload[field_name] = (
+                        invalid if field_name == "observation_id" else [invalid]
+                    )
+                    with self.assertRaises(InputValidationError):
+                        schema_type.from_dict(payload)
+
+    def test_observation_envelope_contains_only_typed_observations(self) -> None:
+        envelope = next(
+            instance
+            for instance in build_instances()
+            if isinstance(instance, ObservationEnvelope)
+        )
+        wire_value = envelope.to_dict()
+        self.assertIsInstance(wire_value["observations"][0], dict)
+        parsed = ObservationEnvelope.from_dict(wire_value)
+        self.assertIsInstance(parsed.observations[0], PlatformObservation)
+        self.assertEqual(parsed, envelope)
+
+        wire_value["observations"] = [
+            {
+                "platform_id": "untyped",
+                "name": "Loose payload",
+            }
+        ]
+        with self.assertRaises(InputValidationError):
+            ObservationEnvelope.from_dict(wire_value)
 
     def test_opportunity_ids_are_canonical_uuids(self) -> None:
         self.assertEqual(str(UUID(OPPORTUNITY_ID)), OPPORTUNITY_ID)
@@ -808,6 +891,27 @@ class SchemaValidationTests(unittest.TestCase):
         with self.assertRaises(InputValidationError):
             RadarRun.from_dict(run_payload)
 
+    def test_integer_fields_reject_values_above_json_safe_range(self) -> None:
+        by_type = {type(instance): instance for instance in build_instances()}
+        cases = (
+            (PlatformObservation, "metric_definition_version"),
+            (PlatformObservation, "source_rank"),
+            (ObservationEnvelope, "metric_definition_version"),
+            (TrendEvidence, "category"),
+            (ExternalEvidence, "engagement_count"),
+            (SerpEvidence, "relevant_nonofficial_results"),
+            (SerpEvidence, "guide_results"),
+        )
+        for schema_type, field_name in cases:
+            for invalid in (2**53, 10**400):
+                with self.subTest(
+                    schema=schema_type.__name__, field=field_name, invalid=invalid
+                ):
+                    payload = by_type[schema_type].to_dict()
+                    payload[field_name] = invalid
+                    with self.assertRaises(InputValidationError):
+                        schema_type.from_dict(payload)
+
     def test_domains_platforms_intents_and_hashes_are_validated(self) -> None:
         by_type = {type(instance): instance for instance in build_instances()}
 
@@ -853,6 +957,34 @@ class SchemaValidationTests(unittest.TestCase):
                 payload["query_parameters"] = invalid
                 with self.assertRaises(InputValidationError):
                     PlatformObservation.from_dict(payload)
+
+    def test_collection_maps_enforce_json_safe_numeric_boundaries(self) -> None:
+        maximum = 2**53 - 1
+        by_type = {type(instance): instance for instance in build_instances()}
+
+        observation_payload = by_type[PlatformObservation].to_dict()
+        observation_payload["raw_metrics"] = {
+            "maximum": maximum,
+            "minimum": -maximum,
+            "nested": {"exact": maximum},
+        }
+        observation = PlatformObservation.from_dict(observation_payload)
+        self.assertEqual(observation.to_dict()["raw_metrics"], observation_payload["raw_metrics"])
+
+        map_cases = (
+            (PlatformObservation, "raw_metrics"),
+            (PlatformObservation, "query_parameters"),
+            (OutstandingTask, "collection_contract"),
+        )
+        for schema_type, field_name in map_cases:
+            for invalid in (maximum + 1, -maximum - 1, 10**400, 1e20):
+                with self.subTest(
+                    schema=schema_type.__name__, field=field_name, invalid=invalid
+                ):
+                    payload = by_type[schema_type].to_dict()
+                    payload[field_name] = {"nested": {"value": invalid}}
+                    with self.assertRaises(InputValidationError):
+                        schema_type.from_dict(payload)
 
 
 if __name__ == "__main__":

@@ -38,7 +38,16 @@ _OUTSTANDING_ACTIONS = frozenset(
 )
 _AUTHOR_RELATIONS = frozenset({"independent", "developer", "unknown"})
 _MISSING_INTENTS = frozenset({"guide", "codes", "answers", "wiki"})
-_SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,254}\Z")
+MAX_SAFE_INTEGER = 2**53 - 1
+_RUN_ID = re.compile(
+    r"(?P<timestamp>\d{8}T\d{6}Z)-(?P<suffix>[0-9a-f]{8,32})\Z"
+)
+_PLATFORM_ID = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9]|[._-](?=[A-Za-z0-9])){0,127}\Z"
+)
+_SURFACE = re.compile(
+    r"[a-z0-9](?:[a-z0-9]|[_-](?=[a-z0-9])){0,63}\Z"
+)
 _WARNING_CODE = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
 _DOMAIN = re.compile(
     r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
@@ -97,9 +106,13 @@ def _json_value(value: object) -> object:
         return {key: _json_value(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
         return [_json_value(item) for item in value]
-    if isinstance(value, float) and not math.isfinite(value):
-        raise _error("non-finite numbers are not JSON-safe")
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if type(value) is int:
+        return _integer(value, "JSON integer")
+    if type(value) is float:
+        if not math.isfinite(value) or abs(value) > MAX_SAFE_INTEGER:
+            raise _error("JSON numbers must be finite and within the safe range")
+        return value
+    if value is None or type(value) in (str, bool):
         return value
     raise _error(f"unsupported JSON value: {type(value).__name__}")
 
@@ -133,10 +146,61 @@ def _literal(value: object, name: str, allowed: frozenset[str]) -> str:
     return parsed
 
 
-def _safe_identifier(value: object, name: str) -> str:
-    parsed = _text(value, name, 255)
-    if _SAFE_IDENTIFIER.fullmatch(parsed) is None:
-        raise _error(f"{name} must be a safe identifier")
+def _compact_utc_timestamp(value: object, name: str) -> str:
+    parsed = _text(value, name, 16)
+    try:
+        instant = datetime.strptime(parsed, "%Y%m%dT%H%M%SZ")
+    except ValueError as error:
+        raise _error(f"{name} must contain a valid compact UTC timestamp") from error
+    if instant.strftime("%Y%m%dT%H%M%SZ") != parsed:
+        raise _error(f"{name} must contain a canonical compact UTC timestamp")
+    return parsed
+
+
+def _run_id(value: object) -> str:
+    parsed = _text(value, "run_id", 50)
+    match = _RUN_ID.fullmatch(parsed)
+    if match is None:
+        raise _error(
+            "run_id must be YYYYMMDDTHHMMSSZ followed by an 8-32 character "
+            "lowercase hexadecimal suffix"
+        )
+    _compact_utc_timestamp(match.group("timestamp"), "run_id timestamp")
+    return parsed
+
+
+def _platform_id(value: object, name: str = "platform_id") -> str:
+    parsed = _text(value, name, 128)
+    if _PLATFORM_ID.fullmatch(parsed) is None:
+        raise _error(
+            f"{name} must be a 1-128 character safe ASCII token without "
+            "leading, trailing, or consecutive separators"
+        )
+    return parsed
+
+
+def _surface(value: object, name: str = "surface") -> str:
+    parsed = _text(value, name, 64)
+    if _SURFACE.fullmatch(parsed) is None:
+        raise _error(
+            f"{name} must be a lowercase slug without leading, trailing, "
+            "or consecutive separators"
+        )
+    return parsed
+
+
+def _observation_id(value: object) -> str:
+    parsed = _text(value, "observation_id", 240)
+    parts = parsed.split(":")
+    if len(parts) != 4:
+        raise _error(
+            "observation_id must be platform:platform_id:surface:timestamp"
+        )
+    platform, platform_id, surface, timestamp = parts
+    _platform(platform)
+    _platform_id(platform_id)
+    _surface(surface)
+    _compact_utc_timestamp(timestamp, "observation_id timestamp")
     return parsed
 
 
@@ -156,11 +220,12 @@ def _platform(value: object, name: str = "platform") -> str:
 
 
 def _platform_key(value: object) -> str:
-    parsed = _safe_identifier(value, "platform_key")
+    parsed = _text(value, "platform_key", 136)
     platform, separator, platform_id = parsed.partition(":")
-    if not separator or not platform_id:
+    if not separator or not platform_id or ":" in platform_id:
         raise _error("platform_key must contain a platform and platform ID")
     _platform(platform)
+    _platform_id(platform_id)
     return parsed
 
 
@@ -240,6 +305,8 @@ def _integer(
 ) -> int:
     if type(value) is not int:
         raise _error(f"{name} must be an integer")
+    if value < -MAX_SAFE_INTEGER or value > MAX_SAFE_INTEGER:
+        raise _error(f"{name} must be within the JSON safe integer range")
     if minimum is not None and value < minimum:
         raise _error(f"{name} must be at least {minimum}")
     if maximum is not None and value > maximum:
@@ -389,11 +456,15 @@ def _freeze_json(value: object, name: str) -> object:
         return MappingProxyType(frozen)
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_json(item, name) for item in value)
-    if value is None or type(value) in (str, int, bool):
+    if value is None or type(value) in (str, bool):
         return value
+    if type(value) is int:
+        return _integer(value, name)
     if type(value) is float:
-        if not math.isfinite(value):
-            raise _error(f"{name} contains a non-finite number")
+        if not math.isfinite(value) or abs(value) > MAX_SAFE_INTEGER:
+            raise _error(
+                f"{name} contains a number outside the finite JSON safe range"
+            )
         return value
     raise _error(f"{name} contains a non-JSON value")
 
@@ -428,7 +499,7 @@ class RadarRun:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
-        object.__setattr__(self, "run_id", _safe_identifier(self.run_id, "run_id"))
+        object.__setattr__(self, "run_id", _run_id(self.run_id))
         object.__setattr__(self, "started_at", _utc_datetime(self.started_at, "started_at"))
         object.__setattr__(self, "mode", _literal(self.mode, "mode", _RUN_MODES))
         platforms = _text_tuple(
@@ -462,7 +533,7 @@ class PlatformRecord:
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
         object.__setattr__(self, "platform", _platform(self.platform))
-        object.__setattr__(self, "platform_id", _safe_identifier(self.platform_id, "platform_id"))
+        object.__setattr__(self, "platform_id", _platform_id(self.platform_id))
         object.__setattr__(self, "name", _text(self.name, "name", 512))
         object.__setattr__(self, "developer", _optional_text(self.developer, "developer", 512))
         object.__setattr__(self, "official_domain", _optional_domain(self.official_domain, "official_domain"))
@@ -533,12 +604,12 @@ class PlatformObservation:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
-        object.__setattr__(self, "observation_id", _safe_identifier(self.observation_id, "observation_id"))
-        object.__setattr__(self, "run_id", _safe_identifier(self.run_id, "run_id"))
+        object.__setattr__(self, "observation_id", _observation_id(self.observation_id))
+        object.__setattr__(self, "run_id", _run_id(self.run_id))
         object.__setattr__(self, "platform", _platform(self.platform))
-        object.__setattr__(self, "platform_id", _safe_identifier(self.platform_id, "platform_id"))
+        object.__setattr__(self, "platform_id", _platform_id(self.platform_id))
         object.__setattr__(self, "provider", _text(self.provider, "provider", 128))
-        object.__setattr__(self, "surface", _text(self.surface, "surface", 128))
+        object.__setattr__(self, "surface", _surface(self.surface))
         object.__setattr__(self, "geo", _country(self.geo))
         object.__setattr__(self, "locale", _locale(self.locale))
         object.__setattr__(self, "query_parameters", _frozen_mapping(self.query_parameters, "query_parameters"))
@@ -567,20 +638,34 @@ class ObservationEnvelope:
     geo: str
     locale: str
     metric_definition_version: int
-    observations: tuple[Mapping[str, object], ...]
+    observations: tuple[PlatformObservation, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
-        object.__setattr__(self, "run_id", _safe_identifier(self.run_id, "run_id"))
+        object.__setattr__(self, "run_id", _run_id(self.run_id))
         object.__setattr__(self, "collector", _platform(self.collector, "collector"))
-        object.__setattr__(self, "surface", _text(self.surface, "surface", 128))
+        object.__setattr__(self, "surface", _surface(self.surface))
         object.__setattr__(self, "geo", _country(self.geo))
         object.__setattr__(self, "locale", _locale(self.locale))
         object.__setattr__(self, "metric_definition_version", _integer(self.metric_definition_version, "metric_definition_version", minimum=1))
-        observations = tuple(
-            _frozen_mapping(item, "observation")
-            for item in _sequence(self.observations, "observations")
+        observations = _typed_tuple(
+            self.observations,
+            "observations",
+            PlatformObservation,
         )
+        for observation in observations:
+            if observation.run_id != self.run_id:
+                raise _error("envelope observation run_id does not match envelope")
+            if observation.platform != self.collector:
+                raise _error("envelope observation platform does not match collector")
+            if observation.surface.replace("_", "-") != self.surface.replace("_", "-"):
+                raise _error("envelope observation surface does not match envelope")
+            if observation.geo != self.geo or observation.locale != self.locale:
+                raise _error("envelope observation geo/locale does not match envelope")
+            if observation.metric_definition_version != self.metric_definition_version:
+                raise _error(
+                    "envelope observation metric version does not match envelope"
+                )
         object.__setattr__(self, "observations", observations)
 
     def to_dict(self) -> dict[str, object]:
@@ -588,7 +673,10 @@ class ObservationEnvelope:
 
     @classmethod
     def from_dict(cls, value: object) -> "ObservationEnvelope":
-        data = _strict_mapping(value, cls)
+        data = dict(_strict_mapping(value, cls))
+        data["observations"] = _from_record_tuple(
+            data["observations"], "observations", PlatformObservation
+        )
         return cls(**data)  # type: ignore[arg-type]
 
 
@@ -748,7 +836,7 @@ class OpportunityEvidence:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
-        object.__setattr__(self, "run_id", _safe_identifier(self.run_id, "run_id"))
+        object.__setattr__(self, "run_id", _run_id(self.run_id))
         object.__setattr__(self, "opportunity_id", _uuid(self.opportunity_id, "opportunity_id"))
         object.__setattr__(self, "observed_at", _utc_datetime(self.observed_at, "observed_at"))
         if self.trends is not None and not isinstance(self.trends, TrendEvidence):
@@ -816,7 +904,7 @@ class SourceHealth:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
-        object.__setattr__(self, "run_id", _safe_identifier(self.run_id, "run_id"))
+        object.__setattr__(self, "run_id", _run_id(self.run_id))
         object.__setattr__(self, "collector", _platform(self.collector, "collector"))
         object.__setattr__(self, "status", _literal(self.status, "status", _SOURCE_STATUSES))
         object.__setattr__(self, "observed_at", _utc_datetime(self.observed_at, "observed_at"))
@@ -844,10 +932,10 @@ class PlatformHeat:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
-        object.__setattr__(self, "run_id", _safe_identifier(self.run_id, "run_id"))
+        object.__setattr__(self, "run_id", _run_id(self.run_id))
         object.__setattr__(self, "platform_key", _platform_key(self.platform_key))
-        object.__setattr__(self, "surface", _text(self.surface, "surface", 128))
-        object.__setattr__(self, "observation_ids", _text_tuple(self.observation_ids, "observation_ids", allow_empty=False, validator=lambda item: _safe_identifier(item, "observation_id")))
+        object.__setattr__(self, "surface", _surface(self.surface))
+        object.__setattr__(self, "observation_ids", _text_tuple(self.observation_ids, "observation_ids", allow_empty=False, validator=_observation_id))
         object.__setattr__(self, "heat", _number(self.heat, "heat", 0, 100))
 
     def to_dict(self) -> dict[str, object]:
@@ -871,10 +959,10 @@ class NormalizedHeat:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
-        object.__setattr__(self, "run_id", _safe_identifier(self.run_id, "run_id"))
+        object.__setattr__(self, "run_id", _run_id(self.run_id))
         object.__setattr__(self, "platform_key", _platform_key(self.platform_key))
-        object.__setattr__(self, "surface", _text(self.surface, "surface", 128))
-        object.__setattr__(self, "observation_ids", _text_tuple(self.observation_ids, "observation_ids", allow_empty=False, validator=lambda item: _safe_identifier(item, "observation_id")))
+        object.__setattr__(self, "surface", _surface(self.surface))
+        object.__setattr__(self, "observation_ids", _text_tuple(self.observation_ids, "observation_ids", allow_empty=False, validator=_observation_id))
         object.__setattr__(self, "heat", _number(self.heat, "heat", 0, 100))
         object.__setattr__(self, "platform_score", _number(self.platform_score, "platform_score", 0, 30))
 
@@ -903,7 +991,7 @@ class ScoredOpportunity:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
-        object.__setattr__(self, "run_id", _safe_identifier(self.run_id, "run_id"))
+        object.__setattr__(self, "run_id", _run_id(self.run_id))
         object.__setattr__(self, "opportunity_id", _uuid(self.opportunity_id, "opportunity_id"))
         object.__setattr__(self, "demand_state", _literal(self.demand_state, "demand_state", _DEMAND_STATES))
         object.__setattr__(self, "platform_score", _number(self.platform_score, "platform_score", 0, 30))
@@ -935,7 +1023,7 @@ class RawArtifact:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
-        object.__setattr__(self, "run_id", _safe_identifier(self.run_id, "run_id"))
+        object.__setattr__(self, "run_id", _run_id(self.run_id))
         object.__setattr__(self, "provider", _text(self.provider, "provider", 128))
         object.__setattr__(self, "path", _path_text(self.path, "path"))
         object.__setattr__(self, "observed_at", _utc_datetime(self.observed_at, "observed_at"))
@@ -966,7 +1054,7 @@ class Publication:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
-        object.__setattr__(self, "run_id", _safe_identifier(self.run_id, "run_id"))
+        object.__setattr__(self, "run_id", _run_id(self.run_id))
         object.__setattr__(self, "phase", _literal(self.phase, "phase", _PHASES))
         object.__setattr__(self, "published_at", _utc_datetime(self.published_at, "published_at"))
         object.__setattr__(self, "report_json", _path_text(self.report_json, "report_json"))
@@ -994,9 +1082,9 @@ class OutstandingTask:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
-        object.__setattr__(self, "run_id", _safe_identifier(self.run_id, "run_id"))
+        object.__setattr__(self, "run_id", _run_id(self.run_id))
         object.__setattr__(self, "collector", _platform(self.collector, "collector"))
-        object.__setattr__(self, "surface", _text(self.surface, "surface", 128))
+        object.__setattr__(self, "surface", _surface(self.surface))
         object.__setattr__(self, "action", _literal(self.action, "action", _OUTSTANDING_ACTIONS))
         object.__setattr__(self, "collection_contract", _frozen_mapping(self.collection_contract, "collection_contract"))
 
@@ -1022,7 +1110,7 @@ class CommandManifest:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
-        object.__setattr__(self, "run_id", _safe_identifier(self.run_id, "run_id"))
+        object.__setattr__(self, "run_id", _run_id(self.run_id))
         object.__setattr__(self, "phase", _literal(self.phase, "phase", _PHASES))
         object.__setattr__(self, "report_json", _path_text(self.report_json, "report_json"))
         object.__setattr__(self, "report_markdown", _path_text(self.report_markdown, "report_markdown"))
@@ -1053,7 +1141,7 @@ class PreliminaryResult:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
-        object.__setattr__(self, "run_id", _safe_identifier(self.run_id, "run_id"))
+        object.__setattr__(self, "run_id", _run_id(self.run_id))
         object.__setattr__(self, "candidates", _typed_tuple(self.candidates, "candidates", GameIdentity))
         object.__setattr__(self, "source_health", _typed_tuple(self.source_health, "source_health", SourceHealth))
         object.__setattr__(self, "warnings", _typed_tuple(self.warnings, "warnings", WarningRecord))
@@ -1076,6 +1164,7 @@ __all__ = [
     "CommandManifest",
     "ExternalEvidence",
     "GameIdentity",
+    "MAX_SAFE_INTEGER",
     "NormalizedHeat",
     "ObservationEnvelope",
     "OpportunityEvidence",
