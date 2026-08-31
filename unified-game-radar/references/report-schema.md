@@ -114,10 +114,12 @@ snapshots remain immutable. The revisions sidecar contains only the run ID,
 content hashes, their consecutive first-persistence revision numbers, and the
 current hash/revision. It never embeds the canonical report payload. Updates
 are serialized by a run-scoped flock opened relative to the anchored report
-directory. A new hash advances the sidecar before the latest pair is written,
-so a retry repairs a partial latest pair. A retry of a known older hash repairs
-only its immutable snapshot and never rolls latest backward. Identical current
-retries are no-ops. Reusing a final or hashed snapshot path with different
+directory, and the visible lock pathname must still name the locked inode
+before and after the update. A new hash advances the sidecar before the latest
+pair is written, so a retry repairs a partial latest pair. A retry of a known
+older hash loads the sidecar's current content-addressed snapshot and repairs
+the current latest pair; it can neither mask a mixed JSON/Markdown pair nor
+roll latest backward. Reusing a final or hashed snapshot path with different
 content is a conflict.
 
 The scheduled collection at 10:00 in the configured timezone records only the
@@ -141,14 +143,23 @@ therefore cannot invalidate an earlier audit record.
 Final persistence order is run JSON, run Markdown, dated JSON, dated Markdown,
 latest JSON, latest Markdown, then the SQLite `Publication`. Preliminary order
 is hashed JSON, hashed Markdown, revision sidecar (for a first-seen hash),
-preliminary-latest JSON, then preliminary-latest Markdown. Each file uses an
-atomic sibling replacement and exact-content comparison. The configured root and
-each child directory are opened with `O_NOFOLLOW`; reads, lock creation,
-temporary creation, fsync, and atomic replacement use those directory handles
-rather than re-resolving pathnames. Replacing the visible root or `daily`
-pathname during a write therefore cannot redirect bytes outside the originally
-anchored report tree. A retry accepts already-correct files and repairs missing
-or incomplete mutable pairs. A retry of an already-recorded historical
-publication returns its original record without rolling back a newer daily
-view. The database write runs in a transaction only after every required file
-succeeds; therefore a file-stage failure cannot create a false publication row.
+preliminary-latest JSON, then preliminary-latest Markdown. Immutable files use
+an exclusive sibling hard-link install that cannot replace an existing name;
+mutable views use sibling replacement. Both paths verify the installed regular
+file's inode and exact content. A failed or poisoned install is retired from the
+official name before the error is returned, leaving that name retryable.
+
+The configured root and each child directory are opened with `O_NOFOLLOW`;
+reads, lock creation, temporary creation, fsync, and atomic installation use
+those directory handles rather than re-resolving pathnames. Replacing the
+visible root or `daily` pathname during a write therefore cannot redirect bytes
+outside the originally anchored report tree. Daily dated/latest selection, the
+four mutable daily file stages, and the publication transaction are serialized
+by a report-root-anchored global flock whose visible inode is validated while held.
+A retry accepts already-correct files and repairs missing or incomplete mutable
+pairs. A retry of an already-recorded historical publication returns its
+original record without rolling back a newer daily view. Immediately before
+the database transaction can commit, the immutable run pair, daily binding,
+publication-lock inode, and visible report-root binding are revalidated. The
+database write is last and rolls back on any failed validation, so a file-stage
+or confinement failure cannot create a false publication row.

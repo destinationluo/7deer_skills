@@ -92,10 +92,24 @@ class _ReportConfinement:
     inode: int
 
 
+@dataclass(frozen=True)
+class _ReportLockBinding:
+    filename: str
+    device: int
+    inode: int
+
+
 class AtomicWriter(Protocol):
     """Minimal injectable atomic-text writer used by report persistence."""
 
     def write_text_at(
+        self,
+        directory_fd: int,
+        filename: str,
+        content: str,
+    ) -> None: ...
+
+    def write_text_immutable_at(
         self,
         directory_fd: int,
         filename: str,
@@ -112,9 +126,40 @@ class FileAtomicWriter:
         filename: str,
         content: str,
     ) -> None:
+        self._write_text_at(
+            directory_fd,
+            filename,
+            content,
+            immutable=False,
+        )
+
+    def write_text_immutable_at(
+        self,
+        directory_fd: int,
+        filename: str,
+        content: str,
+    ) -> None:
+        self._write_text_at(
+            directory_fd,
+            filename,
+            content,
+            immutable=True,
+        )
+
+    def _write_text_at(
+        self,
+        directory_fd: int,
+        filename: str,
+        content: str,
+        *,
+        immutable: bool,
+    ) -> None:
         _safe_filename(filename)
         temporary_name: str | None = None
         temporary_fd: int | None = None
+        temporary_status: os.stat_result | None = None
+        installed_status: os.stat_result | None = None
+        committed = False
         try:
             parent_status = os.fstat(directory_fd)
             if not stat.S_ISDIR(parent_status.st_mode):
@@ -153,44 +198,219 @@ class FileAtomicWriter:
                 view = view[written:]
             os.fsync(temporary_fd)
             temporary_status = os.fstat(temporary_fd)
+            if not stat.S_ISREG(temporary_status.st_mode):
+                raise ReportError("report temporary file must be regular")
             visible_temporary = _stat_at(directory_fd, temporary_name)
-            if visible_temporary is None or (
-                visible_temporary.st_dev,
-                visible_temporary.st_ino,
-            ) != (temporary_status.st_dev, temporary_status.st_ino):
+            if visible_temporary is None or not _same_regular_inode(
+                temporary_status,
+                visible_temporary,
+            ):
                 raise ReportError("report temporary file changed before replace")
-            os.replace(
-                temporary_name,
+            if immutable:
+                try:
+                    os.link(
+                        temporary_name,
+                        filename,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError as error:
+                    raise ReportError(
+                        "immutable report destination changed during write"
+                    ) from error
+                installed_status = temporary_status
+                linked_destination = _stat_at(directory_fd, filename)
+                linked_source = _stat_at(directory_fd, temporary_name)
+                if (
+                    linked_destination is None
+                    or linked_source is None
+                    or not _same_entry_identity(
+                        linked_destination,
+                        linked_source,
+                    )
+                ):
+                    raise ReportError("immutable report link identity is unsafe")
+                installed_status = linked_destination
+            else:
+                os.replace(
+                    temporary_name,
+                    filename,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
+                temporary_name = None
+                installed_status = _stat_at(directory_fd, filename)
+                if installed_status is None:
+                    raise ReportError("report destination disappeared after replace")
+            _verify_writer_destination(
+                directory_fd,
                 filename,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
+                temporary_status,
+                encoded,
             )
-            temporary_name = None
             os.fsync(directory_fd)
+            _verify_writer_destination(
+                directory_fd,
+                filename,
+                temporary_status,
+                encoded,
+            )
+            committed = True
         except ReportError:
             raise
         except (OSError, UnicodeError) as error:
             raise ReportError("unable to atomically write report file") from error
         finally:
-            active_exception = sys.exc_info()[0] is not None
+            primary_error = sys.exc_info()[1]
+            cleanup_errors: list[BaseException] = []
+            if not committed and installed_status is not None:
+                _retire_report_entry(
+                    directory_fd,
+                    filename,
+                    installed_status,
+                    cleanup_errors,
+                )
+            if temporary_name is not None and temporary_status is not None:
+                _unlink_owned_report_entry(
+                    directory_fd,
+                    temporary_name,
+                    temporary_status,
+                    cleanup_errors,
+                )
             if temporary_fd is not None:
                 try:
                     os.close(temporary_fd)
                 except OSError as error:
-                    if not active_exception:
-                        raise ReportError(
-                            "unable to close report temporary file"
-                        ) from error
-            if temporary_name is not None:
-                try:
-                    os.unlink(temporary_name, dir_fd=directory_fd)
-                except FileNotFoundError:
-                    pass
-                except OSError as error:
-                    if not active_exception:
-                        raise ReportError(
-                            "unable to clean report temporary file"
-                        ) from error
+                    cleanup_errors.append(error)
+            _raise_or_note_report_cleanup(primary_error, cleanup_errors)
+
+
+def _same_regular_inode(
+    expected: os.stat_result,
+    actual: os.stat_result,
+) -> bool:
+    return (
+        stat.S_ISREG(actual.st_mode)
+        and expected.st_dev == actual.st_dev
+        and expected.st_ino == actual.st_ino
+    )
+
+
+def _same_entry_identity(
+    expected: os.stat_result,
+    actual: os.stat_result,
+) -> bool:
+    return (
+        stat.S_IFMT(expected.st_mode) == stat.S_IFMT(actual.st_mode)
+        and expected.st_dev == actual.st_dev
+        and expected.st_ino == actual.st_ino
+    )
+
+
+def _verify_writer_destination(
+    directory_fd: int,
+    filename: str,
+    expected_status: os.stat_result,
+    expected: bytes,
+) -> None:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+        actual_status = os.fstat(descriptor)
+        if not _same_regular_inode(expected_status, actual_status):
+            raise ReportError("installed report identity is unsafe")
+        chunks: list[bytes] = []
+        remaining = len(expected) + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if b"".join(chunks) != expected:
+            raise ReportError("installed report content is unsafe")
+        visible = _stat_at(directory_fd, filename)
+        if visible is None or not _same_regular_inode(expected_status, visible):
+            raise ReportError("installed report path changed")
+    except ReportError:
+        raise
+    except OSError as error:
+        raise ReportError("unable to verify installed report") from error
+    finally:
+        if descriptor is not None:
+            primary_error = sys.exc_info()[1]
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if primary_error is None:
+                    raise ReportError("unable to close installed report") from error
+                _add_report_cleanup_note(
+                    primary_error,
+                    "installed report descriptor cleanup also failed",
+                )
+
+
+def _retire_report_entry(
+    directory_fd: int,
+    filename: str,
+    expected_status: os.stat_result,
+    errors: list[BaseException],
+) -> None:
+    try:
+        visible = _stat_at(directory_fd, filename)
+        if visible is None or not _same_entry_identity(expected_status, visible):
+            return
+        retired_name = f".{filename}.{secrets.token_hex(16)}.failed.tmp"
+        os.rename(
+            filename,
+            retired_name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        retired = _stat_at(directory_fd, retired_name)
+        if retired is None or not _same_entry_identity(expected_status, retired):
+            errors.append(ReportError("failed report retirement identity changed"))
+    except OSError as error:
+        errors.append(error)
+
+
+def _unlink_owned_report_entry(
+    directory_fd: int,
+    filename: str,
+    expected_status: os.stat_result,
+    errors: list[BaseException],
+) -> None:
+    try:
+        visible = _stat_at(directory_fd, filename)
+        if visible is None or not _same_entry_identity(expected_status, visible):
+            return
+        os.unlink(filename, dir_fd=directory_fd)
+    except OSError as error:
+        errors.append(error)
+
+
+def _raise_or_note_report_cleanup(
+    primary_error: BaseException | None,
+    errors: Sequence[BaseException],
+) -> None:
+    if not errors:
+        return
+    if primary_error is not None:
+        _add_report_cleanup_note(primary_error, "report cleanup also failed")
+        return
+    raise ReportError("unable to clean report temporary state") from errors[0]
+
+
+def _add_report_cleanup_note(error: BaseException, message: str) -> None:
+    if hasattr(error, "add_note"):
+        error.add_note(message)
 
 
 def _safe_filename(filename: object) -> str:
@@ -1065,7 +1285,11 @@ def _write_content(
         if immutable and existing is not None:
             raise ReportError("immutable run report conflicts with existing content")
         try:
-            writer.write_text_at(parent_fd, filename, content)
+            immutable_method = getattr(writer, "write_text_immutable_at", None)
+            if immutable and callable(immutable_method):
+                immutable_method(parent_fd, filename, content)
+            else:
+                writer.write_text_at(parent_fd, filename, content)
         except ReportError:
             raise
         except Exception as error:
@@ -1117,14 +1341,31 @@ def _preliminary_revision_path(
     return report_dir / f"{report['run_id']}.preliminary.revisions.json"
 
 
+def _validate_report_lock(
+    root_fd: int,
+    binding: _ReportLockBinding,
+) -> None:
+    visible = _stat_at(root_fd, binding.filename)
+    if (
+        visible is None
+        or not stat.S_ISREG(visible.st_mode)
+        or visible.st_dev != binding.device
+        or visible.st_ino != binding.inode
+    ):
+        raise ReportError("report lock pathname changed while held")
+
+
 @contextmanager
-def _preliminary_lock(root_fd: int, run_id: str) -> Iterator[None]:
-    filename = _safe_filename(f".{run_id}.preliminary.lock")
+def _anchored_report_lock(
+    root_fd: int,
+    filename: str,
+) -> Iterator[_ReportLockBinding]:
+    safe_filename = _safe_filename(filename)
     descriptor: int | None = None
     locked = False
     try:
         descriptor = os.open(
-            filename,
+            safe_filename,
             os.O_RDWR
             | os.O_CREAT
             | getattr(os, "O_NOFOLLOW", 0)
@@ -1134,32 +1375,47 @@ def _preliminary_lock(root_fd: int, run_id: str) -> Iterator[None]:
         )
         status = os.fstat(descriptor)
         if not stat.S_ISREG(status.st_mode):
-            raise ReportError("preliminary revision lock must be a regular file")
+            raise ReportError("report lock must be a regular file")
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         locked = True
-        yield
+        binding = _ReportLockBinding(
+            filename=safe_filename,
+            device=status.st_dev,
+            inode=status.st_ino,
+        )
+        _validate_report_lock(root_fd, binding)
+        yield binding
+        _validate_report_lock(root_fd, binding)
     except ReportError:
         raise
     except OSError as error:
-        raise ReportError("unable to lock preliminary revisions") from error
+        raise ReportError("unable to lock report publication") from error
     finally:
-        active_exception = sys.exc_info()[0] is not None
+        primary_error = sys.exc_info()[1]
+        cleanup_errors: list[BaseException] = []
         if descriptor is not None and locked:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
             except OSError as error:
-                if not active_exception:
-                    raise ReportError(
-                        "unable to unlock preliminary revisions"
-                    ) from error
+                cleanup_errors.append(error)
         if descriptor is not None:
             try:
                 os.close(descriptor)
             except OSError as error:
-                if not active_exception:
-                    raise ReportError(
-                        "unable to close preliminary revision lock"
-                    ) from error
+                cleanup_errors.append(error)
+        _raise_or_note_report_cleanup(primary_error, cleanup_errors)
+
+
+@contextmanager
+def _preliminary_lock(
+    root_fd: int,
+    run_id: str,
+) -> Iterator[_ReportLockBinding]:
+    with _anchored_report_lock(
+        root_fd,
+        f".{run_id}.preliminary.lock",
+    ) as binding:
+        yield binding
 
 
 def _revision_index_json(index: Mapping[str, object]) -> str:
@@ -1221,7 +1477,7 @@ def _advance_preliminary_revision(
     writer: AtomicWriter,
     confinement: _ReportConfinement,
     root_fd: int,
-) -> bool:
+) -> str:
     index_path = _preliminary_revision_path(report, report_dir)
     existing = _read_existing(index_path, confinement, root_fd)
     if existing is None:
@@ -1239,7 +1495,7 @@ def _advance_preliminary_revision(
             for entry in index["revisions"]  # type: ignore[union-attr]
         }
         if digest in known:
-            return index["current_sha256"] == digest
+            return str(index["current_sha256"])
         revision = len(known) + 1
         index["revisions"].append(  # type: ignore[union-attr]
             {"revision": revision, "sha256": digest}
@@ -1254,7 +1510,44 @@ def _advance_preliminary_revision(
         root_fd,
         immutable=False,
     )
-    return True
+    return digest
+
+
+def _load_current_preliminary_revision(
+    run_id: str,
+    digest: str,
+    report_dir: Path,
+    writer: AtomicWriter,
+    confinement: _ReportConfinement,
+    root_fd: int,
+) -> dict[str, object]:
+    stem = f"{run_id}.preliminary.{digest}"
+    json_path = report_dir / f"{stem}.json"
+    markdown_path = report_dir / f"{stem}.md"
+    content = _read_existing(json_path, confinement, root_fd)
+    if content is None:
+        raise ReportError("current preliminary revision JSON is missing")
+    try:
+        parsed = json.loads(content)
+        canonical = _canonical_report(parsed)
+    except (ValueError, UnicodeError, RecursionError, InputValidationError) as error:
+        raise ReportError("current preliminary revision is invalid") from error
+    if (
+        canonical["run_id"] != run_id
+        or canonical["phase"] != "preliminary"
+        or _canonical_json(canonical) != content
+        or hashlib.sha256(content.encode("utf-8")).hexdigest() != digest
+    ):
+        raise ReportError("current preliminary revision does not match its index")
+    _write_content(
+        markdown_path,
+        render_markdown(canonical),
+        writer,
+        confinement,
+        root_fd,
+        immutable=True,
+    )
+    return canonical
 
 
 def persist_run_artifacts(
@@ -1295,7 +1588,7 @@ def persist_run_artifacts(
             )
             if canonical["phase"] == "preliminary":
                 digest = paths[0].name.removesuffix(".json").rsplit(".", 1)[-1]
-                is_current = _advance_preliminary_revision(
+                current_digest = _advance_preliminary_revision(
                     canonical,
                     digest,
                     report_dir,
@@ -1303,16 +1596,27 @@ def persist_run_artifacts(
                     confinement,
                     root_fd,
                 )
-                if is_current:
-                    latest_paths = _preliminary_latest_paths(canonical, report_dir)
-                    _persist_mutable_pair(
-                        canonical,
-                        latest_paths[0],
-                        latest_paths[1],
+                current_report = (
+                    canonical
+                    if current_digest == digest
+                    else _load_current_preliminary_revision(
+                        str(canonical["run_id"]),
+                        current_digest,
+                        report_dir,
                         parsed_writer,
                         confinement,
                         root_fd,
                     )
+                )
+                latest_paths = _preliminary_latest_paths(canonical, report_dir)
+                _persist_mutable_pair(
+                    current_report,
+                    latest_paths[0],
+                    latest_paths[1],
+                    parsed_writer,
+                    confinement,
+                    root_fd,
+                )
     return paths
 
 
@@ -1384,20 +1688,35 @@ def _publication_allowed(
 
 
 def _record_publication(store: RadarStore, publication: Publication) -> Publication:
-    with store.transaction():
-        existing = store.get_publication(publication.run_id, publication.phase)
-        if existing is not None:
-            if (
-                existing.report_json != publication.report_json
-                or existing.report_markdown != publication.report_markdown
-                or existing.daily_date != publication.daily_date
-                or existing.advances_daily_latest
-                != publication.advances_daily_latest
-            ):
-                raise ReportError("publication retry conflicts with canonical record")
-            return existing
-        store.publish(publication)
+    existing = store.get_publication(publication.run_id, publication.phase)
+    if existing is not None:
+        if (
+            existing.report_json != publication.report_json
+            or existing.report_markdown != publication.report_markdown
+            or existing.daily_date != publication.daily_date
+            or existing.advances_daily_latest
+            != publication.advances_daily_latest
+        ):
+            raise ReportError("publication retry conflicts with canonical record")
+        return existing
+    store.publish(publication)
     return publication
+
+
+def _validate_run_report_pair(
+    canonical: Mapping[str, object],
+    run_paths: tuple[Path, Path],
+    confinement: _ReportConfinement,
+    root_fd: int,
+) -> None:
+    expected = (
+        _canonical_json(canonical),
+        render_markdown(canonical),
+    )
+    if tuple(
+        _read_existing(path, confinement, root_fd) for path in run_paths
+    ) != expected:
+        raise ReportError("immutable run report pair is incomplete or inconsistent")
 
 
 def _existing_publication(
@@ -1458,121 +1777,134 @@ def publish_daily_if_allowed(
         Path(config.report_dir),
         create=False,
     )
-    expected_run_content = (
-        _canonical_json(canonical),
-        render_markdown(canonical),
-    )
     daily_date = run.started_at.astimezone(ZoneInfo(config.timezone)).date()
     publication_allowed = _publication_allowed(config, run, canonical)
     daily_root = Path(config.report_dir) / "daily"
     with _open_report_root(confinement) as root_fd:
-        if tuple(
-            _read_existing(path, confinement, root_fd) for path in run_paths
-        ) != expected_run_content:
-            raise ReportError(
-                "immutable run report pair is incomplete or inconsistent"
-            )
-        daily_binding = None
-        if publication_allowed:
-            daily_binding = _parent_binding(
-                daily_root / "confinement-check",
+        with _anchored_report_lock(
+            root_fd,
+            ".daily-publication.lock",
+        ) as publication_lock:
+            _validate_run_report_pair(
+                canonical,
+                run_paths,
                 confinement,
                 root_fd,
-                create=False,
             )
-        existing_publication = _existing_publication(
-            store,
-            run,
-            canonical,
-            run_paths,
-            daily_date,
-            publication_allowed,
-        )
-        if existing_publication is not None:
-            return existing_publication
-
-        if not publication_allowed:
-            publication = Publication(
-                schema_version=1,
-                run_id=run.run_id,
-                phase=canonical["phase"],  # type: ignore[arg-type]
-                published_at=published_at,
-                report_json=str(run_paths[0]),
-                report_markdown=str(run_paths[1]),
-                daily_date=daily_date,
-                advances_daily_latest=False,
-            )
-        else:
-            if daily_binding is None:
+            daily_binding = None
+            if publication_allowed:
                 daily_binding = _parent_binding(
                     daily_root / "confinement-check",
                     confinement,
                     root_fd,
-                    create=True,
+                    create=False,
                 )
-            if daily_binding is None:
-                raise ReportError("unable to create daily report directory")
-            date_stem = daily_date.isoformat()
-            dated_paths = (
-                daily_root / f"{date_stem}.json",
-                daily_root / f"{date_stem}.md",
+            existing_publication = _existing_publication(
+                store,
+                run,
+                canonical,
+                run_paths,
+                daily_date,
+                publication_allowed,
             )
-            existing_dated = _load_report(
-                dated_paths[0],
-                confinement,
-                root_fd,
-            )
-            dated_target = canonical
-            if (
-                existing_dated is not None
-                and _report_order(existing_dated) > _report_order(canonical)
-            ):
-                dated_target = existing_dated
-            _persist_mutable_pair(
-                dated_target,
-                dated_paths[0],
-                dated_paths[1],
-                parsed_writer,
-                confinement,
-                root_fd,
-            )
-            dated_is_current = dated_target["run_id"] == run.run_id
+            if existing_publication is not None:
+                return existing_publication
 
-            latest_paths = (daily_root / "latest.json", daily_root / "latest.md")
-            existing_latest = _load_report(
-                latest_paths[0],
-                confinement,
-                root_fd,
-            )
-            latest_target = canonical
-            if (
-                existing_latest is not None
-                and _report_order(existing_latest) > _report_order(canonical)
-            ):
-                latest_target = existing_latest
-            _persist_mutable_pair(
-                latest_target,
-                latest_paths[0],
-                latest_paths[1],
-                parsed_writer,
-                confinement,
-                root_fd,
-            )
-            advances_latest = (
-                dated_is_current and latest_target["run_id"] == run.run_id
-            )
-            publication = Publication(
-                schema_version=1,
-                run_id=run.run_id,
-                phase=canonical["phase"],  # type: ignore[arg-type]
-                published_at=published_at,
-                report_json=str(run_paths[0]),
-                report_markdown=str(run_paths[1]),
-                daily_date=daily_date,
-                advances_daily_latest=advances_latest,
-            )
-            _validate_child_binding(root_fd, "daily", daily_binding)
-    return _record_publication(store, publication)
+            if not publication_allowed:
+                publication = Publication(
+                    schema_version=1,
+                    run_id=run.run_id,
+                    phase=canonical["phase"],  # type: ignore[arg-type]
+                    published_at=published_at,
+                    report_json=str(run_paths[0]),
+                    report_markdown=str(run_paths[1]),
+                    daily_date=daily_date,
+                    advances_daily_latest=False,
+                )
+            else:
+                if daily_binding is None:
+                    daily_binding = _parent_binding(
+                        daily_root / "confinement-check",
+                        confinement,
+                        root_fd,
+                        create=True,
+                    )
+                if daily_binding is None:
+                    raise ReportError("unable to create daily report directory")
+                date_stem = daily_date.isoformat()
+                dated_paths = (
+                    daily_root / f"{date_stem}.json",
+                    daily_root / f"{date_stem}.md",
+                )
+                existing_dated = _load_report(
+                    dated_paths[0],
+                    confinement,
+                    root_fd,
+                )
+                dated_target = canonical
+                if (
+                    existing_dated is not None
+                    and _report_order(existing_dated) > _report_order(canonical)
+                ):
+                    dated_target = existing_dated
+                _persist_mutable_pair(
+                    dated_target,
+                    dated_paths[0],
+                    dated_paths[1],
+                    parsed_writer,
+                    confinement,
+                    root_fd,
+                )
+                dated_is_current = dated_target["run_id"] == run.run_id
+
+                latest_paths = (daily_root / "latest.json", daily_root / "latest.md")
+                existing_latest = _load_report(
+                    latest_paths[0],
+                    confinement,
+                    root_fd,
+                )
+                latest_target = canonical
+                if (
+                    existing_latest is not None
+                    and _report_order(existing_latest) > _report_order(canonical)
+                ):
+                    latest_target = existing_latest
+                _persist_mutable_pair(
+                    latest_target,
+                    latest_paths[0],
+                    latest_paths[1],
+                    parsed_writer,
+                    confinement,
+                    root_fd,
+                )
+                advances_latest = (
+                    dated_is_current and latest_target["run_id"] == run.run_id
+                )
+                publication = Publication(
+                    schema_version=1,
+                    run_id=run.run_id,
+                    phase=canonical["phase"],  # type: ignore[arg-type]
+                    published_at=published_at,
+                    report_json=str(run_paths[0]),
+                    report_markdown=str(run_paths[1]),
+                    daily_date=daily_date,
+                    advances_daily_latest=advances_latest,
+                )
+                _validate_child_binding(root_fd, "daily", daily_binding)
+
+            with store.transaction():
+                recorded = _record_publication(store, publication)
+                _validate_run_report_pair(
+                    canonical,
+                    run_paths,
+                    confinement,
+                    root_fd,
+                )
+                if daily_binding is not None:
+                    _validate_child_binding(root_fd, "daily", daily_binding)
+                _validate_report_lock(root_fd, publication_lock)
+                _validate_report_root(confinement)
+            return recorded
 
 
 __all__ = [

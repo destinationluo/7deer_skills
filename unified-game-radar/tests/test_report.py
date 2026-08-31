@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import tempfile
 import sys
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -19,6 +20,7 @@ sys.path.insert(0, str(PROJECT_DIR))
 
 from unified_game_radar.config import RadarConfig
 from unified_game_radar.errors import InputValidationError, ReportError
+import unified_game_radar.report as report_module
 from unified_game_radar.report import (
     FileAtomicWriter,
     build_report,
@@ -259,6 +261,17 @@ class FailAfterWriter:
     ) -> None:
         self.calls += 1
         self.delegate.write_text_at(directory_fd, filename, content)
+        if self.calls == self.fail_on:
+            raise OSError(f"failure after write {self.fail_on}")
+
+    def write_text_immutable_at(
+        self,
+        directory_fd: int,
+        filename: str,
+        content: str,
+    ) -> None:
+        self.calls += 1
+        self.delegate.write_text_immutable_at(directory_fd, filename, content)
         if self.calls == self.fail_on:
             raise OSError(f"failure after write {self.fail_on}")
 
@@ -639,6 +652,103 @@ class RunArtifactTests(unittest.TestCase):
                     render_markdown(report),
                 )
 
+    def test_old_preliminary_retry_repairs_the_current_mixed_latest_pair(self) -> None:
+        first = build_report(preliminary_result(), (), "preliminary")
+        changed_result = preliminary_result()
+        changed_identity = replace(
+            changed_result.candidates[0],
+            name="Signal Garden Second",
+            normalized_name="signal garden second",
+        )
+        second = build_report(
+            replace(
+                changed_result,
+                candidates=(changed_identity, changed_result.candidates[1]),
+            ),
+            (),
+            "preliminary",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            persist_run_artifacts(first, root, FileAtomicWriter())
+            with self.assertRaises(ReportError):
+                persist_run_artifacts(second, root, FailAfterWriter(4))
+
+            persist_run_artifacts(first, root, FileAtomicWriter())
+
+            self.assertEqual(
+                (root / f"{RUN_ID}.preliminary.latest.json").read_text("utf-8"),
+                canonical_json(second),
+            )
+            self.assertEqual(
+                (root / f"{RUN_ID}.preliminary.latest.md").read_text("utf-8"),
+                render_markdown(second),
+            )
+
+    def test_file_writer_never_overwrites_a_concurrent_immutable_destination(
+        self,
+    ) -> None:
+        report = build_report(preliminary_result(), final_scores(), "final")
+        competitor = b"concurrent-immutable-owner"
+        real_link = os.link
+
+        def install_competitor_before_link(source, destination, **kwargs):
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=kwargs["dst_dir_fd"],
+            )
+            try:
+                os.write(descriptor, competitor)
+            finally:
+                os.close(descriptor)
+            return real_link(source, destination, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch(
+                "unified_game_radar.report.os.link",
+                side_effect=install_competitor_before_link,
+            ), self.assertRaises(ReportError):
+                persist_run_artifacts(report, root, FileAtomicWriter())
+
+            self.assertEqual(
+                (root / f"{RUN_ID}.final.json").read_bytes(),
+                competitor,
+            )
+
+    def test_file_writer_poison_race_keeps_official_name_retryable(self) -> None:
+        report = build_report(preliminary_result(), final_scores(), "final")
+        real_link = os.link
+        real_unlink = os.unlink
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "reports"
+            outside = base / "outside.json"
+            outside.write_text("outside-sentinel", "utf-8")
+
+            def poison_temporary_before_link(source, destination, **kwargs):
+                source_fd = kwargs["src_dir_fd"]
+                real_unlink(source, dir_fd=source_fd)
+                os.symlink(outside, source, dir_fd=source_fd)
+                return real_link(source, destination, **kwargs)
+
+            with patch(
+                "unified_game_radar.report.os.link",
+                side_effect=poison_temporary_before_link,
+            ), self.assertRaises(ReportError):
+                persist_run_artifacts(report, root, FileAtomicWriter())
+
+            official = root / f"{RUN_ID}.final.json"
+            self.assertFalse(os.path.lexists(official))
+            self.assertEqual(outside.read_text("utf-8"), "outside-sentinel")
+
+            paths = persist_run_artifacts(report, root, FileAtomicWriter())
+            self.assertEqual(paths[0].read_text("utf-8"), canonical_json(report))
+
     def test_preliminary_lock_symlink_is_rejected_without_touching_target(self) -> None:
         report = build_report(preliminary_result(), (), "preliminary")
         with tempfile.TemporaryDirectory() as directory:
@@ -655,6 +765,34 @@ class RunArtifactTests(unittest.TestCase):
 
             self.assertEqual(outside.read_text("utf-8"), "sentinel")
             self.assertEqual(tuple(root.iterdir()), (lock,))
+
+    def test_preliminary_lock_replacement_before_flock_is_rejected(self) -> None:
+        report = build_report(preliminary_result(), (), "preliminary")
+        real_flock = report_module.fcntl.flock
+        swapped = False
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock = root / f".{RUN_ID}.preliminary.lock"
+            moved_lock = root / "moved-preliminary.lock"
+
+            def swap_lock_then_flock(descriptor, operation):
+                nonlocal swapped
+                if operation == report_module.fcntl.LOCK_EX and not swapped:
+                    lock.rename(moved_lock)
+                    lock.write_text("replacement-lock", "utf-8")
+                    swapped = True
+                return real_flock(descriptor, operation)
+
+            with patch(
+                "unified_game_radar.report.fcntl.flock",
+                side_effect=swap_lock_then_flock,
+            ), self.assertRaises(ReportError):
+                persist_run_artifacts(report, root, FileAtomicWriter())
+
+            self.assertTrue(swapped)
+            self.assertEqual(lock.read_text("utf-8"), "replacement-lock")
+            self.assertFalse(any(root.glob(f"{RUN_ID}.preliminary.*.json")))
 
     def test_persist_refuses_symlinked_report_root(self) -> None:
         report = build_report(preliminary_result(), final_scores(), "final")
@@ -679,21 +817,21 @@ class RunArtifactTests(unittest.TestCase):
             moved = base / "moved-reports"
             outside = base / "outside"
             outside.mkdir()
-            real_replace = os.replace
+            real_link = os.link
             swapped = False
 
-            def attack_replace(source, destination, *args, **kwargs):
+            def attack_link(source, destination, *args, **kwargs):
                 nonlocal swapped
                 if not swapped:
                     root.rename(moved)
                     root.symlink_to(outside, target_is_directory=True)
                     (outside / Path(source).name).write_text("attacker", "utf-8")
                     swapped = True
-                return real_replace(source, destination, *args, **kwargs)
+                return real_link(source, destination, *args, **kwargs)
 
             with patch(
-                "unified_game_radar.report.os.replace",
-                side_effect=attack_replace,
+                "unified_game_radar.report.os.link",
+                side_effect=attack_link,
             ):
                 with self.assertRaises(ReportError):
                     persist_run_artifacts(report, root, FileAtomicWriter())
@@ -931,6 +1069,115 @@ class DailyPublicationTests(unittest.TestCase):
             latest_before,
         )
 
+    def test_concurrent_daily_publications_cannot_regress_latest(self) -> None:
+        older = radar_run(
+            run_id="20260831T080000Z-c1d2e3f4",
+            started_at=datetime(2026, 8, 31, 8, tzinfo=timezone.utc),
+        )
+        newer = radar_run(
+            run_id=SECOND_RUN_ID,
+            started_at=datetime(2026, 9, 1, 8, tzinfo=timezone.utc),
+        )
+        older_report, older_paths = self._prepare(older)
+        newer_report, newer_paths = self._prepare(newer)
+        database_path = self.report_dir.parent / "radar.sqlite3"
+        older_paused = threading.Event()
+        release_older = threading.Event()
+        newer_entered_writer = threading.Event()
+        newer_done = threading.Event()
+        errors: list[BaseException] = []
+
+        class PausingLatestWriter:
+            def __init__(self) -> None:
+                self.delegate = FileAtomicWriter()
+                self.paused = False
+
+            def write_text_at(
+                self,
+                directory_fd: int,
+                filename: str,
+                content: str,
+            ) -> None:
+                if filename == "latest.json" and not self.paused:
+                    self.paused = True
+                    older_paused.set()
+                    if not release_older.wait(timeout=5):
+                        raise RuntimeError("timed out waiting to resume older write")
+                self.delegate.write_text_at(directory_fd, filename, content)
+
+        class NotifyingWriter:
+            def __init__(self) -> None:
+                self.delegate = FileAtomicWriter()
+
+            def write_text_at(
+                self,
+                directory_fd: int,
+                filename: str,
+                content: str,
+            ) -> None:
+                newer_entered_writer.set()
+                self.delegate.write_text_at(directory_fd, filename, content)
+
+        def publish_in_thread(
+            run: RadarRun,
+            report: dict[str, object],
+            paths: tuple[Path, Path],
+            writer: object,
+            done: threading.Event | None = None,
+        ) -> None:
+            store = RadarStore(database_path)
+            store.initialize()
+            try:
+                publish_daily_if_allowed(
+                    self.config,
+                    store,
+                    run,
+                    report,
+                    paths,
+                    run.started_at,
+                    writer,
+                )
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                store.close()
+                if done is not None:
+                    done.set()
+
+        older_thread = threading.Thread(
+            target=publish_in_thread,
+            args=(older, older_report, older_paths, PausingLatestWriter()),
+        )
+        newer_thread = threading.Thread(
+            target=publish_in_thread,
+            args=(
+                newer,
+                newer_report,
+                newer_paths,
+                NotifyingWriter(),
+                newer_done,
+            ),
+        )
+        older_thread.start()
+        self.assertTrue(older_paused.wait(timeout=5))
+        newer_thread.start()
+        if newer_entered_writer.wait(timeout=1):
+            self.assertTrue(newer_done.wait(timeout=5))
+        release_older.set()
+        older_thread.join(timeout=5)
+        newer_thread.join(timeout=5)
+
+        self.assertFalse(older_thread.is_alive())
+        self.assertFalse(newer_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            (self.report_dir / "daily/latest.json").read_text("utf-8"),
+            canonical_json(newer_report),
+        )
+        self.assertTrue(
+            self.store.get_publication(newer.run_id, "final").advances_daily_latest
+        )
+
     def test_daily_publication_refuses_symlinked_daily_parent(self) -> None:
         run = radar_run(
             run_id="20260906T080000Z-a1b2c3d6",
@@ -1011,6 +1258,32 @@ class DailyPublicationTests(unittest.TestCase):
 
         self.assertEqual(list(outside.iterdir()), [])
         self.assertIsNone(self.store.get_publication(run.run_id, "final"))
+
+    def test_report_root_swap_before_database_record_rolls_back_publication(self) -> None:
+        run = radar_run(
+            run_id="20260910T080000Z-a1b2c3da",
+            started_at=datetime(2026, 9, 10, 8, tzinfo=timezone.utc),
+        )
+        report, paths = self._prepare(run)
+        moved = self.report_dir.with_name("moved-reports-before-db")
+        outside = self.report_dir.parent / "outside-before-db"
+        outside.mkdir()
+        real_record = report_module._record_publication
+
+        def swap_root_then_record(store, publication):
+            self.report_dir.rename(moved)
+            self.report_dir.symlink_to(outside, target_is_directory=True)
+            return real_record(store, publication)
+
+        with patch(
+            "unified_game_radar.report._record_publication",
+            side_effect=swap_root_then_record,
+        ), self.assertRaises(ReportError):
+            self._publish(run, report, paths)
+
+        self.assertIsNone(self.store.get_publication(run.run_id, "final"))
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertTrue((moved / paths[0].name).is_file())
 
     def test_publication_reads_are_confined_when_report_root_is_replaced_by_symlink(
         self,
