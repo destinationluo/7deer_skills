@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import errno
+import gc
 import json
 import multiprocessing
 import os
@@ -9,8 +11,9 @@ import stat
 import sys
 import tempfile
 import unittest
-from unittest import mock
+import weakref
 from typing import Any, Optional
+from unittest import mock
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -21,6 +24,7 @@ from unified_game_radar.errors import (
     PersistenceError,
     RunBusyError,
 )
+from unified_game_radar import run_lock as run_lock_module
 from unified_game_radar.run_lock import RunLock
 
 
@@ -403,6 +407,8 @@ class RunLockTests(unittest.TestCase):
             gate_path = root / "gate-failure.lock"
             gate_lock = self._lock(gate_path)
             gate_lock.acquire()
+            gate_descriptor = gate_lock._parent_descriptor
+            gate_finalizer = gate_lock._parent_finalizer
             with mock.patch.object(
                 gate_lock,
                 "_acquire_gate",
@@ -410,14 +416,25 @@ class RunLockTests(unittest.TestCase):
             ), self.assertRaisesRegex(PersistenceError, "transient gate failure"):
                 gate_lock.release()
             self.assertTrue(gate_path.exists())
+            self.assertTrue(gate_lock._acquired)
+            self.assertIs(gate_lock._parent_descriptor, gate_descriptor)
+            self.assertIs(gate_lock._parent_finalizer, gate_finalizer)
+            self.assertTrue(gate_finalizer.alive)
+            os.fstat(gate_descriptor)
             with self.assertRaises(RunBusyError):
                 self._lock(gate_path).__enter__()
             gate_lock.release()
             self.assertFalse(gate_path.exists())
+            self.assertFalse(gate_finalizer.alive)
+            with self.assertRaises(OSError) as gate_closed:
+                os.fstat(gate_descriptor)
+            self.assertEqual(gate_closed.exception.errno, errno.EBADF)
 
             read_path = root / "read-failure.lock"
             read_lock = self._lock(read_path)
             read_lock.acquire()
+            read_descriptor = read_lock._parent_descriptor
+            read_finalizer = read_lock._parent_finalizer
             with mock.patch(
                 "unified_game_radar.run_lock.os.read",
                 side_effect=OSError("transient read failure"),
@@ -427,14 +444,25 @@ class RunLockTests(unittest.TestCase):
             ):
                 read_lock.release()
             self.assertTrue(read_path.exists())
+            self.assertTrue(read_lock._acquired)
+            self.assertIs(read_lock._parent_descriptor, read_descriptor)
+            self.assertIs(read_lock._parent_finalizer, read_finalizer)
+            self.assertTrue(read_finalizer.alive)
+            os.fstat(read_descriptor)
             with self.assertRaises(RunBusyError):
                 self._lock(read_path).__enter__()
             read_lock.release()
             self.assertFalse(read_path.exists())
+            self.assertFalse(read_finalizer.alive)
+            with self.assertRaises(OSError) as read_closed:
+                os.fstat(read_descriptor)
+            self.assertEqual(read_closed.exception.errno, errno.EBADF)
 
             removal_path = root / "removal-failure.lock"
             removal_lock = self._lock(removal_path)
             removal_lock.acquire()
+            removal_descriptor = removal_lock._parent_descriptor
+            removal_finalizer = removal_lock._parent_finalizer
             with mock.patch(
                 "unified_game_radar.run_lock.os.rename",
                 side_effect=OSError("transient quarantine failure"),
@@ -444,10 +472,147 @@ class RunLockTests(unittest.TestCase):
             ):
                 removal_lock.release()
             self.assertTrue(removal_path.exists())
+            self.assertTrue(removal_lock._acquired)
+            self.assertIs(removal_lock._parent_descriptor, removal_descriptor)
+            self.assertIs(removal_lock._parent_finalizer, removal_finalizer)
+            self.assertTrue(removal_finalizer.alive)
+            os.fstat(removal_descriptor)
             with self.assertRaises(RunBusyError):
                 self._lock(removal_path).__enter__()
             removal_lock.release()
             self.assertFalse(removal_path.exists())
+            self.assertFalse(removal_finalizer.alive)
+            with self.assertRaises(OSError) as removal_closed:
+                os.fstat(removal_descriptor)
+            self.assertEqual(removal_closed.exception.errno, errno.EBADF)
+
+    def test_finalizer_only_captures_descriptor_and_acquire_failure_has_none(self) -> None:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            path = Path(directory) / "radar.lock"
+            lock = self._lock(path)
+            lock.acquire()
+            descriptor = lock._parent_descriptor
+            finalizer = lock._parent_finalizer
+            registered = finalizer.peek()
+            self.assertIsNotNone(registered)
+            _referent, callback, arguments, keyword_arguments = registered
+            self.assertIs(callback, run_lock_module._close_fd_quietly)
+            self.assertEqual(arguments, (descriptor,))
+            self.assertEqual(keyword_arguments, {})
+            self.assertNotIn(lock, arguments)
+            self.assertNotIn(lock, keyword_arguments.values())
+
+            contender = self._lock(path)
+            with self.assertRaises(RunBusyError):
+                contender.acquire()
+            self.assertFalse(contender._acquired)
+            self.assertIsNone(contender._parent_descriptor)
+            self.assertIsNone(contender._parent_finalizer)
+            lock.release()
+
+    def test_unresolved_context_cleanup_finalizes_retained_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+            real_acquire_gate = RunLock._acquire_gate
+
+            def fail_cleanup_gate(
+                lock: RunLock,
+                parent_descriptor: int,
+            ) -> int:
+                if lock._acquired:
+                    raise PersistenceError("transient gate failure")
+                return real_acquire_gate(lock, parent_descriptor)
+
+            cases = (
+                (
+                    "gate",
+                    lambda: mock.patch.object(
+                        RunLock,
+                        "_acquire_gate",
+                        new=fail_cleanup_gate,
+                    ),
+                ),
+                (
+                    "read",
+                    lambda: mock.patch(
+                        "unified_game_radar.run_lock.os.read",
+                        side_effect=OSError("transient read failure"),
+                    ),
+                ),
+                (
+                    "quarantine",
+                    lambda: mock.patch(
+                        "unified_game_radar.run_lock.os.rename",
+                        side_effect=OSError("transient quarantine failure"),
+                    ),
+                ),
+            )
+            for name, patch_factory in cases:
+                with self.subTest(name=name):
+                    path = root / f"{name}-body-failure.lock"
+                    lock = self._lock(path)
+                    reference = weakref.ref(lock)
+                    with self.assertRaisesRegex(ValueError, "body failed"):
+                        with patch_factory():
+                            with lock:
+                                descriptor = lock._parent_descriptor
+                                finalizer = lock._parent_finalizer
+                                raise ValueError("body failed")
+                    self.assertIsNotNone(descriptor)
+                    self.assertIsNotNone(finalizer)
+                    self.assertTrue(finalizer.alive)
+                    os.fstat(descriptor)
+                    self.assertTrue(path.exists())
+
+                    del lock
+                    gc.collect()
+                    self.assertIsNone(reference())
+                    self.assertFalse(finalizer.alive)
+                    with self.assertRaises(OSError) as closed:
+                        os.fstat(descriptor)
+                    self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    def test_successful_release_finalizes_descriptor_once_and_can_reacquire(self) -> None:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            path = Path(directory) / "radar.lock"
+            lock = self._lock(path)
+            real_close = run_lock_module._close_fd_quietly
+            with mock.patch(
+                "unified_game_radar.run_lock._close_fd_quietly",
+                wraps=real_close,
+            ) as close_descriptor:
+                lock.acquire()
+                first_descriptor = lock._parent_descriptor
+                first_finalizer = lock._parent_finalizer
+                self.assertTrue(first_finalizer.alive)
+                lock.release()
+                close_descriptor.assert_called_once_with(first_descriptor)
+                self.assertFalse(first_finalizer.alive)
+                self.assertFalse(lock._acquired)
+                self.assertIsNone(lock._payload)
+                self.assertIsNone(lock._created_identity)
+                self.assertIsNone(lock._parent_descriptor)
+                self.assertIsNone(lock._parent_finalizer)
+
+                lock.release()
+                close_descriptor.assert_called_once_with(first_descriptor)
+
+                lock.acquire()
+                second_descriptor = lock._parent_descriptor
+                second_finalizer = lock._parent_finalizer
+                self.assertIsNot(second_finalizer, first_finalizer)
+                self.assertTrue(second_finalizer.alive)
+                lock.release()
+                self.assertEqual(close_descriptor.call_count, 2)
+                close_descriptor.assert_has_calls(
+                    [mock.call(first_descriptor), mock.call(second_descriptor)]
+                )
+                self.assertFalse(second_finalizer.alive)
+                self.assertFalse(lock._acquired)
+                self.assertIsNone(lock._payload)
+                self.assertIsNone(lock._created_identity)
+                self.assertIsNone(lock._parent_descriptor)
+                self.assertIsNone(lock._parent_finalizer)
 
     def test_cleanup_on_body_exception_does_not_suppress_or_mask_it(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:

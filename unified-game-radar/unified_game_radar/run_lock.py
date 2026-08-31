@@ -19,6 +19,7 @@ import re
 import secrets
 import stat
 from typing import Callable, Dict, Optional, Tuple
+import weakref
 
 from .errors import InputValidationError, PersistenceError, RunBusyError
 
@@ -45,6 +46,13 @@ class _QuarantineFailure(Exception):
 
 LockPayload = Dict[str, object]
 LockIdentity = Tuple[int, int, int, int]
+
+
+def _close_fd_quietly(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
 
 
 def _validate_run_id(value: object) -> str:
@@ -194,6 +202,7 @@ class RunLock:
         self._payload: Optional[LockPayload] = None
         self._created_identity: Optional[LockIdentity] = None
         self._parent_descriptor: Optional[int] = None
+        self._parent_finalizer: Optional[weakref.finalize] = None
 
     def _callback_context(self) -> tuple[datetime, str, int]:
         try:
@@ -786,9 +795,15 @@ class RunLock:
             for _attempt in range(_MAX_ACQUIRE_ATTEMPTS):
                 identity = self._write_new(parent_descriptor, payload)
                 if identity is not None:
+                    parent_finalizer = weakref.finalize(
+                        self,
+                        _close_fd_quietly,
+                        parent_descriptor,
+                    )
                     self._payload = payload
                     self._created_identity = identity
                     self._parent_descriptor = parent_descriptor
+                    self._parent_finalizer = parent_finalizer
                     self._acquired = True
                     retain_parent_descriptor = True
                     return self
@@ -833,7 +848,13 @@ class RunLock:
         payload = self._payload
         identity = self._created_identity
         parent_descriptor = self._parent_descriptor
-        if payload is None or identity is None or parent_descriptor is None:
+        parent_finalizer = self._parent_finalizer
+        if (
+            payload is None
+            or identity is None
+            or parent_descriptor is None
+            or parent_finalizer is None
+        ):
             if exc_type is None:
                 raise PersistenceError("run-lock ownership state is incomplete")
             return False
@@ -882,7 +903,5 @@ class RunLock:
                 self._payload = None
                 self._created_identity = None
                 self._parent_descriptor = None
-                try:
-                    os.close(parent_descriptor)
-                except OSError:
-                    pass
+                self._parent_finalizer = None
+                parent_finalizer()
