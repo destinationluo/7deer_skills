@@ -5,6 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import math
+import re
+from types import MappingProxyType
 from typing import Protocol, TypeVar, runtime_checkable
 
 from ..errors import InputValidationError
@@ -19,6 +22,16 @@ from ..schemas import (
 
 
 Record = TypeVar("Record")
+_RUN_ID = re.compile(
+    r"(?P<timestamp>\d{8}T\d{6}Z)-[0-9a-f]{8,32}\Z",
+    flags=re.ASCII,
+)
+_PROVIDER = re.compile(r"[a-z][a-z0-9_]{0,127}\Z", flags=re.ASCII)
+_ARTIFACT_NAME = re.compile(
+    r"[a-z0-9](?:[a-z0-9_-]{0,126}[a-z0-9])?\.json\Z",
+    flags=re.ASCII,
+)
+_MAX_SAFE_INTEGER = 9_007_199_254_740_991
 
 
 def _schema_records(
@@ -66,6 +79,72 @@ def _aware_utc(value: object, name: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _pending_run_id(value: object) -> str:
+    if not isinstance(value, str):
+        raise InputValidationError("pending raw run_id must be text")
+    match = _RUN_ID.fullmatch(value)
+    if match is None:
+        raise InputValidationError("pending raw run_id is invalid")
+    try:
+        datetime.strptime(match.group("timestamp"), "%Y%m%dT%H%M%SZ")
+    except ValueError as error:
+        raise InputValidationError("pending raw run_id is invalid") from error
+    return value
+
+
+def _pending_provider(value: object) -> str:
+    if not isinstance(value, str) or _PROVIDER.fullmatch(value) is None:
+        raise InputValidationError(
+            "pending raw provider must be a lowercase identifier"
+        )
+    return value
+
+
+def _pending_artifact_name(value: object) -> str:
+    if not isinstance(value, str) or _ARTIFACT_NAME.fullmatch(value) is None:
+        raise InputValidationError(
+            "pending raw artifact_name must be a safe lowercase JSON filename"
+        )
+    return value
+
+
+def _pending_observed_at(value: object) -> datetime:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() != timedelta(0)
+    ):
+        raise InputValidationError(
+            "pending raw observed_at must be a timezone-aware UTC datetime"
+        )
+    return value.astimezone(timezone.utc)
+
+
+def _freeze_pending_json(value: object, name: str = "pending raw payload") -> object:
+    if isinstance(value, Mapping):
+        frozen: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise InputValidationError(
+                    f"{name} mappings must use string keys"
+                )
+            frozen[key] = _freeze_pending_json(item, name)
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_pending_json(item, name) for item in value)
+    if value is None or type(value) in (str, bool):
+        return value
+    if type(value) is int:
+        if value < -_MAX_SAFE_INTEGER or value > _MAX_SAFE_INTEGER:
+            raise InputValidationError(
+                f"{name} integers must be within the JSON-safe range"
+            )
+        return value
+    if type(value) is float and math.isfinite(value):
+        return value
+    raise InputValidationError(f"{name} must contain only JSON values")
+
+
 def _positive_window(value: object, name: str) -> timedelta:
     if type(value) is not int or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
@@ -102,6 +181,7 @@ def _validate_result_semantics(
     observations: tuple[PlatformObservation, ...],
     health: SourceHealth,
     raw_artifacts: tuple[RawArtifact, ...],
+    pending_raw_payloads: tuple["PendingRawPayload", ...],
 ) -> None:
     for warning in health.warnings:
         if warning.collector is not None and warning.collector != collector:
@@ -127,11 +207,12 @@ def _validate_result_semantics(
     if health.status == "not_run" and (
         observations
         or raw_artifacts
+        or pending_raw_payloads
         or any(health.capabilities.values())
     ):
         raise InputValidationError(
             "not_run health cannot contain observations, raw artifacts, "
-            "or successful capabilities"
+            "pending raw payloads, or successful capabilities"
         )
 
 
@@ -144,6 +225,38 @@ class Collector(Protocol):
 
 
 @dataclass(frozen=True)
+class PendingRawPayload:
+    """Immutable provider bytes awaiting Task 12A redaction and persistence."""
+
+    run_id: str
+    provider: str
+    artifact_name: str
+    observed_at: datetime
+    payload: object
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "run_id", _pending_run_id(self.run_id))
+        object.__setattr__(self, "provider", _pending_provider(self.provider))
+        object.__setattr__(
+            self,
+            "artifact_name",
+            _pending_artifact_name(self.artifact_name),
+        )
+        object.__setattr__(
+            self,
+            "observed_at",
+            _pending_observed_at(self.observed_at),
+        )
+        try:
+            payload = _freeze_pending_json(self.payload)
+        except RecursionError as error:
+            raise InputValidationError(
+                "pending raw payload must not contain recursive values"
+            ) from error
+        object.__setattr__(self, "payload", payload)
+
+
+@dataclass(frozen=True)
 class CollectorResult:
     """Immutable, provenance-checked output from one collector."""
 
@@ -151,6 +264,7 @@ class CollectorResult:
     observations: tuple[PlatformObservation, ...]
     health: SourceHealth
     raw_artifacts: tuple[RawArtifact, ...]
+    pending_raw_payloads: tuple[PendingRawPayload, ...] = ()
 
     def __post_init__(self) -> None:
         collector = validate_platform(self.collector, "collector")
@@ -165,6 +279,11 @@ class CollectorResult:
             self.raw_artifacts,
             "raw_artifacts",
             RawArtifact,
+        )
+        pending_raw_payloads = _schema_records(
+            self.pending_raw_payloads,
+            "pending_raw_payloads",
+            PendingRawPayload,
         )
         if self.health.collector != collector:
             raise InputValidationError(
@@ -184,15 +303,44 @@ class CollectorResult:
                 raise InputValidationError(
                     "raw artifact run_id must match health run_id"
                 )
+        for pending in pending_raw_payloads:
+            if pending.run_id != self.health.run_id:
+                raise InputValidationError(
+                    "pending raw payload run_id must match health run_id"
+                )
+            if pending.observed_at != self.health.observed_at:
+                raise InputValidationError(
+                    "pending raw observed_at must match health observed_at"
+                )
+            if not (
+                pending.provider == collector
+                or pending.provider.startswith(f"{collector}_")
+            ):
+                raise InputValidationError(
+                    "pending raw payload provider must belong to result collector"
+                )
+            if not (
+                pending.artifact_name == f"{collector}.json"
+                or pending.artifact_name.startswith(f"{collector}_")
+            ):
+                raise InputValidationError(
+                    "pending raw artifact_name must belong to result collector"
+                )
         _validate_result_semantics(
             collector,
             observations,
             self.health,
             raw_artifacts,
+            pending_raw_payloads,
         )
         object.__setattr__(self, "collector", collector)
         object.__setattr__(self, "observations", observations)
         object.__setattr__(self, "raw_artifacts", raw_artifacts)
+        object.__setattr__(
+            self,
+            "pending_raw_payloads",
+            pending_raw_payloads,
+        )
 
 
 def classify_source_health(
@@ -289,4 +437,9 @@ def classify_source_health(
         raise ValueError(str(error)) from error
 
 
-__all__ = ["Collector", "CollectorResult", "classify_source_health"]
+__all__ = [
+    "Collector",
+    "CollectorResult",
+    "PendingRawPayload",
+    "classify_source_health",
+]

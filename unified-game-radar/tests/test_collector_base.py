@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT_DIR))
 from unified_game_radar.collectors.base import (
     Collector,
     CollectorResult,
+    PendingRawPayload,
     classify_source_health,
 )
 from unified_game_radar.errors import InputValidationError
@@ -99,6 +100,27 @@ def make_artifact(*, run_id: str = RUN_ID) -> RawArtifact:
     )
 
 
+def make_pending_payload(
+    *,
+    run_id: str = RUN_ID,
+    provider: str = "steam_official",
+    artifact_name: str = "steam_featured_categories.json",
+    observed_at: datetime = NOW,
+    payload: object | None = None,
+) -> PendingRawPayload:
+    return PendingRawPayload(
+        run_id=run_id,
+        provider=provider,
+        artifact_name=artifact_name,
+        observed_at=observed_at,
+        payload=(
+            {"response": {"items": [1, {"token": "secret"}]}}
+            if payload is None
+            else payload
+        ),
+    )
+
+
 def make_health(
     *,
     collector: str = "steam",
@@ -159,10 +181,12 @@ class CollectorContractTests(unittest.TestCase):
             observations=[make_observation()],  # type: ignore[arg-type]
             health=make_health(warnings=(warning,)),
             raw_artifacts=[make_artifact()],  # type: ignore[arg-type]
+            pending_raw_payloads=[make_pending_payload()],  # type: ignore[arg-type]
         )
 
         self.assertIs(type(result.observations), tuple)
         self.assertIs(type(result.raw_artifacts), tuple)
+        self.assertIs(type(result.pending_raw_payloads), tuple)
         self.assertEqual((warning,), result.health.warnings)
         self.assertNotIn("warnings", {field.name for field in fields(result)})
         with self.assertRaises(FrozenInstanceError):
@@ -182,8 +206,27 @@ class CollectorContractTests(unittest.TestCase):
             {"observations": (make_observation(platform="roblox"),)},
             {"observations": (make_observation(run_id=OTHER_RUN_ID),)},
             {"raw_artifacts": (make_artifact(run_id=OTHER_RUN_ID),)},
+            {"pending_raw_payloads": (make_pending_payload(run_id=OTHER_RUN_ID),)},
+            {
+                "pending_raw_payloads": (
+                    make_pending_payload(
+                        observed_at=NOW - timedelta(seconds=1)
+                    ),
+                )
+            },
+            {
+                "pending_raw_payloads": (
+                    make_pending_payload(provider="roblox_official"),
+                )
+            },
+            {
+                "pending_raw_payloads": (
+                    make_pending_payload(artifact_name="roblox_charts.json"),
+                )
+            },
             {"observations": (object(),)},
             {"raw_artifacts": (object(),)},
+            {"pending_raw_payloads": (object(),)},
         )
         for invalid in invalid_values:
             with self.subTest(invalid=invalid):
@@ -271,6 +314,7 @@ class CollectorContractTests(unittest.TestCase):
         invalid_values = (
             {"observations": (make_observation(),)},
             {"raw_artifacts": (make_artifact(),)},
+            {"pending_raw_payloads": (make_pending_payload(),)},
             {
                 "health": make_health(
                     status="not_run",
@@ -289,6 +333,51 @@ class CollectorContractTests(unittest.TestCase):
         result = CollectorResult(**valid)  # type: ignore[arg-type]
         self.assertEqual("not_run", result.health.status)
         self.assertEqual({"listing": False}, result.health.capabilities)
+
+    def test_pending_raw_payload_is_lossless_and_recursively_immutable(self) -> None:
+        original = {
+            "authorization": "Bearer secret",
+            "nested": [{"cookie": "session"}, True, None, 1.25],
+        }
+
+        pending = make_pending_payload(payload=original)
+        original["authorization"] = "changed"
+        original["nested"][0]["cookie"] = "changed"  # type: ignore[index]
+
+        self.assertEqual(
+            pending.payload["authorization"],  # type: ignore[index]
+            "Bearer secret",
+        )
+        nested = pending.payload["nested"]  # type: ignore[index]
+        self.assertIs(type(nested), tuple)
+        self.assertEqual(nested[0]["cookie"], "session")  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            pending.payload["authorization"] = "mutate"  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            nested[0]["cookie"] = "mutate"  # type: ignore[index]
+
+    def test_pending_raw_payload_validates_safe_provenance_and_json(self) -> None:
+        invalid_values = (
+            {"run_id": "not-a-run"},
+            {"provider": "Steam Official"},
+            {"artifact_name": "../steam.json"},
+            {"artifact_name": "steam_payload.txt"},
+            {"observed_at": NOW.replace(tzinfo=None)},
+            {"payload": {"bad": object()}},
+            {"payload": {"bad": float("nan")}},
+            {"payload": {1: "non-string key"}},
+        )
+        valid = {
+            "run_id": RUN_ID,
+            "provider": "steam_official",
+            "artifact_name": "steam_payload.json",
+            "observed_at": NOW,
+            "payload": {"ok": True},
+        }
+        for invalid in invalid_values:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(InputValidationError):
+                    PendingRawPayload(**{**valid, **invalid})
 
 
 class SourceHealthClassificationTests(unittest.TestCase):

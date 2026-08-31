@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime, timezone
-import hashlib
 import json
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import unittest
 from urllib.parse import urlsplit
 
@@ -27,6 +29,7 @@ from unified_game_radar.collectors.steam import (
     adapt_raw_payloads,
 )
 from unified_game_radar.config import RadarConfig
+from unified_game_radar.errors import InputValidationError
 from unified_game_radar.schemas import RadarRun
 
 
@@ -36,6 +39,14 @@ STARTED_AT = datetime(2026, 8, 31, 2, tzinfo=timezone.utc)
 
 def load_fixture(name: str) -> object:
     return json.loads((FIXTURE_DIR / name).read_text(encoding="utf-8"))
+
+
+def _thaw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value
 
 
 class FixtureClient:
@@ -242,7 +253,7 @@ class SteamCollectorTests(unittest.TestCase):
         )
         self.assertNotIn("warnings", result.__dataclass_fields__)
 
-    def test_raw_payload_descriptors_are_deterministic_and_content_addressed(self) -> None:
+    def test_raw_payloads_remain_pending_until_safe_artifact_persistence(self) -> None:
         legacy, _ = legacy_fixture_result()
         payloads = adapt_raw_payloads(legacy)
 
@@ -257,42 +268,120 @@ class SteamCollectorTests(unittest.TestCase):
             del client, config, observed_at
             return legacy
 
-        collector = SteamCollector(
+        with TemporaryDirectory() as directory:
+            collector = SteamCollector(
+                replace(make_config(), data_dir=Path(directory)),
+                object(),  # type: ignore[arg-type]
+                collect_official_fn=provider,
+            )
+            first = collector.collect(make_run())
+            second = collector.collect(make_run())
+
+            self.assertEqual(first.pending_raw_payloads, second.pending_raw_payloads)
+            self.assertEqual(len(first.pending_raw_payloads), len(legacy.raw))
+            self.assertEqual(first.raw_artifacts, ())
+            self.assertEqual(second.raw_artifacts, ())
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+        pending_by_name = {
+            pending.artifact_name: pending
+            for pending in first.pending_raw_payloads
+        }
+        featured = pending_by_name["steam_featured_categories.json"]
+        self.assertEqual(featured.run_id, RUN_ID)
+        self.assertEqual(featured.provider, "steam_official")
+        self.assertEqual(featured.observed_at, STARTED_AT)
+        self.assertEqual(
+            _thaw_json(featured.payload),
+            payloads["featured_categories"],
+        )
+
+    def test_secret_raw_values_exist_only_in_frozen_pending_memory(self) -> None:
+        legacy, _ = legacy_fixture_result()
+        secret_result = replace(
+            legacy,
+            raw={
+                "request_context": {
+                    "token": "top-secret",
+                    "headers": {"Cookie": "session=private"},
+                }
+            },
+        )
+
+        def provider(
+            client: object,
+            config: SteamRadarConfig,
+            observed_at: str,
+        ) -> CollectionResult:
+            del client, config, observed_at
+            return secret_result
+
+        result = SteamCollector(
             make_config(),
             object(),  # type: ignore[arg-type]
             collect_official_fn=provider,
-        )
-        first = collector.collect(make_run())
-        second = collector.collect(make_run())
+        ).collect(make_run())
 
-        self.assertEqual(first.raw_artifacts, second.raw_artifacts)
-        self.assertEqual(len(first.raw_artifacts), len(legacy.raw))
-        artifacts_by_path = {
-            artifact.path: artifact for artifact in first.raw_artifacts
-        }
-        featured_path = f"state/radar/raw/{RUN_ID}/steam_featured_categories.json"
+        self.assertEqual(result.raw_artifacts, ())
+        self.assertEqual(len(result.pending_raw_payloads), 1)
+        payload = result.pending_raw_payloads[0].payload
+        self.assertEqual(payload["token"], "top-secret")  # type: ignore[index]
         self.assertEqual(
-            artifacts_by_path[featured_path].path,
-            featured_path,
+            payload["headers"]["Cookie"],  # type: ignore[index]
+            "session=private",
         )
+        with self.assertRaises(TypeError):
+            payload["token"] = "changed"  # type: ignore[index]
+
+    def test_exact_duplicates_are_deduplicated_with_first_order(self) -> None:
+        legacy, _ = legacy_fixture_result()
+        released = legacy.released[0]
+
+        within_released = replace(
+            legacy,
+            released=(released, released),
+        )
+        across_release_sets = replace(
+            legacy,
+            released=(released,),
+            unreleased=(released, *legacy.unreleased),
+        )
+
+        within = adapt_collection_result(make_run(), within_released)
+        across = adapt_collection_result(make_run(), across_release_sets)
+        baseline = adapt_collection_result(make_run(), legacy)
+
+        self.assertEqual(within, baseline)
+        self.assertEqual(across, baseline)
         self.assertEqual(
-            {artifact.observed_at for artifact in first.raw_artifacts},
-            {STARTED_AT},
+            tuple(row.observation_id for row in across),
+            tuple(dict.fromkeys(row.observation_id for row in across)),
         )
-        self.assertTrue(
-            all(artifact.provider == "steam_official" for artifact in first.raw_artifacts)
+
+    def test_same_observation_id_with_different_payload_is_rejected(self) -> None:
+        legacy, _ = legacy_fixture_result()
+        released = legacy.released[0]
+        conflicting_data = released.to_dict()
+        conflicting_data["name"] = "Conflicting Steam Name"
+        conflicting = type(released).from_dict(conflicting_data)
+        conflicting_results = (
+            replace(legacy, released=(released, conflicting)),
+            replace(
+                legacy,
+                released=(released,),
+                unreleased=(conflicting, *legacy.unreleased),
+            ),
         )
-        canonical = json.dumps(
-            payloads["featured_categories"],
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        self.assertEqual(
-            artifacts_by_path[featured_path].sha256,
-            hashlib.sha256(canonical).hexdigest(),
-        )
+
+        for conflict in conflicting_results:
+            with self.subTest(
+                location=(len(conflict.released), len(conflict.unreleased))
+            ):
+                with self.assertRaisesRegex(
+                    InputValidationError,
+                    "observation_id.*different payload",
+                ):
+                    adapt_collection_result(make_run(), conflict)
 
     def test_automated_collection_requests_only_steam_owned_hosts(self) -> None:
         client = FixtureClient()

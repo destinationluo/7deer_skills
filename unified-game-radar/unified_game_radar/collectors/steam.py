@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import date, datetime, time, timezone
-import hashlib
-import json
-from pathlib import Path
 import re
 
 from steam_game_radar.config import RadarConfig as SteamRadarConfig
@@ -22,10 +19,13 @@ from ..errors import InputValidationError
 from ..schemas import (
     PlatformObservation,
     RadarRun,
-    RawArtifact,
     WarningRecord,
 )
-from .base import CollectorResult, classify_source_health
+from .base import (
+    CollectorResult,
+    PendingRawPayload,
+    classify_source_health,
+)
 
 
 _PROVIDER = "steam_official"
@@ -94,8 +94,7 @@ class SteamCollector:
             collector="steam",
         )
         payloads = adapt_raw_payloads(legacy_result)
-        artifacts = _raw_artifact_descriptors(
-            self._config,
+        pending_raw_payloads = _pending_raw_payloads(
             run,
             observed_at,
             payloads,
@@ -104,7 +103,8 @@ class SteamCollector:
             collector="steam",
             observations=observations,
             health=health,
-            raw_artifacts=artifacts,
+            raw_artifacts=(),
+            pending_raw_payloads=pending_raw_payloads,
         )
 
 
@@ -124,17 +124,26 @@ def adapt_collection_result(
         raise TypeError("legacy_result must be a CollectionResult")
     observed_at = _run_observed_at(run)
     observations: list[PlatformObservation] = []
+    observations_by_id: dict[str, PlatformObservation] = {}
     for record in (*legacy_result.released, *legacy_result.unreleased):
-        observations.extend(
-            _record_observations(
-                run,
-                record,
-                observed_at,
-                geo=geo,
-                locale=locale,
-                language=language,
-            )
+        record_observations = _record_observations(
+            run,
+            record,
+            observed_at,
+            geo=geo,
+            locale=locale,
+            language=language,
         )
+        for observation in record_observations:
+            existing = observations_by_id.get(observation.observation_id)
+            if existing is None:
+                observations_by_id[observation.observation_id] = observation
+                observations.append(observation)
+            elif existing != observation:
+                raise InputValidationError(
+                    "Steam observation_id was reused with a different payload: "
+                    f"{observation.observation_id}"
+                )
     return tuple(observations)
 
 
@@ -230,40 +239,25 @@ def _adapt_warning(warning: SteamWarning) -> WarningRecord:
     )
 
 
-def _raw_artifact_descriptors(
-    config: RadarConfig,
+def _pending_raw_payloads(
     run: RadarRun,
     observed_at: datetime,
     payloads: Mapping[str, object],
-) -> tuple[RawArtifact, ...]:
-    artifacts: list[RawArtifact] = []
+) -> tuple[PendingRawPayload, ...]:
+    pending: list[PendingRawPayload] = []
     for raw_key in sorted(payloads):
         if _RAW_KEY.fullmatch(raw_key) is None:
             raise InputValidationError("Steam raw payload key is not a safe identifier")
-        serialized = json.dumps(
-            payloads[raw_key],
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        path = (
-            Path(config.data_dir)
-            / "raw"
-            / run.run_id
-            / f"steam_{raw_key}.json"
-        )
-        artifacts.append(
-            RawArtifact(
-                schema_version=1,
+        pending.append(
+            PendingRawPayload(
                 run_id=run.run_id,
                 provider=_PROVIDER,
-                path=str(path),
+                artifact_name=f"steam_{raw_key}.json",
                 observed_at=observed_at,
-                sha256=hashlib.sha256(serialized).hexdigest(),
+                payload=payloads[raw_key],
             )
         )
-    return tuple(artifacts)
+    return tuple(pending)
 
 
 def _run_observed_at(run: RadarRun) -> datetime:
