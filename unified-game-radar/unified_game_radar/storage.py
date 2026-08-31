@@ -6,7 +6,7 @@ from contextlib import contextmanager
 import json
 from pathlib import Path
 import sqlite3
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Protocol, Sequence
 
 from .errors import PersistenceError
 from .schemas import (
@@ -20,6 +20,25 @@ from .schemas import (
 
 
 _SCHEMA_VERSION = 1
+
+
+class _Connection(Protocol):
+    def execute(
+        self,
+        statement: str,
+        parameters: Sequence[object] = (),
+    ) -> sqlite3.Cursor: ...
+
+    def commit(self) -> None: ...
+
+    def rollback(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
+def _open_connection(path: str) -> sqlite3.Connection:
+    return sqlite3.connect(path, isolation_level=None)
+
 
 _SCHEMA = (
     """
@@ -168,6 +187,176 @@ _SCHEMA = (
 )
 
 
+_Column = tuple[str, str, int, int]
+_TABLE_MANIFEST: dict[str, tuple[_Column, ...]] = {
+    "runs": (
+        ("run_id", "TEXT", 0, 1),
+        ("started_at", "TEXT", 1, 0),
+        ("mode", "TEXT", 1, 0),
+        ("canonical_json", "TEXT", 1, 0),
+    ),
+    "source_health": (
+        ("run_id", "TEXT", 1, 1),
+        ("collector", "TEXT", 1, 2),
+        ("status", "TEXT", 1, 0),
+        ("observed_at", "TEXT", 1, 0),
+        ("canonical_json", "TEXT", 1, 0),
+    ),
+    "game_identities": (
+        ("opportunity_id", "TEXT", 0, 1),
+        ("normalized_name", "TEXT", 1, 0),
+        ("official_domain", "TEXT", 0, 0),
+        ("canonical_json", "TEXT", 1, 0),
+    ),
+    "platform_records": (
+        ("platform", "TEXT", 1, 1),
+        ("platform_id", "TEXT", 1, 2),
+        ("opportunity_id", "TEXT", 1, 0),
+        ("name", "TEXT", 1, 0),
+        ("canonical_json", "TEXT", 1, 0),
+    ),
+    "observations": (
+        ("observation_id", "TEXT", 0, 1),
+        ("run_id", "TEXT", 1, 0),
+        ("platform", "TEXT", 1, 0),
+        ("platform_id", "TEXT", 1, 0),
+        ("provider", "TEXT", 1, 0),
+        ("surface", "TEXT", 1, 0),
+        ("geo", "TEXT", 1, 0),
+        ("locale", "TEXT", 1, 0),
+        ("query_parameters_json", "TEXT", 1, 0),
+        ("metric_definition_version", "INTEGER", 1, 0),
+        ("observed_at", "TEXT", 1, 0),
+        ("canonical_json", "TEXT", 1, 0),
+    ),
+    "identity_links": (
+        ("source_platform", "TEXT", 1, 1),
+        ("source_platform_id", "TEXT", 1, 2),
+        ("target_platform", "TEXT", 1, 3),
+        ("target_platform_id", "TEXT", 1, 4),
+        ("canonical_json", "TEXT", 1, 0),
+    ),
+    "evidence": (
+        ("run_id", "TEXT", 1, 1),
+        ("opportunity_id", "TEXT", 1, 2),
+        ("observed_at", "TEXT", 1, 0),
+        ("canonical_json", "TEXT", 1, 0),
+    ),
+    "scores": (
+        ("run_id", "TEXT", 1, 1),
+        ("opportunity_id", "TEXT", 1, 2),
+        ("demand_state", "TEXT", 1, 0),
+        ("total_score", "REAL", 1, 0),
+        ("action", "TEXT", 1, 0),
+        ("canonical_json", "TEXT", 1, 0),
+    ),
+    "publications": (
+        ("run_id", "TEXT", 1, 1),
+        ("phase", "TEXT", 1, 2),
+        ("published_at", "TEXT", 1, 0),
+        ("daily_date", "TEXT", 1, 0),
+        ("advances_daily_latest", "INTEGER", 1, 0),
+        ("canonical_json", "TEXT", 1, 0),
+    ),
+}
+
+
+_ForeignKey = tuple[str, str, tuple[tuple[int, str, str], ...]]
+_FOREIGN_KEY_MANIFEST: dict[str, frozenset[_ForeignKey]] = {
+    "runs": frozenset(),
+    "source_health": frozenset(
+        {("runs", "CASCADE", ((0, "run_id", "run_id"),))}
+    ),
+    "game_identities": frozenset(),
+    "platform_records": frozenset(
+        {
+            (
+                "game_identities",
+                "CASCADE",
+                ((0, "opportunity_id", "opportunity_id"),),
+            )
+        }
+    ),
+    "observations": frozenset(
+        {("runs", "CASCADE", ((0, "run_id", "run_id"),))}
+    ),
+    "identity_links": frozenset(
+        {
+            (
+                "platform_records",
+                "CASCADE",
+                (
+                    (0, "source_platform", "platform"),
+                    (1, "source_platform_id", "platform_id"),
+                ),
+            ),
+            (
+                "platform_records",
+                "CASCADE",
+                (
+                    (0, "target_platform", "platform"),
+                    (1, "target_platform_id", "platform_id"),
+                ),
+            ),
+        }
+    ),
+    "evidence": frozenset(
+        {
+            ("runs", "CASCADE", ((0, "run_id", "run_id"),)),
+            (
+                "game_identities",
+                "CASCADE",
+                ((0, "opportunity_id", "opportunity_id"),),
+            ),
+        }
+    ),
+    "scores": frozenset(
+        {
+            ("runs", "CASCADE", ((0, "run_id", "run_id"),)),
+            (
+                "game_identities",
+                "CASCADE",
+                ((0, "opportunity_id", "opportunity_id"),),
+            ),
+        }
+    ),
+    "publications": frozenset(
+        {("runs", "CASCADE", ((0, "run_id", "run_id"),))}
+    ),
+}
+
+
+_INDEX_MANIFEST: dict[str, tuple[str, tuple[str, ...]]] = {
+    "runs_started_at_idx": ("runs", ("started_at",)),
+    "game_identities_normalized_name_idx": (
+        "game_identities",
+        ("normalized_name",),
+    ),
+    "platform_records_opportunity_idx": (
+        "platform_records",
+        ("opportunity_id",),
+    ),
+    "observations_history_idx": (
+        "observations",
+        (
+            "platform",
+            "platform_id",
+            "provider",
+            "surface",
+            "geo",
+            "locale",
+            "metric_definition_version",
+            "observed_at",
+        ),
+    ),
+    "evidence_observed_at_idx": ("evidence", ("observed_at",)),
+    "publications_daily_idx": (
+        "publications",
+        ("daily_date", "advances_daily_latest", "published_at"),
+    ),
+}
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(
         value,
@@ -185,12 +374,160 @@ def _restore(payload: str, schema_type: object) -> object:
         raise PersistenceError("stored canonical JSON is invalid") from error
 
 
-class RadarStore:
-    """Own one explicit SQLite connection for a radar database."""
+def _execute_on(
+    connection: _Connection,
+    statement: str,
+    parameters: Sequence[object] = (),
+) -> sqlite3.Cursor:
+    try:
+        return connection.execute(statement, parameters)
+    except sqlite3.Error as error:
+        raise PersistenceError("SQLite operation failed") from error
 
-    def __init__(self, path: Path) -> None:
+
+def _fetchone_on(
+    connection: _Connection,
+    statement: str,
+    parameters: Sequence[object] = (),
+) -> tuple[object, ...] | None:
+    try:
+        return _execute_on(connection, statement, parameters).fetchone()
+    except sqlite3.Error as error:
+        raise PersistenceError("SQLite read failed") from error
+
+
+def _fetchall_on(
+    connection: _Connection,
+    statement: str,
+    parameters: Sequence[object] = (),
+) -> list[tuple[object, ...]]:
+    try:
+        return _execute_on(connection, statement, parameters).fetchall()
+    except sqlite3.Error as error:
+        raise PersistenceError("SQLite read failed") from error
+
+
+def _validate_columns(connection: _Connection, table: str) -> None:
+    rows = _fetchall_on(connection, f'PRAGMA table_info("{table}")')
+    actual = tuple(
+        (
+            str(row[1]),
+            str(row[2]).upper(),
+            int(row[3]),
+            int(row[5]),
+        )
+        for row in rows
+    )
+    if actual != _TABLE_MANIFEST[table]:
+        raise PersistenceError(f"incompatible SQLite table schema: {table}")
+
+
+def _validate_foreign_keys(connection: _Connection, table: str) -> None:
+    rows = _fetchall_on(
+        connection,
+        f'PRAGMA foreign_key_list("{table}")',
+    )
+    grouped: dict[int, tuple[str, str, list[tuple[int, str, str]]]] = {}
+    for row in rows:
+        identifier = int(row[0])
+        target_table = str(row[2])
+        on_delete = str(row[6]).upper()
+        if identifier not in grouped:
+            grouped[identifier] = (target_table, on_delete, [])
+        group_table, group_delete, columns = grouped[identifier]
+        if group_table != target_table or group_delete != on_delete:
+            raise PersistenceError(
+                f"incompatible SQLite foreign key schema: {table}"
+            )
+        columns.append((int(row[1]), str(row[3]), str(row[4])))
+    actual = frozenset(
+        (target, on_delete, tuple(sorted(columns)))
+        for target, on_delete, columns in grouped.values()
+    )
+    if actual != _FOREIGN_KEY_MANIFEST[table]:
+        raise PersistenceError(f"incompatible SQLite foreign keys: {table}")
+
+
+def _validate_index(
+    connection: _Connection,
+    index: str,
+    table: str,
+    columns: tuple[str, ...],
+) -> None:
+    record = _fetchone_on(
+        connection,
+        "SELECT type, tbl_name FROM sqlite_master WHERE name = ?",
+        (index,),
+    )
+    if record != ("index", table):
+        raise PersistenceError(f"missing or incompatible SQLite index: {index}")
+    index_rows = _fetchall_on(
+        connection,
+        f'PRAGMA index_list("{table}")',
+    )
+    matching = [row for row in index_rows if row[1] == index]
+    if len(matching) != 1:
+        raise PersistenceError(f"missing or incompatible SQLite index: {index}")
+    row = matching[0]
+    if int(row[2]) != 0 or str(row[3]) != "c" or int(row[4]) != 0:
+        raise PersistenceError(f"incompatible SQLite index options: {index}")
+    column_rows = _fetchall_on(
+        connection,
+        f'PRAGMA index_info("{index}")',
+    )
+    actual_columns = tuple(
+        str(column_row[2])
+        for column_row in sorted(column_rows, key=lambda item: int(item[0]))
+    )
+    if actual_columns != columns:
+        raise PersistenceError(f"incompatible SQLite index columns: {index}")
+
+
+def _validate_schema(connection: _Connection) -> None:
+    for table in _TABLE_MANIFEST:
+        _validate_columns(connection, table)
+        _validate_foreign_keys(connection, table)
+    for index, (table, columns) in _INDEX_MANIFEST.items():
+        _validate_index(connection, index, table, columns)
+
+
+def _rollback_local(connection: _Connection) -> None:
+    try:
+        connection.rollback()
+    except BaseException:
+        pass
+
+
+def _initialize_version_zero(connection: _Connection) -> None:
+    _execute_on(connection, "BEGIN IMMEDIATE")
+    try:
+        for statement in _SCHEMA:
+            _execute_on(connection, statement)
+        _execute_on(connection, f"PRAGMA user_version={_SCHEMA_VERSION}")
+        _validate_schema(connection)
+        try:
+            connection.commit()
+        except sqlite3.Error as error:
+            _rollback_local(connection)
+            raise PersistenceError(
+                "could not commit radar schema migration"
+            ) from error
+    except BaseException:
+        _rollback_local(connection)
+        raise
+
+
+class RadarStore:
+    """Own one thread-confined SQLite connection for a radar database."""
+
+    def __init__(
+        self,
+        path: Path,
+        connection_factory: Callable[[str], _Connection] | None = None,
+    ) -> None:
         self.path = Path(path)
-        self._connection: sqlite3.Connection | None = None
+        self._connection_factory = connection_factory or _open_connection
+        self._connection: _Connection | None = None
         self._in_transaction = False
 
     def __enter__(self) -> "RadarStore":
@@ -203,39 +540,68 @@ class RadarStore:
     def initialize(self) -> None:
         """Open the database and migrate an empty/version-1 file safely."""
 
-        if self._connection is None:
+        if self._connection is not None:
+            connection = self._connection
             try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                connection = sqlite3.connect(
-                    str(self.path),
-                    isolation_level=None,
+                version_row = _fetchone_on(
+                    connection,
+                    "PRAGMA user_version",
                 )
-                connection.execute("PRAGMA foreign_keys=ON")
-                if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
-                    connection.close()
-                    raise PersistenceError("SQLite foreign keys could not be enabled")
-                connection.execute("PRAGMA journal_mode=WAL")
-                self._connection = connection
-            except (OSError, sqlite3.Error) as error:
-                raise PersistenceError(
-                    f"could not open radar database: {self.path}"
-                ) from error
+                assert version_row is not None
+                version = version_row[0]
+                if version != _SCHEMA_VERSION:
+                    raise PersistenceError(
+                        f"unsupported radar database version: {version}"
+                    )
+                _validate_schema(connection)
+            except BaseException:
+                self._discard_connection(connection)
+                raise
+            return
 
-        connection = self._require_connection()
+        connection: _Connection | None = None
         try:
-            current_version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if current_version not in (0, _SCHEMA_VERSION):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            connection = self._connection_factory(str(self.path))
+            _execute_on(connection, "PRAGMA foreign_keys=ON")
+            foreign_keys_row = _fetchone_on(
+                connection,
+                "PRAGMA foreign_keys",
+            )
+            if foreign_keys_row is None or foreign_keys_row[0] != 1:
+                raise PersistenceError("SQLite foreign keys could not be enabled")
+            _execute_on(connection, "PRAGMA journal_mode=WAL")
+            version_row = _fetchone_on(
+                connection,
+                "PRAGMA user_version",
+            )
+            assert version_row is not None
+            current_version = version_row[0]
+            if current_version == 0:
+                _initialize_version_zero(connection)
+            elif current_version == _SCHEMA_VERSION:
+                _validate_schema(connection)
+            else:
                 raise PersistenceError(
                     f"unsupported radar database version: {current_version}"
                 )
-            with self.transaction():
-                for statement in _SCHEMA:
-                    connection.execute(statement)
-                connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
-        except PersistenceError:
+        except BaseException as error:
+            if connection is not None:
+                try:
+                    connection.close()
+                except BaseException:
+                    pass
+            self._connection = None
+            self._in_transaction = False
+            if isinstance(error, PersistenceError):
+                raise
+            if isinstance(error, (OSError, sqlite3.Error)):
+                raise PersistenceError(
+                    f"could not open radar database: {self.path}"
+                ) from error
             raise
-        except sqlite3.Error as error:
-            raise PersistenceError("could not initialize radar database") from error
+        assert connection is not None
+        self._connection = connection
 
     def close(self) -> None:
         """Close the owned connection; closing an active transaction rolls it back."""
@@ -243,13 +609,12 @@ class RadarStore:
         connection = self._connection
         if connection is None:
             return
-        try:
-            if self._in_transaction:
+        if self._in_transaction:
+            try:
                 connection.rollback()
-            connection.close()
-        finally:
-            self._in_transaction = False
-            self._connection = None
+            except BaseException:
+                pass
+        self._discard_connection(connection)
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
@@ -258,18 +623,16 @@ class RadarStore:
         connection = self._require_connection()
         if self._in_transaction:
             raise PersistenceError("nested radar transactions are not supported")
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-        except sqlite3.Error as error:
-            raise PersistenceError("could not begin radar transaction") from error
+        self._execute("BEGIN IMMEDIATE")
         self._in_transaction = True
         try:
             yield
         except BaseException:
             try:
                 connection.rollback()
-            finally:
-                self._in_transaction = False
+            except BaseException:
+                self._discard_connection(connection)
+            self._in_transaction = False
             raise
         else:
             try:
@@ -277,8 +640,9 @@ class RadarStore:
             except sqlite3.Error as error:
                 try:
                     connection.rollback()
-                finally:
-                    self._in_transaction = False
+                except BaseException:
+                    self._discard_connection(connection)
+                self._in_transaction = False
                 raise PersistenceError("could not commit radar transaction") from error
             self._in_transaction = False
 
@@ -297,10 +661,10 @@ class RadarStore:
         )
 
     def get_run(self, run_id: str) -> RadarRun | None:
-        row = self._require_connection().execute(
+        row = self._fetchone(
             "SELECT canonical_json FROM runs WHERE run_id = ?",
             (run_id,),
-        ).fetchone()
+        )
         if row is None:
             return None
         restored = _restore(row[0], RadarRun)
@@ -375,13 +739,13 @@ class RadarStore:
         run_id: str,
         collector: str,
     ) -> SourceHealth | None:
-        row = self._require_connection().execute(
+        row = self._fetchone(
             """
             SELECT canonical_json FROM source_health
             WHERE run_id = ? AND collector = ?
             """,
             (run_id, collector),
-        ).fetchone()
+        )
         if row is None:
             return None
         restored = _restore(row[0], SourceHealth)
@@ -416,13 +780,13 @@ class RadarStore:
         run_id: str,
         opportunity_id: str,
     ) -> ScoredOpportunity | None:
-        row = self._require_connection().execute(
+        row = self._fetchone(
             """
             SELECT canonical_json FROM scores
             WHERE run_id = ? AND opportunity_id = ?
             """,
             (run_id, opportunity_id),
-        ).fetchone()
+        )
         if row is None:
             return None
         restored = _restore(row[0], ScoredOpportunity)
@@ -457,13 +821,13 @@ class RadarStore:
         run_id: str,
         phase: str,
     ) -> Publication | None:
-        row = self._require_connection().execute(
+        row = self._fetchone(
             """
             SELECT canonical_json FROM publications
             WHERE run_id = ? AND phase = ?
             """,
             (run_id, phase),
-        ).fetchone()
+        )
         if row is None:
             return None
         restored = _restore(row[0], Publication)
@@ -471,14 +835,44 @@ class RadarStore:
         return restored
 
     def _write(self, statement: str, parameters: Sequence[object]) -> None:
-        connection = self._require_connection()
         if self._in_transaction:
-            connection.execute(statement, parameters)
+            self._execute(statement, parameters)
             return
         with self.transaction():
-            connection.execute(statement, parameters)
+            self._execute(statement, parameters)
 
-    def _require_connection(self) -> sqlite3.Connection:
+    def _execute(
+        self,
+        statement: str,
+        parameters: Sequence[object] = (),
+    ) -> sqlite3.Cursor:
+        return _execute_on(
+            self._require_connection(),
+            statement,
+            parameters,
+        )
+
+    def _fetchone(
+        self,
+        statement: str,
+        parameters: Sequence[object] = (),
+    ) -> tuple[object, ...] | None:
+        return _fetchone_on(
+            self._require_connection(),
+            statement,
+            parameters,
+        )
+
+    def _discard_connection(self, connection: _Connection) -> None:
+        self._in_transaction = False
+        if self._connection is connection:
+            self._connection = None
+        try:
+            connection.close()
+        except BaseException:
+            pass
+
+    def _require_connection(self) -> _Connection:
         if self._connection is None:
             raise PersistenceError("radar store is not initialized")
         return self._connection

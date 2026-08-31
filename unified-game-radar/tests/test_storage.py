@@ -13,7 +13,7 @@ import unittest
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
-from unified_game_radar.errors import PersistenceError
+from unified_game_radar.errors import InputValidationError, PersistenceError
 from unified_game_radar.schemas import (
     GameIdentity,
     PlatformRecord,
@@ -31,6 +31,33 @@ SECOND_RUN_ID = "20260831T080000Z-b1c2d3e4"
 MISSING_RUN_ID = "20260831T090000Z-c1d2e3f4"
 OPPORTUNITY_ID = "0f840f6f-5c62-4ca6-9d53-e0be9ab2740b"
 STARTED_AT = datetime(2026, 8, 31, 2, tzinfo=timezone.utc)
+
+
+class FaultInjectingConnection:
+    def __init__(self, path: Path) -> None:
+        self.delegate = sqlite3.connect(str(path), isolation_level=None)
+        self.fail_commit = False
+        self.fail_rollback = False
+        self.closed = False
+        self.commit_error: sqlite3.OperationalError | None = None
+
+    def execute(self, *args: object) -> sqlite3.Cursor:
+        return self.delegate.execute(*args)
+
+    def commit(self) -> None:
+        if self.fail_commit:
+            self.commit_error = sqlite3.OperationalError("injected commit failure")
+            raise self.commit_error
+        self.delegate.commit()
+
+    def rollback(self) -> None:
+        if self.fail_rollback:
+            raise sqlite3.OperationalError("injected rollback failure")
+        self.delegate.rollback()
+
+    def close(self) -> None:
+        self.closed = True
+        self.delegate.close()
 
 
 def make_run(run_id: str = RUN_ID) -> RadarRun:
@@ -174,8 +201,9 @@ class RadarStoreTest(unittest.TestCase):
             self.store._connection.execute("PRAGMA foreign_keys").fetchone()[0],
             1,
         )
-        with self.assertRaises(sqlite3.IntegrityError):
+        with self.assertRaises(PersistenceError) as raised:
             self.store.bind_platform_record(OPPORTUNITY_ID, make_record())
+        self.assertIsInstance(raised.exception.__cause__, sqlite3.IntegrityError)
 
     def test_transaction_rolls_back_all_rows(self) -> None:
         run = make_run()
@@ -190,6 +218,13 @@ class RadarStoreTest(unittest.TestCase):
         self.store.create_run(run)
         self.assertEqual(self.store.get_run(run.run_id), run)
         self.assertIsNone(self.store.get_run(MISSING_RUN_ID))
+
+    def test_duplicate_run_is_reported_as_persistence_error(self) -> None:
+        run = make_run()
+        self.store.create_run(run)
+        with self.assertRaises(PersistenceError) as raised:
+            self.store.create_run(run)
+        self.assertIsInstance(raised.exception.__cause__, sqlite3.IntegrityError)
 
     def test_write_outside_explicit_transaction_is_durable(self) -> None:
         run = make_run()
@@ -273,13 +308,47 @@ class RadarStoreTest(unittest.TestCase):
         )
 
     def test_source_health_requires_an_existing_run(self) -> None:
-        with self.assertRaises(sqlite3.IntegrityError):
+        with self.assertRaises(PersistenceError) as raised:
             self.store.save_source_health(make_health(MISSING_RUN_ID))
+        self.assertIsInstance(raised.exception.__cause__, sqlite3.IntegrityError)
 
     def test_score_requires_an_existing_run(self) -> None:
         self.store.upsert_identity(make_identity())
-        with self.assertRaises(sqlite3.IntegrityError):
+        with self.assertRaises(PersistenceError) as raised:
             self.store.save_score(make_score(MISSING_RUN_ID))
+        self.assertIsInstance(raised.exception.__cause__, sqlite3.IntegrityError)
+
+    def test_select_failure_is_reported_as_persistence_error(self) -> None:
+        self.store._connection.execute("DROP TABLE runs")
+        with self.assertRaises(PersistenceError) as raised:
+            self.store.get_run(RUN_ID)
+        self.assertIsInstance(raised.exception.__cause__, sqlite3.OperationalError)
+
+    def test_faulted_connection_read_is_reported_as_persistence_error(self) -> None:
+        self.store._connection.close()
+        with self.assertRaises(PersistenceError) as raised:
+            self.store.get_run(RUN_ID)
+        self.assertIsInstance(raised.exception.__cause__, sqlite3.ProgrammingError)
+
+    def test_invalid_stored_schema_is_reported_as_persistence_error(self) -> None:
+        self.store.create_run(make_run())
+        self.store._connection.execute(
+            "UPDATE runs SET canonical_json = ? WHERE run_id = ?",
+            ("{}", RUN_ID),
+        )
+        with self.assertRaises(PersistenceError) as raised:
+            self.store.get_run(RUN_ID)
+        self.assertIsInstance(raised.exception.__cause__, InputValidationError)
+
+    def test_invalid_stored_json_is_reported_as_persistence_error(self) -> None:
+        self.store.create_run(make_run())
+        self.store._connection.execute(
+            "UPDATE runs SET canonical_json = ? WHERE run_id = ?",
+            ("{", RUN_ID),
+        )
+        with self.assertRaises(PersistenceError) as raised:
+            self.store.get_run(RUN_ID)
+        self.assertIsInstance(raised.exception.__cause__, json.JSONDecodeError)
 
     def test_close_releases_the_sqlite_connection(self) -> None:
         connection = self.store._connection
@@ -296,6 +365,129 @@ class RadarStoreTest(unittest.TestCase):
             connection = managed._connection
         with self.assertRaises(sqlite3.ProgrammingError):
             connection.execute("SELECT 1")
+
+    def test_version_zero_reserved_malformed_table_is_rejected(self) -> None:
+        path = Path(self.temporary_directory.name) / "malformed-v0.sqlite3"
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "CREATE TABLE runs (run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, "
+            "mode TEXT NOT NULL)"
+        )
+        connection.commit()
+        connection.close()
+
+        malformed = RadarStore(path)
+        with self.assertRaises(PersistenceError):
+            malformed.initialize()
+        self.assertIsNone(malformed._connection)
+
+        check = sqlite3.connect(path)
+        try:
+            self.assertEqual(check.execute("PRAGMA user_version").fetchone()[0], 0)
+        finally:
+            check.close()
+
+    def test_version_one_missing_required_index_is_rejected(self) -> None:
+        path = Path(self.temporary_directory.name) / "missing-index.sqlite3"
+        valid = RadarStore(path)
+        valid.initialize()
+        valid.close()
+        connection = sqlite3.connect(path)
+        connection.execute("DROP INDEX observations_history_idx")
+        connection.commit()
+        connection.close()
+
+        malformed = RadarStore(path)
+        with self.assertRaises(PersistenceError):
+            malformed.initialize()
+        self.assertIsNone(malformed._connection)
+
+    def test_version_one_missing_required_foreign_key_is_rejected(self) -> None:
+        path = Path(self.temporary_directory.name) / "missing-fk.sqlite3"
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            """
+            CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                canonical_json TEXT NOT NULL
+            );
+            CREATE TABLE source_health (
+                run_id TEXT NOT NULL,
+                collector TEXT NOT NULL,
+                status TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                canonical_json TEXT NOT NULL,
+                PRIMARY KEY (run_id, collector)
+            );
+            PRAGMA user_version=1;
+            """
+        )
+        connection.close()
+
+        malformed = RadarStore(path)
+        with self.assertRaises(PersistenceError):
+            malformed.initialize()
+        self.assertIsNone(malformed._connection)
+
+    def test_unsupported_version_failure_closes_local_connection(self) -> None:
+        path = Path(self.temporary_directory.name) / "future.sqlite3"
+        connection = sqlite3.connect(path)
+        connection.execute("PRAGMA user_version=2")
+        connection.close()
+        tracked = FaultInjectingConnection(path)
+        store = RadarStore(path, connection_factory=lambda _: tracked)
+
+        with self.assertRaises(PersistenceError):
+            store.initialize()
+        self.assertIsNone(store._connection)
+        self.assertTrue(tracked.closed)
+
+    def test_context_manager_enter_failure_does_not_retain_connection(self) -> None:
+        path = Path(self.temporary_directory.name) / "context-malformed.sqlite3"
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "CREATE TABLE runs (run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL)"
+        )
+        connection.commit()
+        connection.close()
+        tracked = FaultInjectingConnection(path)
+        store = RadarStore(path, connection_factory=lambda _: tracked)
+
+        with self.assertRaises(PersistenceError):
+            with store:
+                self.fail("context body must not run")
+        self.assertIsNone(store._connection)
+        self.assertTrue(tracked.closed)
+
+    def test_caller_exception_survives_rollback_failure(self) -> None:
+        path = Path(self.temporary_directory.name) / "rollback.sqlite3"
+        tracked = FaultInjectingConnection(path)
+        store = RadarStore(path, connection_factory=lambda _: tracked)
+        store.initialize()
+        tracked.fail_rollback = True
+
+        with self.assertRaisesRegex(RuntimeError, "caller failure"):
+            with store.transaction():
+                raise RuntimeError("caller failure")
+        self.assertIsNone(store._connection)
+        self.assertTrue(tracked.closed)
+
+    def test_commit_failure_is_preserved_when_rollback_also_fails(self) -> None:
+        path = Path(self.temporary_directory.name) / "commit.sqlite3"
+        tracked = FaultInjectingConnection(path)
+        store = RadarStore(path, connection_factory=lambda _: tracked)
+        store.initialize()
+        tracked.fail_commit = True
+        tracked.fail_rollback = True
+
+        with self.assertRaises(PersistenceError) as raised:
+            with store.transaction():
+                pass
+        self.assertIs(raised.exception.__cause__, tracked.commit_error)
+        self.assertIsNone(store._connection)
+        self.assertTrue(tracked.closed)
 
 
 if __name__ == "__main__":
