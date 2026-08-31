@@ -61,6 +61,9 @@ INSTALLED_ENRICH_COMMAND = """python3 .agent/skills/steam-game-radar/scripts/ste
   --config .agent/skills/steam-game-radar/references/config.example.json \\
   --run-id 20260824T030000Z-a1b2c3d4 \\
   --input /path/to/enrichment.json"""
+UNIFIED_STEAM_SCAN_COMMAND = """python3 unified-game-radar/scripts/game_radar.py scan \\
+  --config unified-game-radar/references/config.example.json \\
+  --platform steam"""
 
 
 def _read(path: Path) -> str:
@@ -90,165 +93,38 @@ class SkillDocumentationTests(unittest.TestCase):
             self.assertNotIn(workflow_word, description.casefold())
         body = text[match.end() :] if match else ""
         self.assertLess(len(body.split()), 700)
-        for reference in (
-            "references/data-sources.md",
-            "references/steamdb-import-format.md",
-            "references/scoring-rules.md",
-            "references/report-template.md",
-        ):
-            self.assertIn(reference, body)
+        self.assertIn("unified-game-radar/SKILL.md", body)
+        self.assertIn("references/steamdb-import-format.md", body)
+        self.assertIn("deprecated", body.casefold())
+        self.assertIn("manual-only", body.casefold())
 
     def test_manual_trigger_routes_are_exact(self) -> None:
         text = _read(SKILL_ROOT / "SKILL.md")
-        self.assertIn("`\u8dd1 Steam \u96f7\u8fbe`", text)
-        self.assertIn("`\u5bfc\u5165 SteamDB \u699c\u5355\u5e76\u8dd1 Steam \u96f7\u8fbe`", text)
-        scan_index = text.find("`\u8dd1 Steam \u96f7\u8fbe`")
-        import_index = text.find("`\u5bfc\u5165 SteamDB \u699c\u5355\u5e76\u8dd1 Steam \u96f7\u8fbe`")
-        self.assertGreater(text.find(SCAN_COMMAND, scan_index), scan_index)
-        self.assertGreater(text.find(IMPORT_COMMAND, import_index), import_index)
-        import_route = text[import_index : text.find("##", import_index + 3)]
-        self.assertRegex(import_route, r"\u672c\u5730(?: CSV/JSON| CSV \u6216 JSON).*(?:view|\u89c6\u56fe)")
-        for token in ("Top 10", "Google", "YouTube", "Reddit"):
-            self.assertIn(token, import_route)
-        path_section = text[text.find("## Path modes") : text.find("## Manual routes")]
-        self.assertIn("Repository checkout", path_section)
-        self.assertIn("Installed in the target project", path_section)
-        self.assertIn("target project root", path_section)
-        self.assertIn(
-            "Relative `data_dir` and `report_dir` values resolve from that target project root",
-            " ".join(path_section.split()),
-        )
-        for command in (
-            INSTALLED_SCAN_COMMAND,
-            INSTALLED_IMPORT_COMMAND,
-            INSTALLED_ENRICH_COMMAND,
-        ):
-            self.assertIn(command, path_section)
+        self.assertIn(UNIFIED_STEAM_SCAN_COMMAND, text)
+        self.assertIn("exact `run_id`", text)
+        self.assertIn("`enrich`", text)
+        self.assertIn("`report`", text)
+        self.assertNotIn("--publish-daily", text)
+        self.assertNotRegex(text, r"\b[0-5]?\d\s+[0-2]?\d(?:,[0-2]?\d)*\s+\*\s+\*\s+\*")
+        self.assertIn("local CSV/JSON export", text)
+        self.assertIn("Never browse, crawl, refresh, or automate steamdb.info", text)
 
     def test_exact_cli_commands_and_outputs(self) -> None:
         text = _read(SKILL_ROOT / "SKILL.md")
-        for command in (SCAN_COMMAND, IMPORT_COMMAND, ENRICH_COMMAND):
-            self.assertIn(command, text)
-            self.assertEqual(text.count(command), 1)
-        self.assertIn("reports/steam-game-radar/{run_id}.preliminary.json", text)
-        self.assertIn("reports/steam-game-radar/{run_id}.final.json", text)
-        self.assertIn("references/report-template.md", text)
-        exit_section = text[text.find("## Exit codes") : text.find("## References")]
-        exit_rows = {
-            int(code): meaning.strip()
-            for code, meaning in re.findall(
-                r"(?m)^\|\s*([0-6])\s*\|\s*([^|]+?)\s*\|$",
-                exit_section,
-            )
-        }
-        self.assertEqual(
-            exit_rows,
-            {
-                0: "Success, including stale fallback no older than 72 hours",
-                1: "Unexpected failure; traceback is emitted",
-                2: "Input or schema validation failure",
-                3: "Provider failure with no usable fallback",
-                4: "Configuration failure",
-                5: "Snapshot or report persistence failure",
-                6: "Another run holds the project lock",
-            },
-        )
+        self.assertEqual(text.count(UNIFIED_STEAM_SCAN_COMMAND), 1)
+        self.assertNotIn(SCAN_COMMAND, text)
+        self.assertNotIn(IMPORT_COMMAND, text)
+        self.assertNotIn(ENRICH_COMMAND, text)
+        self.assertIn("one-line manifest", text)
+        self.assertIn("unified-game-radar/SKILL.md", text)
 
     def test_agent_schedule_and_preliminary_only_cron(self) -> None:
         text = _read(SKILL_ROOT / "SKILL.md")
-        schedule = text[text.find("## Schedules") : text.find("## Policy and outputs")]
-        schedule_flat = " ".join(schedule.split())
-        self.assertIn("scheduler-neutral parameters", schedule_flat)
-        self.assertIn("map into the host Agent scheduler UI or API", schedule_flat)
-        self.assertIn("not a universal registration JSON", schedule_flat)
-        self.assertIn("`0 11 * * *`", schedule)
-        self.assertIn("`Asia/Shanghai`", schedule)
-        self.assertNotIn("<preliminary_run_id>", schedule)
-        manifest_match = re.search(
-            r"```jsonl\n([^\n]+)\n```",
-            schedule,
-        )
-        self.assertIsNotNone(manifest_match)
-        manifest = json.loads(manifest_match.group(1) if manifest_match else "{}")
-        self.assertEqual(
-            set(manifest),
-            {
-                "schema_version",
-                "run_id",
-                "phase",
-                "report_json",
-                "report_markdown",
-                "warnings",
-                "enrichment_candidate_appids",
-            },
-        )
-        self.assertEqual(manifest["schema_version"], 1)
-        self.assertEqual(manifest["phase"], "preliminary")
-        self.assertEqual(manifest["enrichment_candidate_appids"], [123456])
-        self.assertEqual(manifest["warnings"], [])
-        self.assertTrue(Path(manifest["report_json"]).is_absolute())
-        self.assertTrue(Path(manifest["report_markdown"]).is_absolute())
-        workflow = " ".join(
-            schedule[schedule.find("### Agent payload") :].split()
-        )
-        workflow_steps = (
-            "Run `scan`",
-            "capture and parse its exact one-line JSON manifest",
-            "read `run_id`",
-            "research every AppID in `enrichment_candidate_appids`",
-            "write `enrichment.json`",
-            "run `enrich`",
-            "capture and consume the final one-line manifest",
-        )
-        for step in workflow_steps:
-            self.assertIn(step, workflow)
-        for earlier, later in zip(
-            workflow_steps,
-            workflow_steps[1:],
-        ):
-            self.assertLess(workflow.find(earlier), workflow.find(later))
-        self.assertIn(
-            "one total Top N across released and unreleased eligible reported candidates",
-            workflow,
-        )
-        self.assertIn("canonical `candidate_sort_key`", workflow)
-        self.assertIn("not N per pool", workflow)
-        self.assertIn("already limited by configured `enrichment_top_n`", workflow)
-        self.assertIn("manifest field is authoritative", workflow)
-        cron_section = schedule[schedule.find("### Conventional cron") :]
-        cron_blocks = {
-            label: block
-            for label, block in re.findall(
-                r"#### (Repository checkout|Installed in the target project)\n\n```cron\n(.*?)\n```",
-                cron_section,
-                flags=re.DOTALL,
-            )
-        }
-        self.assertEqual(
-            cron_blocks,
-            {
-                "Repository checkout": (
-                    "TZ=Asia/Shanghai\n"
-                    "0 11 * * * cd /absolute/path/to/project && "
-                    "python3 steam-game-radar/scripts/steam_radar.py scan "
-                    "--config steam-game-radar/references/config.example.json"
-                ),
-                "Installed in the target project": (
-                    "TZ=Asia/Shanghai\n"
-                    "0 11 * * * cd /absolute/path/to/project && "
-                    "python3 .agent/skills/steam-game-radar/scripts/steam_radar.py scan "
-                    "--config .agent/skills/steam-game-radar/references/config.example.json"
-                ),
-            },
-        )
-        cron_flat = " ".join(cron_section.split())
-        self.assertIn("scan-only and preliminary-only", cron_flat)
-        self.assertIn("target project root", cron_flat)
-        self.assertRegex(
-            text,
-            r"(?s)conventional cron.*?(?:preliminary-only|\u4ec5\u751f\u6210 preliminary).*?(?:\u72ec\u7acb Agent|separate agent)",
-        )
-        self.assertRegex(text, r"(?:\u4e0d\u4f1a|never).*(?:\u4fee\u6539|edit).*(?:cron|\u5b9a\u65f6)")
+        self.assertIn("scheduled standalone Steam workflow is deprecated", text)
+        self.assertIn("manual-only", text)
+        self.assertNotIn("## Schedules", text)
+        self.assertNotIn("```cron", text)
+        self.assertNotRegex(text, r"\b[0-5]?\d\s+[0-2]?\d(?:,[0-2]?\d)*\s+\*\s+\*\s+\*")
 
     def test_steamdb_is_local_import_only_and_never_scraped(self) -> None:
         skill = _read(SKILL_ROOT / "SKILL.md")
@@ -261,7 +137,7 @@ class SkillDocumentationTests(unittest.TestCase):
                 combined,
                 rf"(?:never|\u4ece\u4e0d|\u4e0d\u5f97|\u7981\u6b62)[^\n]{{0,80}}{prohibited}",
             )
-        self.assertIn("\u4eba\u5de5", combined)
+        self.assertRegex(combined, r"(?:human|\u4eba\u5de5)")
 
     def test_data_sources_reference_is_complete(self) -> None:
         text = _read(SKILL_ROOT / "references/data-sources.md")
@@ -639,15 +515,15 @@ class SkillDocumentationTests(unittest.TestCase):
             readme,
         )
         skill_names = sorted(path.parent.name for path in ROOT.glob("*/SKILL.md"))
-        self.assertEqual(len(skill_names), 32)
-        self.assertIn("32 \u4e2a\u53ef\u590d\u7528", readme)
-        self.assertIn("skills-32-blue.svg", readme)
-        self.assertIn("**\u603b\u6280\u80fd\u6570**: 32 \u4e2a", readme)
+        self.assertEqual(len(skill_names), 33)
+        self.assertIn("33 \u4e2a\u53ef\u590d\u7528", readme)
+        self.assertIn("skills-33-blue.svg", readme)
+        self.assertIn("**\u603b\u6280\u80fd\u6570**: 33 \u4e2a", readme)
         for name in skill_names:
             self.assertIn(f"**{name}**", readme)
         steam_line = next(line for line in readme.splitlines() if "**steam-game-radar**" in line)
         html5_line = next(line for line in readme.splitlines() if "**html5-game-radar**" in line)
-        self.assertRegex(steam_line, r"Steam.*(?:\u5b98\u65b9|\u8d8b\u52bf|SteamDB)")
+        self.assertRegex(steam_line, r"Steam.*(?:\u5f03\u7528|\u624b\u52a8|\u517c\u5bb9)")
         self.assertRegex(html5_line, r"HTML5|\u6d4f\u89c8\u5668\u53ef\u73a9")
         self.assertNotEqual(steam_line, html5_line)
 

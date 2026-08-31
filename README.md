@@ -25,7 +25,7 @@
 🔄 **内容自动同步** — `auto-page-sync` 让你只管往仓库写 Markdown，前端页面自动生成。配合 GitHub Actions 定时拉取，Google 爬虫看到的永远是最新内容。支持日报、博客、Changelog、Landing Page 等多种页面模式，一套机制复用所有项目。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
-[![Skills](https://img.shields.io/badge/skills-32-blue.svg)](#-完整技能清单)
+[![Skills](https://img.shields.io/badge/skills-33-blue.svg)](#-完整技能清单)
 [![Agent Skills Standard](https://img.shields.io/badge/standard-Agent_Skills-8A2BE2.svg)](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)
 [![Contributions Welcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](./CONTRIBUTING.md)
 
