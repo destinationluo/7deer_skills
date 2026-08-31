@@ -95,7 +95,10 @@ def _round_one_decimal(value: float) -> float:
 def _finite_number(value: object, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a number")
-    parsed = float(value)
+    try:
+        parsed = float(value)
+    except (OverflowError, ValueError) as error:
+        raise ValueError(f"{name} must be a finite number") from error
     if not math.isfinite(parsed):
         raise ValueError(f"{name} must be finite")
     return parsed
@@ -529,6 +532,8 @@ def eligible_cohort(
     values = tuple(heats)
     if not all(isinstance(item, PlatformHeat) for item in values):
         raise TypeError("heats must contain PlatformHeat records")
+    if len({item.run_id for item in values}) > 1:
+        raise ValueError("eligible cohort input must belong to one run")
     selected = tuple(
         item
         for item in values
@@ -536,8 +541,6 @@ def eligible_cohort(
         and item.surface == surface
         and item.heat >= floor
     )
-    if len({item.run_id for item in selected}) > 1:
-        raise ValueError("eligible cohort must belong to one run")
     return tuple(sorted(selected, key=_deterministic_heat_order))
 
 
@@ -563,13 +566,13 @@ def normalize_cohort(
     """Normalize exactly one compatible cohort into a deterministic score list."""
 
     values = tuple(heats)
+    floor = _finite_number(heat_floor, "heat_floor")
+    if floor < 0 or floor > 100:
+        raise ValueError("heat_floor must be between 0 and 100")
     if not values:
         return ()
     if not all(isinstance(item, PlatformHeat) for item in values):
         raise TypeError("heats must contain PlatformHeat records")
-    floor = _finite_number(heat_floor, "heat_floor")
-    if floor < 0 or floor > 100:
-        raise ValueError("heat_floor must be between 0 and 100")
     platforms = {parse_platform_key(item.platform_key)[0] for item in values}
     surfaces = {item.surface for item in values}
     run_ids = {item.run_id for item in values}

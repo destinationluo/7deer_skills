@@ -158,7 +158,9 @@ deterministic regardless of input order.
 
 The absolute heat floor is `30.0`. A candidate below the floor is excluded.
 `eligible_cohort` can filter a broader same-run sequence by exact platform and
-cohort surface; it returns heat-descending, platform-key-ascending results.
+cohort surface. Every input row must belong to that one run even when the row
+would later be filtered for platform, surface, or heat. Results are ordered by
+heat descending and platform key ascending.
 
 `normalize_cohort` accepts exactly one run/platform/cohort surface and rejects
 mixed or duplicate platform-key input. Eligibility is applied before cohort
@@ -184,4 +186,7 @@ can receive no more than 15 platform points.
 
 Persisted `heat` and `platform_score` use decimal half-up rounding to one
 decimal place. Output order is deterministic: heat descending, then platform
-key ascending, then observation IDs.
+key ascending, then observation IDs. Numeric inputs reject booleans, nonfinite
+values, and integers too large for finite float conversion with `ValueError`.
+Independent parameters such as `heat_floor` are validated even for an empty
+cohort.

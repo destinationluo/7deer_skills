@@ -106,6 +106,34 @@ def heat(
 
 
 class ItchHeatTests(unittest.TestCase):
+    def test_numeric_inputs_reject_huge_bool_and_nonfinite_as_value_errors(self) -> None:
+        invalid_values = (10**400, True, float("nan"), float("inf"))
+        scorers = (
+            lambda value: score_itch_heat(
+                itch_input(first_seen_age_hours=value)
+            ),
+            lambda value: score_steam_released_heat(
+                released_input(
+                    current_player_growth_percent=value,
+                    player_growth_history_compatible=True,
+                )
+            ),
+            lambda value: score_steam_upcoming_heat(
+                upcoming_input(release_days_away=value)
+            ),
+            lambda value: score_roblox_heat(
+                roblox_input(
+                    concurrent_player_growth_percent=value,
+                    player_growth_history_compatible=True,
+                )
+            ),
+        )
+        for value in invalid_values:
+            for scorer in scorers:
+                with self.subTest(value=repr(value), scorer=scorer):
+                    with self.assertRaises(ValueError):
+                        scorer(value)
+
     def test_first_seen_age_boundaries(self) -> None:
         cases = (
             (None, 0),
@@ -593,6 +621,53 @@ class CohortNormalizationTests(unittest.TestCase):
             tuple(item.platform_key for item in selected),
             ("steam:5", "steam:2"),
         )
+
+    def test_eligible_cohort_rejects_any_cross_run_input_before_filtering(self) -> None:
+        unrelated_inputs = (
+            heat("steam:2", 20, run_id=OTHER_RUN_ID),
+            heat(
+                "steam:2",
+                80,
+                surface="steam_upcoming",
+                run_id=OTHER_RUN_ID,
+            ),
+            heat("roblox:2", 80, run_id=OTHER_RUN_ID),
+        )
+        for unrelated in unrelated_inputs:
+            with self.subTest(unrelated=unrelated):
+                with self.assertRaises(ValueError):
+                    eligible_cohort(
+                        (heat("steam:1", 80), unrelated),
+                        platform="steam",
+                        surface="steam_released",
+                    )
+
+    def test_numeric_utility_inputs_use_stable_value_errors(self) -> None:
+        invalid_values = (10**400, True, float("nan"), float("inf"), "30")
+        for value in invalid_values:
+            with self.subTest(api="eligible", value=repr(value)):
+                with self.assertRaises(ValueError):
+                    eligible_cohort(
+                        (),
+                        platform="steam",
+                        surface="steam_released",
+                        heat_floor=value,  # type: ignore[arg-type]
+                    )
+            with self.subTest(api="normalize", value=repr(value)):
+                with self.assertRaises(ValueError):
+                    normalize_cohort((), heat_floor=value)  # type: ignore[arg-type]
+            with self.subTest(api="rank", value=repr(value)):
+                with self.assertRaises(ValueError):
+                    average_tie_rank((value,))  # type: ignore[arg-type]
+
+    def test_valid_empty_cohorts_remain_empty_after_parameter_validation(self) -> None:
+        self.assertEqual(
+            eligible_cohort(
+                (), platform="steam", surface="steam_released", heat_floor=30
+            ),
+            (),
+        )
+        self.assertEqual(normalize_cohort((), heat_floor=30), ())
 
     def test_average_tie_ranks_are_one_based_and_input_aligned(self) -> None:
         self.assertEqual(
