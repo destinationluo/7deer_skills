@@ -3,8 +3,10 @@ from __future__ import annotations
 import copy
 from dataclasses import replace
 from datetime import date, datetime, timezone
+import hashlib
 import json
 from pathlib import Path
+import re
 import tempfile
 import sys
 import unittest
@@ -375,6 +377,34 @@ class ReportBuildTests(unittest.TestCase):
         self.assertLess(markdown.index("Markdown Source"), markdown.index("Pocket Workshop"))
         self.assertEqual(markdown, render_markdown(changed))
 
+    def test_markdown_html_escapes_untrusted_text_and_does_not_autolink_urls(self) -> None:
+        report = copy.deepcopy(
+            build_report(preliminary_result(), final_scores(), "final")
+        )
+        unsafe_url = (
+            "https://store.steampowered.com/app/123456/>\n"
+            "<script>alert(1)</script>?left=1&right=2"
+        )
+        report["candidates"][0]["name"] = "Danger <b> & signal"
+        report["candidates"][0]["platforms"][0]["url"] = unsafe_url
+        report["candidates"][0]["evidence_urls"][0] = unsafe_url
+        report["candidates"][0]["warnings"][0]["message"] = (
+            "warning <img src=x> & more"
+        )
+
+        markdown = render_markdown(report)
+
+        self.assertNotIn("<b>", markdown)
+        self.assertNotIn("<script>", markdown)
+        self.assertNotIn("<img", markdown)
+        self.assertNotIn(f"<{unsafe_url}>", markdown)
+        self.assertNotIn("\n<script>", markdown)
+        self.assertIn("&lt;b&gt;", markdown)
+        self.assertIn("&lt;script&gt;", markdown)
+        self.assertIn("&lt;img", markdown)
+        self.assertIn("&amp;", markdown)
+        self.assertIn("&gt;", markdown)
+
     def test_canonical_renderer_maps_malformed_exact_schema_to_validation_error(self) -> None:
         report = build_report(preliminary_result(), final_scores(), "final")
         invalid_phase = copy.deepcopy(report)
@@ -385,6 +415,71 @@ class ReportBuildTests(unittest.TestCase):
             with self.subTest(keys=tuple(malformed)):
                 with self.assertRaises(InputValidationError):
                     render_markdown(malformed)
+
+    def test_canonical_renderer_rejects_noncanonical_array_order(self) -> None:
+        report = build_report(preliminary_result(), final_scores(), "final")
+        reversed_health = copy.deepcopy(report)
+        reversed_health["source_health"].reverse()
+
+        reversed_platforms = copy.deepcopy(report)
+        first = reversed_platforms["candidates"][0]
+        first["platforms"].reverse()
+        first["evidence_urls"].reverse()
+        first["evidence_timestamps"].reverse()
+
+        reversed_candidates = copy.deepcopy(report)
+        reversed_candidates["candidates"].reverse()
+        for rank, candidate in enumerate(reversed_candidates["candidates"], start=1):
+            candidate["rank"] = rank
+
+        for malformed in (
+            reversed_health,
+            reversed_platforms,
+            reversed_candidates,
+        ):
+            with self.subTest(first_candidate=malformed["candidates"][0]["name"]):
+                with self.assertRaises(InputValidationError):
+                    render_markdown(malformed)
+
+    def test_candidate_platforms_require_health_and_warning_ownership(self) -> None:
+        result = preliminary_result()
+        missing_roblox_health = replace(
+            result,
+            source_health=tuple(
+                item for item in result.source_health if item.collector != "roblox"
+            ),
+        )
+        with self.assertRaises(InputValidationError):
+            build_report(missing_roblox_health, final_scores(), "final")
+
+        report = build_report(result, final_scores(), "final")
+        missing_provenance = copy.deepcopy(report)
+        missing_provenance["source_health"] = [
+            item
+            for item in missing_provenance["source_health"]
+            if item["collector"] != "roblox"
+        ]
+        missing_provenance["candidates"][0]["evidence_timestamps"] = [
+            item
+            for item in missing_provenance["candidates"][0]["evidence_timestamps"]
+            if item["collector"] != "roblox"
+        ]
+
+        wrong_candidate_warning = copy.deepcopy(report)
+        wrong_candidate_warning["candidates"][0]["warnings"][0][
+            "opportunity_id"
+        ] = OPPORTUNITY_B
+
+        owned_run_warning = copy.deepcopy(report)
+        owned_run_warning["warnings"][0]["opportunity_id"] = OPPORTUNITY_A
+
+        for malformed in (
+            missing_provenance,
+            wrong_candidate_warning,
+            owned_run_warning,
+        ):
+            with self.assertRaises(InputValidationError):
+                render_markdown(malformed)
 
 
 class RunArtifactTests(unittest.TestCase):
@@ -426,6 +521,88 @@ class RunArtifactTests(unittest.TestCase):
                 paths = persist_run_artifacts(report, root, FileAtomicWriter())
                 self.assertEqual(paths[0].read_text(encoding="utf-8"), canonical_json(report))
                 self.assertEqual(paths[1].read_text(encoding="utf-8"), render_markdown(report))
+
+    def test_preliminary_reports_use_content_addressed_snapshots_and_latest_view(self) -> None:
+        first = build_report(preliminary_result(), (), "preliminary")
+        changed_result = preliminary_result()
+        changed_identity = replace(
+            changed_result.candidates[0],
+            name="Signal Garden Expanded",
+            normalized_name="signal garden expanded",
+        )
+        changed_result = replace(
+            changed_result,
+            candidates=(changed_identity, changed_result.candidates[1]),
+        )
+        second = build_report(changed_result, (), "preliminary")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_paths = persist_run_artifacts(first, root, FileAtomicWriter())
+            second_paths = persist_run_artifacts(second, root, FileAtomicWriter())
+
+            first_hash = hashlib.sha256(canonical_json(first).encode("utf-8")).hexdigest()
+            second_hash = hashlib.sha256(canonical_json(second).encode("utf-8")).hexdigest()
+            self.assertNotEqual(first_hash, second_hash)
+            self.assertEqual(
+                first_paths,
+                (
+                    root / f"{RUN_ID}.preliminary.{first_hash}.json",
+                    root / f"{RUN_ID}.preliminary.{first_hash}.md",
+                ),
+            )
+            self.assertEqual(
+                second_paths,
+                (
+                    root / f"{RUN_ID}.preliminary.{second_hash}.json",
+                    root / f"{RUN_ID}.preliminary.{second_hash}.md",
+                ),
+            )
+            self.assertRegex(first_paths[0].name, re.compile(r"[0-9a-f]{64}\.json\Z"))
+            self.assertEqual(first_paths[0].read_text("utf-8"), canonical_json(first))
+            self.assertEqual(second_paths[0].read_text("utf-8"), canonical_json(second))
+            self.assertEqual(
+                (root / f"{RUN_ID}.preliminary.latest.json").read_text("utf-8"),
+                canonical_json(second),
+            )
+            self.assertEqual(
+                (root / f"{RUN_ID}.preliminary.latest.md").read_text("utf-8"),
+                render_markdown(second),
+            )
+
+    def test_preliminary_retry_repairs_each_snapshot_and_latest_stage(self) -> None:
+        report = build_report(preliminary_result(), (), "preliminary")
+        for fail_on in (1, 2, 3, 4):
+            with self.subTest(fail_on=fail_on), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with self.assertRaises(ReportError):
+                    persist_run_artifacts(report, root, FailAfterWriter(fail_on))
+
+                paths = persist_run_artifacts(report, root, FileAtomicWriter())
+                self.assertEqual(paths[0].read_text("utf-8"), canonical_json(report))
+                self.assertEqual(paths[1].read_text("utf-8"), render_markdown(report))
+                self.assertEqual(
+                    (root / f"{RUN_ID}.preliminary.latest.json").read_text("utf-8"),
+                    canonical_json(report),
+                )
+                self.assertEqual(
+                    (root / f"{RUN_ID}.preliminary.latest.md").read_text("utf-8"),
+                    render_markdown(report),
+                )
+
+    def test_persist_refuses_symlinked_report_root(self) -> None:
+        report = build_report(preliminary_result(), final_scores(), "final")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside"
+            outside.mkdir()
+            report_link = root / "reports"
+            report_link.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaises(ReportError):
+                persist_run_artifacts(report, report_link, FileAtomicWriter())
+
+            self.assertEqual(list(outside.iterdir()), [])
 
 
 class DailyPublicationTests(unittest.TestCase):
@@ -509,7 +686,8 @@ class DailyPublicationTests(unittest.TestCase):
         daily = self.report_dir / "daily"
         self.assertTrue(publication.advances_daily_latest)
         self.assertEqual(publication.daily_date, date(2026, 8, 31))
-        self.assertEqual(Path(publication.report_json), daily / "2026-08-31.json")
+        self.assertEqual(Path(publication.report_json), paths[0])
+        self.assertEqual(Path(publication.report_markdown), paths[1])
         for path in (
             daily / "2026-08-31.json",
             daily / "2026-08-31.md",
@@ -520,6 +698,39 @@ class DailyPublicationTests(unittest.TestCase):
         self.assertEqual((daily / "latest.json").read_text(), canonical_json(report))
         self.assertEqual((daily / "latest.md").read_text(), render_markdown(report))
         self.assertEqual(self.store.get_publication(run.run_id, "final"), publication)
+
+    def test_same_date_publications_keep_immutable_audit_paths(self) -> None:
+        scheduled = radar_run(
+            run_id="20260831T080000Z-c1d2e3f4",
+            started_at=datetime(2026, 8, 31, 8, tzinfo=timezone.utc),
+        )
+        first_report, first_paths = self._prepare(scheduled)
+        first = self._publish(scheduled, first_report, first_paths)
+
+        manual = radar_run(
+            run_id="20260831T090000Z-d1e2f3a4",
+            started_at=datetime(2026, 8, 31, 9, tzinfo=timezone.utc),
+            mode="manual",
+            publish_daily=True,
+        )
+        second_report, second_paths = self._prepare(manual)
+        second = self._publish(
+            manual,
+            second_report,
+            second_paths,
+            now=datetime(2026, 8, 31, 9, 5, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(Path(first.report_json), first_paths[0])
+        self.assertEqual(Path(first.report_markdown), first_paths[1])
+        self.assertEqual(Path(second.report_json), second_paths[0])
+        self.assertEqual(Path(second.report_markdown), second_paths[1])
+        self.assertEqual(Path(first.report_json).read_text("utf-8"), canonical_json(first_report))
+        self.assertEqual(Path(second.report_json).read_text("utf-8"), canonical_json(second_report))
+        self.assertEqual(
+            (self.report_dir / "daily/2026-08-31.json").read_text("utf-8"),
+            canonical_json(second_report),
+        )
 
     def test_manual_requires_explicit_publish_daily_and_uses_configured_timezone_date(self) -> None:
         manual = radar_run(mode="manual")
@@ -584,6 +795,79 @@ class DailyPublicationTests(unittest.TestCase):
         latest = self.report_dir / "daily" / "latest.json"
         self.assertEqual(latest.read_text(encoding="utf-8"), canonical_json(newer_report))
         self.assertTrue((self.report_dir / "daily" / "2026-08-31.json").is_file())
+
+    def test_historical_publication_retry_returns_original_after_latest_advances(self) -> None:
+        older = radar_run(
+            run_id="20260831T080000Z-c1d2e3f4",
+            started_at=datetime(2026, 8, 31, 8, tzinfo=timezone.utc),
+        )
+        older_report, older_paths = self._prepare(older)
+        original = self._publish(
+            older,
+            older_report,
+            older_paths,
+            now=datetime(2026, 8, 31, 8, 5, tzinfo=timezone.utc),
+        )
+
+        newer = radar_run(
+            run_id=SECOND_RUN_ID,
+            started_at=datetime(2026, 9, 1, 8, tzinfo=timezone.utc),
+        )
+        newer_report, newer_paths = self._prepare(newer)
+        self._publish(
+            newer,
+            newer_report,
+            newer_paths,
+            now=datetime(2026, 9, 1, 8, 5, tzinfo=timezone.utc),
+        )
+        latest_before = (self.report_dir / "daily/latest.json").read_text("utf-8")
+
+        retried = self._publish(
+            older,
+            older_report,
+            older_paths,
+            now=datetime(2026, 9, 2, 8, 5, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(retried, original)
+        self.assertEqual(
+            (self.report_dir / "daily/latest.json").read_text("utf-8"),
+            latest_before,
+        )
+
+    def test_daily_publication_refuses_symlinked_daily_parent(self) -> None:
+        run = radar_run(
+            run_id="20260906T080000Z-a1b2c3d6",
+            started_at=datetime(2026, 9, 6, 8, tzinfo=timezone.utc),
+        )
+        report, paths = self._prepare(run)
+        outside = self.report_dir.parent / "outside-daily"
+        outside.mkdir()
+        (self.report_dir / "daily").symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaises(ReportError):
+            self._publish(run, report, paths)
+
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertIsNone(self.store.get_publication(run.run_id, "final"))
+
+    def test_publication_reads_are_confined_when_report_root_is_replaced_by_symlink(
+        self,
+    ) -> None:
+        run = radar_run(
+            run_id="20260907T080000Z-a1b2c3d7",
+            started_at=datetime(2026, 9, 7, 8, tzinfo=timezone.utc),
+        )
+        report, paths = self._prepare(run)
+        moved = self.report_dir.with_name("moved-reports")
+        self.report_dir.rename(moved)
+        self.report_dir.symlink_to(moved, target_is_directory=True)
+
+        with self.assertRaises(ReportError):
+            self._publish(run, report, paths)
+
+        self.assertFalse((moved / "daily").exists())
+        self.assertIsNone(self.store.get_publication(run.run_id, "final"))
 
     def test_retry_repairs_each_partial_daily_stage_without_false_publication(self) -> None:
         for fail_on in (1, 2, 3, 4):

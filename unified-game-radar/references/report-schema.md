@@ -28,6 +28,8 @@ The object has exactly these eight keys:
   health and evidence provenance.
 - `source_health`, `warnings`, and `outstanding_tasks` contain the exact
   version-1 schema records. Source health is ordered itch, Steam, Roblox.
+  Run warnings have no opportunity owner; source warnings have no opportunity
+  owner and may name only their own collector.
 
 ## Candidate object
 
@@ -60,8 +62,10 @@ Every candidate has exactly these fourteen keys:
 `platforms` contains complete `PlatformRecord` objects in itch, Steam, Roblox
 order and then platform-ID order. `evidence_urls` is the matching deduplicated
 platform URL list. `evidence_timestamps` contains exact `collector` and
-`observed_at` pairs from same-run source health for those platforms. Candidate
-warnings are the typed warnings attached to its score.
+`observed_at` pairs from same-run source health for every platform. A platform
+without same-run source health is invalid. Candidate warnings are the typed
+warnings attached to its score and each warning must own that candidate's
+exact `opportunity_id`.
 
 Candidates with scores use the stable unified opportunity sort and consecutive
 one-based ranks. A preliminary report may retain an unscored candidate; its
@@ -75,7 +79,8 @@ one-decimal schema values and the total must equal their sum.
 JSON is UTF-8, finite JSON-native data with sorted object keys, compact
 separators, unescaped Unicode, and one trailing newline. Array order is
 semantic and must not be resorted during rendering. Markdown escapes visible
-text and displays:
+text for Markdown and HTML. Evidence URLs are HTML-escaped code text rather
+than raw Markdown autolinks. Markdown displays:
 
 - run ID, phase, and generated timestamp;
 - every source status, observation timestamp, and source warning;
@@ -85,15 +90,27 @@ text and displays:
 
 ## Files and publication
 
-Run files are immutable:
+Final run files are immutable at fixed paths:
 
 ```text
-{report_dir}/{run_id}.{phase}.json
-{report_dir}/{run_id}.{phase}.md
+{report_dir}/{run_id}.final.json
+{report_dir}/{run_id}.final.md
 ```
 
-An identical retry is a no-op. Reusing a run/phase path with different content
-is a conflict.
+Preliminary collection may evolve several times within one run. Every version
+therefore has a content-addressed immutable snapshot. The lowercase SHA-256 is
+computed from the canonical JSON bytes and is shared by its JSON/Markdown pair:
+
+```text
+{report_dir}/{run_id}.preliminary.{canonical_json_sha256}.json
+{report_dir}/{run_id}.preliminary.{canonical_json_sha256}.md
+{report_dir}/{run_id}.preliminary.latest.json
+{report_dir}/{run_id}.preliminary.latest.md
+```
+
+The two `preliminary.latest` files are a recoverable current view; all hashed
+snapshots remain immutable. Identical retries are no-ops. Reusing a final or
+hashed snapshot path with different content is a conflict.
 
 The scheduled collection at 10:00 in the configured timezone records only the
 run pair. A final scheduled run at the configured daily publish hour (16:00 by
@@ -108,11 +125,19 @@ default), or a manual final run with explicit `publish_daily`, may write:
 
 The daily date comes from the run start in the configured timezone, not retry
 time. A preliminary report never advances daily output. `latest` compares run
-timestamps and never moves to an older run or scheduled date.
+timestamps and never moves to an older run or scheduled date. Every SQLite
+`Publication.report_json` and `report_markdown` points to the run's immutable
+snapshot, never to mutable dated/latest views; later same-date publication
+therefore cannot invalidate an earlier audit record.
 
-Persistence order is run JSON, run Markdown, dated JSON, dated Markdown,
-latest JSON, latest Markdown, then the SQLite `Publication`. Each file uses an
-atomic sibling replacement and exact-content comparison. A retry accepts
-already-correct files and repairs missing or incomplete mutable pairs. The
-database write runs in a transaction only after every required file succeeds;
-therefore a file-stage failure cannot create a false publication row.
+Final persistence order is run JSON, run Markdown, dated JSON, dated Markdown,
+latest JSON, latest Markdown, then the SQLite `Publication`. Preliminary order
+is hashed JSON, hashed Markdown, preliminary-latest JSON, then
+preliminary-latest Markdown. Each file uses an atomic sibling replacement and
+exact-content comparison. Reads, parent creation, and writes remain confined
+to a real configured report directory; the root, `daily`, and controlled child
+parents must not be symlinks. A retry accepts already-correct files and repairs
+missing or incomplete mutable pairs. A retry of an already-recorded historical
+publication returns its original record without rolling back a newer daily
+view. The database write runs in a transaction only after every required file
+succeeds; therefore a file-stage failure cannot create a false publication row.
