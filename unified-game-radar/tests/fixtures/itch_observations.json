@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "run_id": "20260831T020000Z-a1b2c3d4",
+  "collector": "itch",
+  "geo": "US",
+  "locale": "en",
+  "metric_definition_version": 1,
+  "observed_at": "2026-08-31T02:05:00Z",
+  "rows": [
+    {
+      "title": "Signal Garden",
+      "developer": "Tiny Studio",
+      "game_url": "https://tiny-studio.itch.io/signal-garden",
+      "surface": "newest",
+      "surface_scope": "global",
+      "rank": 3,
+      "browser_playable": true,
+      "genre": "Puzzle",
+      "is_jam": false,
+      "author_release_count": 3,
+      "originality": "verified_original",
+      "observed_at": "2026-08-31T02:05:00Z",
+      "evidence_url": "https://itch.io/games/newest"
+    },
+    {
+      "title": "Signal Garden",
+      "developer": "Tiny Studio",
+      "game_url": "https://tiny-studio.itch.io/signal-garden",
+      "surface": "popular",
+      "surface_scope": "global",
+      "rank": 17,
+      "browser_playable": true,
+      "genre": "Puzzle",
+      "is_jam": false,
+      "author_release_count": 3,
+      "originality": "verified_original",
+      "observed_at": "2026-08-31T02:05:00Z",
+      "evidence_url": "https://itch.io/games/top-sellers"
+    },
+    {
+      "title": "Weekend Jam Prototype",
+      "developer": "Jam Maker",
+      "game_url": "https://jam-maker.itch.io/weekend-prototype",
+      "surface": "newest",
+      "surface_scope": "global",
+      "rank": 18,
+      "browser_playable": true,
+      "genre": null,
+      "is_jam": true,
+      "author_release_count": 1,
+      "originality": "unknown",
+      "observed_at": "2026-08-31T02:05:00Z",
+      "evidence_url": "https://itch.io/games/newest"
+    }
+  ]
+}
