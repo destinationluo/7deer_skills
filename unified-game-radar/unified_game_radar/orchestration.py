@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+from pathlib import Path
 import re
 from uuid import UUID
 
@@ -37,15 +38,26 @@ from .normalize import (
     select_record_heat,
 )
 from .platform_keys import canonical_platform_key, validate_platform
+from .report import (
+    AtomicWriter,
+    FileAtomicWriter,
+    build_report,
+    persist_run_artifacts,
+    publish_daily_if_allowed,
+)
+from .score import opportunity_sort_key, score_opportunity
 from .schemas import (
+    CommandManifest,
     GameIdentity,
     NormalizedHeat,
+    OpportunityEvidence,
     OutstandingTask,
     PlatformHeat,
     PlatformObservation,
     PlatformRecord,
     PreliminaryResult,
     RadarRun,
+    ScoredOpportunity,
     SourceHealth,
     WarningRecord,
 )
@@ -89,6 +101,22 @@ def _run_suffix(value: object) -> str:
                 "the first id_factory value must be a UUID or lowercase hex suffix"
             )
         return value
+
+
+def new_run_id(
+    clock: Callable[[], datetime],
+    id_factory: Callable[[], str],
+) -> tuple[datetime, str]:
+    """Return the one UTC instant and run ID shared by locking and scan."""
+
+    if not callable(clock) or not callable(id_factory):
+        raise TypeError("clock and id_factory must be callable")
+    started_at = _utc_seconds(clock(), "clock")
+    suffix = _run_suffix(id_factory())
+    return (
+        started_at,
+        f"{started_at.strftime('%Y%m%dT%H%M%SZ')}-{suffix}",
+    )
 
 
 def _selected_platforms(
@@ -841,22 +869,62 @@ def _select_candidates(
     return tuple(item[2] for item in ordered[:limit])
 
 
+def _candidate_platform_scores(
+    identities: Sequence[GameIdentity],
+    normalized: Sequence[NormalizedHeat],
+) -> dict[str, float]:
+    identity_by_key = {
+        platform_key(record): identity
+        for identity in identities
+        for record in identity.platform_records
+    }
+    best: dict[str, tuple[float, float]] = {}
+    for heat in normalized:
+        identity = identity_by_key.get(heat.platform_key)
+        if identity is None:
+            continue
+        ranking = (heat.platform_score, heat.heat)
+        prior = best.get(identity.opportunity_id)
+        if prior is None or ranking > prior:
+            best[identity.opportunity_id] = ranking
+    return {
+        opportunity_id: ranking[0]
+        for opportunity_id, ranking in best.items()
+    }
+
+
+def _rebuild_scoring_context(
+    config: RadarConfig,
+    store: RadarStore,
+    run: RadarRun,
+    id_factory: Callable[[], str],
+) -> tuple[tuple[GameIdentity, ...], dict[str, float]]:
+    observations = _verified_run_observations(store, run)
+    records = _platform_records(observations)
+    identities = _link_identities(config, store, records, id_factory)
+    heats = _platform_heats(run, store, observations)
+    normalized = _normalized_heats(heats, config.heat_floor)
+    candidates = _select_candidates(
+        identities,
+        normalized,
+        config.preliminary_top_n,
+    )
+    return candidates, _candidate_platform_scores(identities, normalized)
+
+
 def _rebuild_candidates(
     config: RadarConfig,
     store: RadarStore,
     run: RadarRun,
     id_factory: Callable[[], str],
 ) -> tuple[GameIdentity, ...]:
-    observations = _verified_run_observations(store, run)
-    records = _platform_records(observations)
-    identities = _link_identities(config, store, records, id_factory)
-    heats = _platform_heats(run, store, observations)
-    normalized = _normalized_heats(heats, config.heat_floor)
-    return _select_candidates(
-        identities,
-        normalized,
-        config.preliminary_top_n,
+    candidates, _ = _rebuild_scoring_context(
+        config,
+        store,
+        run,
+        id_factory,
     )
+    return candidates
 
 
 def _run_is_finalized(store: RadarStore, run_id: str) -> bool:
@@ -1078,6 +1146,151 @@ def _result_context(
     return health_rows, warnings, outstanding
 
 
+def _existing_identity_only() -> str:
+    raise InputValidationError(
+        "persisted observations must already be linked to an identity"
+    )
+
+
+def _persisted_preliminary_result(
+    config: RadarConfig,
+    store: RadarStore,
+    run: RadarRun,
+) -> tuple[PreliminaryResult, dict[str, float]]:
+    candidates, platform_scores = _rebuild_scoring_context(
+        config,
+        store,
+        run,
+        _existing_identity_only,
+    )
+    health, warnings, outstanding = _result_context(store, run)
+    return (
+        PreliminaryResult(
+            schema_version=1,
+            run_id=run.run_id,
+            candidates=candidates,
+            source_health=health,
+            warnings=warnings,
+            outstanding_tasks=outstanding,
+        ),
+        platform_scores,
+    )
+
+
+def _load_run_evidence(
+    store: RadarStore,
+    run_id: str,
+) -> dict[str, OpportunityEvidence]:
+    rows = store._fetchall(  # type: ignore[attr-defined]
+        """
+        SELECT canonical_json FROM evidence
+        WHERE run_id = ?
+        ORDER BY opportunity_id
+        """,
+        (run_id,),
+    )
+    evidence: dict[str, OpportunityEvidence] = {}
+    for row in rows:
+        if len(row) != 1 or not isinstance(row[0], str):
+            raise InputValidationError("stored evidence row is invalid")
+        item = OpportunityEvidence.from_dict(json.loads(row[0]))
+        if item.run_id != run_id or item.opportunity_id in evidence:
+            raise InputValidationError("stored evidence provenance is invalid")
+        evidence[item.opportunity_id] = item
+    return evidence
+
+
+def _load_run_scores(
+    store: RadarStore,
+    run_id: str,
+) -> dict[str, ScoredOpportunity]:
+    rows = store._fetchall(  # type: ignore[attr-defined]
+        """
+        SELECT canonical_json FROM scores
+        WHERE run_id = ?
+        ORDER BY opportunity_id
+        """,
+        (run_id,),
+    )
+    scores: dict[str, ScoredOpportunity] = {}
+    for row in rows:
+        if len(row) != 1 or not isinstance(row[0], str):
+            raise InputValidationError("stored score row is invalid")
+        item = ScoredOpportunity.from_dict(json.loads(row[0]))
+        if item.run_id != run_id or item.opportunity_id in scores:
+            raise InputValidationError("stored score provenance is invalid")
+        scores[item.opportunity_id] = item
+    return scores
+
+
+def _required_run(store: RadarStore, run_id: object) -> RadarRun:
+    if not isinstance(run_id, str):
+        raise InputValidationError("run_id must be text")
+    run = store.get_run(run_id)
+    if run is None:
+        raise InputValidationError("radar run was not found")
+    return run
+
+
+def _validate_evidence_batch(
+    run: RadarRun,
+    candidates: Sequence[GameIdentity],
+    evidence_batch: Sequence[OpportunityEvidence],
+) -> tuple[OpportunityEvidence, ...]:
+    if isinstance(evidence_batch, (str, bytes)) or not isinstance(
+        evidence_batch,
+        Sequence,
+    ):
+        raise InputValidationError(
+            "evidence_batch must be a sequence of OpportunityEvidence"
+        )
+    evidence_by_id: dict[str, OpportunityEvidence] = {}
+    for index, evidence in enumerate(evidence_batch):
+        if not isinstance(evidence, OpportunityEvidence):
+            raise InputValidationError(
+                f"evidence_batch[{index}] must be OpportunityEvidence"
+            )
+        if evidence.run_id != run.run_id:
+            raise InputValidationError("evidence run_id must match run_id")
+        if evidence.opportunity_id in evidence_by_id:
+            raise InputValidationError(
+                "evidence batch must not contain duplicate opportunity IDs"
+            )
+        evidence_by_id[evidence.opportunity_id] = evidence
+    expected_ids = tuple(candidate.opportunity_id for candidate in candidates)
+    if set(evidence_by_id) != set(expected_ids):
+        raise InputValidationError(
+            "evidence batch must exactly cover the enrichment candidates"
+        )
+    return tuple(evidence_by_id[opportunity_id] for opportunity_id in expected_ids)
+
+
+def _final_result(
+    result: PreliminaryResult,
+    scores: Mapping[str, ScoredOpportunity],
+    limit: int,
+) -> tuple[PreliminaryResult, tuple[ScoredOpportunity, ...]]:
+    ordered = sorted(
+        result.candidates,
+        key=lambda candidate: opportunity_sort_key(
+            scores[candidate.opportunity_id],
+            candidate.normalized_name,
+        ),
+    )[:limit]
+    final_scores = tuple(scores[candidate.opportunity_id] for candidate in ordered)
+    return (
+        PreliminaryResult(
+            schema_version=1,
+            run_id=result.run_id,
+            candidates=tuple(ordered),
+            source_health=result.source_health,
+            warnings=result.warnings,
+            outstanding_tasks=result.outstanding_tasks,
+        ),
+        final_scores,
+    )
+
+
 def scan_run(
     config: RadarConfig,
     store: RadarStore,
@@ -1085,6 +1298,11 @@ def scan_run(
     clock: Callable[[], datetime],
     id_factory: Callable[[], str],
     platforms: Sequence[str],
+    *,
+    started_at: datetime | None = None,
+    run_id: str | None = None,
+    mode: str = "manual",
+    publish_daily: bool = False,
 ) -> PreliminaryResult:
     """Run selected collectors and return one cross-platform candidate list."""
 
@@ -1098,15 +1316,26 @@ def scan_run(
         raise TypeError("clock and id_factory must be callable")
 
     selected = _selected_platforms(config, platforms)
-    started_at = _utc_seconds(clock(), "clock")
-    suffix = _run_suffix(id_factory())
+    if (started_at is None) != (run_id is None):
+        raise ValueError("started_at and run_id must be provided together")
+    if started_at is None:
+        scan_started_at, scan_run_id = new_run_id(clock, id_factory)
+    else:
+        scan_started_at = _utc_seconds(started_at, "started_at")
+        if not isinstance(run_id, str):
+            raise ValueError("run_id must be text")
+        scan_run_id = run_id
+        if not scan_run_id.startswith(
+            f"{scan_started_at.strftime('%Y%m%dT%H%M%SZ')}-"
+        ):
+            raise ValueError("run_id timestamp must match started_at")
     run = RadarRun(
         schema_version=1,
-        run_id=f"{started_at.strftime('%Y%m%dT%H%M%SZ')}-{suffix}",
-        started_at=started_at,
-        mode="manual",
+        run_id=scan_run_id,
+        started_at=scan_started_at,
+        mode=mode,
         platforms=selected,
-        publish_daily=False,
+        publish_daily=publish_daily,
     )
     store.create_run(run)
     results, health, warnings, outstanding = _collect_selected(
@@ -1201,4 +1430,161 @@ def ingest_run(
     )
 
 
-__all__ = ["ingest_run", "scan_run"]
+def report_run(
+    config: RadarConfig,
+    store: RadarStore,
+    run_id: str,
+    clock: Callable[[], datetime],
+    *,
+    writer: AtomicWriter | None = None,
+) -> CommandManifest:
+    """Rebuild one run from SQLite and persist its canonical report."""
+
+    if not isinstance(config, RadarConfig):
+        raise TypeError("config must be RadarConfig")
+    if not isinstance(store, RadarStore):
+        raise TypeError("store must be RadarStore")
+    if not callable(clock):
+        raise TypeError("clock must be callable")
+    run = _required_run(store, run_id)
+    now = _utc_seconds(clock(), "clock")
+    if now < run.started_at:
+        raise InputValidationError("report clock must not precede run started_at")
+    result, _ = _persisted_preliminary_result(config, store, run)
+    enrichment_candidates = result.candidates[: config.enrichment_top_n]
+    expected_ids = {
+        candidate.opportunity_id for candidate in enrichment_candidates
+    }
+    evidence = _load_run_evidence(store, run.run_id)
+    scores = _load_run_scores(store, run.run_id)
+    if not evidence and not scores:
+        report_result = result
+        report_scores: tuple[ScoredOpportunity, ...] = ()
+        phase = "preliminary"
+    else:
+        if set(evidence) != expected_ids or set(scores) != expected_ids:
+            raise InputValidationError(
+                "final run evidence and scores must exactly cover enrichment candidates"
+            )
+        enrichment_result = PreliminaryResult(
+            schema_version=1,
+            run_id=result.run_id,
+            candidates=enrichment_candidates,
+            source_health=result.source_health,
+            warnings=result.warnings,
+            outstanding_tasks=result.outstanding_tasks,
+        )
+        report_result, report_scores = _final_result(
+            enrichment_result,
+            scores,
+            config.final_top_n,
+        )
+        phase = "final"
+    report = build_report(report_result, report_scores, phase)
+    active_writer = FileAtomicWriter() if writer is None else writer
+    paths = persist_run_artifacts(
+        report,
+        Path(config.report_dir),
+        active_writer,
+    )
+    if phase == "final":
+        publish_daily_if_allowed(
+            config,
+            store,
+            run,
+            report,
+            paths,
+            now,
+            active_writer,
+        )
+    return CommandManifest(
+        schema_version=1,
+        run_id=run.run_id,
+        phase=phase,
+        report_json=str(paths[0]),
+        report_markdown=str(paths[1]),
+        source_health=report_result.source_health,
+        warnings=report_result.warnings,
+        outstanding_tasks=report_result.outstanding_tasks,
+    )
+
+
+def enrich_run(
+    config: RadarConfig,
+    store: RadarStore,
+    run_id: str,
+    evidence_batch: Sequence[OpportunityEvidence],
+    clock: Callable[[], datetime],
+    *,
+    writer: AtomicWriter | None = None,
+) -> CommandManifest:
+    """Atomically persist one complete enrichment batch and final scores."""
+
+    if not isinstance(config, RadarConfig):
+        raise TypeError("config must be RadarConfig")
+    if not isinstance(store, RadarStore):
+        raise TypeError("store must be RadarStore")
+    if not callable(clock):
+        raise TypeError("clock must be callable")
+    run = _required_run(store, run_id)
+    now = _utc_seconds(clock(), "clock")
+    if now < run.started_at:
+        raise InputValidationError("enrichment clock must not precede run started_at")
+    result, platform_scores = _persisted_preliminary_result(config, store, run)
+    candidates = result.candidates[: config.enrichment_top_n]
+    evidence = _validate_evidence_batch(run, candidates, evidence_batch)
+    expected_ids = {candidate.opportunity_id for candidate in candidates}
+    existing_evidence = _load_run_evidence(store, run.run_id)
+    existing_scores = _load_run_scores(store, run.run_id)
+    if existing_evidence or existing_scores:
+        if (
+            set(existing_evidence) != expected_ids
+            or set(existing_scores) != expected_ids
+        ):
+            raise InputValidationError(
+                "existing final enrichment batch is incomplete"
+            )
+        with store.transaction():
+            for item in evidence:
+                store.insert_evidence(item)
+        return report_run(
+            config,
+            store,
+            run.run_id,
+            lambda: now,
+            writer=writer,
+        )
+
+    evidence_by_id = {item.opportunity_id: item for item in evidence}
+    scores = tuple(
+        score_opportunity(
+            run_id=run.run_id,
+            opportunity_id=candidate.opportunity_id,
+            game_name=candidate.name,
+            platform_score=platform_scores[candidate.opportunity_id],
+            evidence=evidence_by_id[candidate.opportunity_id],
+            publication_time=now,
+        )
+        for candidate in candidates
+    )
+    with store.transaction():
+        for item in evidence:
+            store.insert_evidence(item)
+        for score in scores:
+            store.save_score(score)
+    return report_run(
+        config,
+        store,
+        run.run_id,
+        lambda: now,
+        writer=writer,
+    )
+
+
+__all__ = [
+    "enrich_run",
+    "ingest_run",
+    "new_run_id",
+    "report_run",
+    "scan_run",
+]
