@@ -603,6 +603,52 @@ class IngestRunTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(observation_ids(self.store.path, RUN_ID), ())
 
+    def test_rejects_future_browser_observations_before_any_persistence(self) -> None:
+        self.create_run()
+        future = NOW + timedelta(minutes=1)
+
+        with self.assertRaisesRegex(InputValidationError, "future"):
+            self.ingest(
+                itch_envelope(
+                    [itch_row(observed_at=future)],
+                    observed_at=future,
+                )
+            )
+
+        health = self.store.get_source_health(RUN_ID, "itch")
+        assert health is not None
+        self.assertEqual(health.status, "not_run")
+        self.assertEqual(observation_ids(self.store.path, RUN_ID), ())
+
+    def test_rejects_future_browser_envelope_even_when_rows_are_empty(self) -> None:
+        self.create_run()
+        future = NOW + timedelta(minutes=1)
+
+        with self.assertRaisesRegex(InputValidationError, "future"):
+            self.ingest(itch_envelope([], observed_at=future))
+
+        health = self.store.get_source_health(RUN_ID, "itch")
+        assert health is not None
+        self.assertEqual(health.status, "not_run")
+        self.assertEqual(observation_ids(self.store.path, RUN_ID), ())
+
+    def test_rejects_clock_before_run_start_even_for_empty_envelope(self) -> None:
+        self.create_run()
+        calls: list[str] = []
+
+        with self.assertRaisesRegex(InputValidationError, "run started_at"):
+            self.ingest(
+                itch_envelope([]),
+                clock=lambda: STARTED_AT - timedelta(seconds=1),
+                registry=parser_registry(calls),
+            )
+
+        self.assertEqual(calls, [])
+        health = self.store.get_source_health(RUN_ID, "itch")
+        assert health is not None
+        self.assertEqual(health.status, "not_run")
+        self.assertEqual(observation_ids(self.store.path, RUN_ID), ())
+
     def test_preserves_strict_row_and_envelope_timestamp_validation(self) -> None:
         self.create_run()
         mismatched = itch_envelope(

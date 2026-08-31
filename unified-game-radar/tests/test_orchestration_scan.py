@@ -169,11 +169,13 @@ class FixtureCollector:
         *,
         pending: bool = False,
         failure: Exception | None = None,
+        health_status: str = "fresh",
     ) -> None:
         self.platform = platform
         self.build_rows = build_rows
         self.pending = pending
         self.failure = failure
+        self.health_status = health_status
         self.calls: list[RadarRun] = []
 
     def collect(self, run: RadarRun) -> CollectorResult:
@@ -185,9 +187,9 @@ class FixtureCollector:
             schema_version=1,
             run_id=run.run_id,
             collector=self.platform,
-            status="fresh",
+            status=self.health_status,
             observed_at=run.started_at,
-            capabilities={"listing": True},
+            capabilities={"listing": self.health_status == "fresh"},
             warnings=(),
         )
         pending = (
@@ -340,6 +342,89 @@ class ScanRunTests(unittest.TestCase):
         self.assertTrue(all("secret" not in warning.message for warning in result.warnings))
         self.assertIsNotNone(self.store.get_source_health(result.run_id, "steam"))
         self.assertIsNotNone(self.store.get_source_health(result.run_id, "roblox"))
+
+    def test_stale_and_unavailable_current_rows_do_not_enter_candidates(self) -> None:
+        itch = FixtureCollector(
+            "itch",
+            lambda run: (
+                observation(
+                    run,
+                    platform="itch",
+                    platform_id="stale",
+                    name="Stale Itch",
+                    developer="Studio I",
+                    surface="popular",
+                    rank=1,
+                ),
+            ),
+            health_status="stale",
+        )
+        roblox = FixtureCollector(
+            "roblox",
+            lambda run: (
+                observation(
+                    run,
+                    platform="roblox",
+                    platform_id="90",
+                    name="Unavailable Roblox",
+                    developer="Studio R",
+                    surface="rising",
+                    rank=1,
+                ),
+            ),
+            health_status="unavailable",
+        )
+
+        result = scan_run(
+            config(self.root),
+            self.store,
+            {"itch": itch, "roblox": roblox},
+            lambda: NOW,
+            SequenceIdFactory(),
+            ("itch", "roblox"),
+        )
+
+        self.assertEqual(result.candidates, ())
+        self.assertEqual(stored_identities(self.store.path), ())
+        self.assertEqual(
+            tuple(item.collector for item in result.outstanding_tasks),
+            ("itch", "roblox"),
+        )
+
+    def test_partial_platform_keeps_successful_surface_candidate(self) -> None:
+        itch = FixtureCollector(
+            "itch",
+            lambda run: (
+                observation(
+                    run,
+                    platform="itch",
+                    platform_id="partial",
+                    name="Partial Itch",
+                    developer="Studio I",
+                    surface="popular",
+                    rank=1,
+                ),
+            ),
+            health_status="partial",
+        )
+
+        result = scan_run(
+            config(self.root),
+            self.store,
+            {"itch": itch},
+            lambda: NOW,
+            SequenceIdFactory(),
+            ("itch",),
+        )
+
+        self.assertEqual(
+            tuple(item.name for item in result.candidates),
+            ("Partial Itch",),
+        )
+        self.assertEqual(
+            tuple(item.collector for item in result.outstanding_tasks),
+            ("itch",),
+        )
 
     def test_links_identities_before_one_global_top_n_and_applies_heat_floor(self) -> None:
         itch = FixtureCollector(

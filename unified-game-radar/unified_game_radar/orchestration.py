@@ -13,8 +13,8 @@ from .collectors.base import (
     CollectorResult,
     classify_source_health,
 )
-from .collectors.itch import build_itch_observations
-from .collectors.roblox import build_roblox_observations
+from .collectors.itch import ItchBrowserEnvelope, build_itch_observations
+from .collectors.roblox import RobloxBrowserEnvelope, build_roblox_observations
 from .config import RadarConfig
 from .errors import InputValidationError
 from .identity import match_identity, normalize_name, platform_key
@@ -369,6 +369,27 @@ def _run_observations(
             raise ValueError("stored observation run_id is invalid")
         observations.append(observation)
     return tuple(observations)
+
+
+def _verified_run_observations(
+    store: RadarStore,
+    run: RadarRun,
+) -> tuple[PlatformObservation, ...]:
+    eligible_platforms: set[str] = set()
+    for platform in run.platforms:
+        health = store.get_source_health(run.run_id, platform)
+        if (
+            health is not None
+            and health.run_id == run.run_id
+            and health.collector == platform
+            and health.status in {"fresh", "partial"}
+        ):
+            eligible_platforms.add(platform)
+    return tuple(
+        observation
+        for observation in _run_observations(store, run.run_id)
+        if observation.platform in eligible_platforms
+    )
 
 
 def _merge_record(identity: GameIdentity, record: PlatformRecord) -> GameIdentity:
@@ -807,7 +828,7 @@ def _rebuild_candidates(
     run: RadarRun,
     id_factory: Callable[[], str],
 ) -> tuple[GameIdentity, ...]:
-    observations = _run_observations(store, run.run_id)
+    observations = _verified_run_observations(store, run)
     records = _platform_records(observations)
     identities = _link_identities(config, store, records, id_factory)
     heats = _platform_heats(run, store, observations)
@@ -864,6 +885,7 @@ def _parse_browser_observations(
         str,
         Callable[[object, RadarRun], object],
     ],
+    now: datetime,
 ) -> tuple[PlatformObservation, ...]:
     parser = parser_registry.get(collector)
     if not callable(parser):
@@ -872,9 +894,21 @@ def _parse_browser_observations(
         )
     parsed = parser(envelope, run)
     if collector == "itch":
-        observations = build_itch_observations(run, parsed)  # type: ignore[arg-type]
+        if not isinstance(parsed, ItchBrowserEnvelope):
+            raise InputValidationError(
+                "itch parser must return an ItchBrowserEnvelope"
+            )
+        envelope_observed_at = parsed.observed_at
+        observations = build_itch_observations(run, parsed)
     else:
-        observations = build_roblox_observations(run, parsed)  # type: ignore[arg-type]
+        if not isinstance(parsed, RobloxBrowserEnvelope):
+            raise InputValidationError(
+                "roblox parser must return a RobloxBrowserEnvelope"
+            )
+        envelope_observed_at = parsed.observed_at
+        observations = build_roblox_observations(run, parsed)
+    if envelope_observed_at > now:
+        raise InputValidationError("browser envelope must not be in the future")
     if any(
         observation.run_id != run.run_id
         or observation.platform != collector
@@ -884,6 +918,21 @@ def _parse_browser_observations(
             "parsed browser observations do not match the ingest target"
         )
     return observations
+
+
+def _validate_ingest_now(run: RadarRun, now: datetime) -> None:
+    if now < run.started_at:
+        raise InputValidationError("ingest clock must not precede run started_at")
+
+
+def _validate_ingest_observation_times(
+    observations: Sequence[PlatformObservation],
+    now: datetime,
+) -> None:
+    if any(observation.observed_at > now for observation in observations):
+        raise InputValidationError(
+            "browser observations must not be in the future"
+        )
 
 
 def _browser_capabilities(
@@ -1065,12 +1114,15 @@ def ingest_run(
 
     run, collector = _ingest_target(store, run_id, envelope)
     now = _utc_seconds(clock(), "clock")
+    _validate_ingest_now(run, now)
     observations = _parse_browser_observations(
         run,
         collector,
         envelope,
         parser_registry,
+        now,
     )
+    _validate_ingest_observation_times(observations, now)
     active_observations = _active_ingest_observations(
         store,
         run,
