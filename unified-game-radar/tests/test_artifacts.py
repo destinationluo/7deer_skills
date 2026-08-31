@@ -197,7 +197,9 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(destination, "steam_store.json")
         self.assertEqual(source_parent, destination_parent)
         artifact_path = Path(artifact.path)
-        self.assertEqual(list(artifact_path.parent.glob(".*.tmp")), [])
+        retained = list(artifact_path.parent.glob(".*.cleanup.tmp"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].stat().st_ino, artifact_path.stat().st_ino)
         self.assertEqual(json.loads(artifact_path.read_text("utf-8")), {"safe": True})
 
     @unittest.skipUnless(os.name == "posix", "secure descriptor assertions need POSIX")
@@ -467,6 +469,123 @@ class ArtifactTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(os.name == "posix", "secure descriptor assertions need POSIX")
+    def test_cleanup_never_unlinks_a_replacement_swapped_after_identity_check(
+        self,
+    ) -> None:
+        provider_dir = self.root / "provider"
+        provider_dir.mkdir()
+        name = ".owned.tmp"
+        (provider_dir / name).write_bytes(b"owned")
+        descriptor = os.open(provider_dir, artifacts_module._directory_open_flags())
+        expected = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        real_unlink = os.unlink
+        unlink_calls = 0
+
+        def replace_immediately_before_unlink(
+            path: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal unlink_calls
+            unlink_calls += 1
+            if str(path).endswith(".cleanup.tmp"):
+                directory_descriptor = kwargs["dir_fd"]
+                moved_name = f"{path}.owned"
+                os.rename(
+                    path,
+                    moved_name,
+                    src_dir_fd=directory_descriptor,
+                    dst_dir_fd=directory_descriptor,
+                )
+                replacement_descriptor = os.open(
+                    path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                try:
+                    os.write(replacement_descriptor, b"concurrent")
+                finally:
+                    os.close(replacement_descriptor)
+            real_unlink(path, **kwargs)  # type: ignore[arg-type]
+
+        errors: list[BaseException] = []
+        try:
+            with mock.patch(
+                "unified_game_radar.artifacts.os.unlink",
+                side_effect=replace_immediately_before_unlink,
+            ):
+                artifacts_module._cleanup_temporary_file(
+                    descriptor,
+                    name,
+                    expected,
+                    "cleanup",
+                    errors,
+                )
+        finally:
+            os.close(descriptor)
+
+        self.assertEqual(unlink_calls, 0)
+
+    @unittest.skipUnless(os.name == "posix", "secure descriptor assertions need POSIX")
+    def test_cleanup_never_moves_a_replacement_swapped_after_identity_check(
+        self,
+    ) -> None:
+        provider_dir = self.root / "provider"
+        provider_dir.mkdir()
+        name = ".owned.tmp"
+        (provider_dir / name).write_bytes(b"owned")
+        descriptor = os.open(provider_dir, artifacts_module._directory_open_flags())
+        expected = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        real_rename = os.rename
+        swapped = False
+
+        def replace_immediately_before_retire(
+            source: object,
+            target: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal swapped
+            if str(source) == name and not swapped:
+                directory_descriptor = kwargs["src_dir_fd"]
+                real_rename(
+                    source,
+                    f"{source}.owned",
+                    src_dir_fd=directory_descriptor,
+                    dst_dir_fd=directory_descriptor,
+                )
+                replacement_descriptor = os.open(
+                    source,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                try:
+                    os.write(replacement_descriptor, b"concurrent")
+                finally:
+                    os.close(replacement_descriptor)
+                swapped = True
+            real_rename(source, target, **kwargs)  # type: ignore[arg-type]
+
+        errors: list[BaseException] = []
+        try:
+            with mock.patch(
+                "unified_game_radar.artifacts.os.rename",
+                side_effect=replace_immediately_before_retire,
+            ):
+                artifacts_module._cleanup_temporary_file(
+                    descriptor,
+                    name,
+                    expected,
+                    "cleanup",
+                    errors,
+                )
+        finally:
+            os.close(descriptor)
+
+        self.assertTrue(swapped)
+        self.assertEqual((provider_dir / name).read_bytes(), b"concurrent")
+
+    @unittest.skipUnless(os.name == "posix", "secure descriptor assertions need POSIX")
     def test_poisoned_link_is_removed_from_the_official_name_when_unlink_fails(
         self,
     ) -> None:
@@ -553,6 +672,53 @@ class ArtifactTests(unittest.TestCase):
         self.assertTrue((provider_root / "steam_official/first.json").is_file())
         self.assertFalse((provider_root / "steam_official/second.json").exists())
         self.assertTrue((provider_root / "itch_browser/second.json").is_file())
+
+    def test_provider_budget_counts_each_cleanup_hardlink_once(self) -> None:
+        payload = {"payload": "a" * 18}
+        config = self.config(
+            raw_max_bytes_per_provider=len(canonical_bytes(payload)),
+        )
+
+        artifact = self.persist(payload, config=config)
+
+        provider_dir = Path(artifact.path).parent
+        cleanup = list(provider_dir.glob(".*.cleanup.tmp"))
+        self.assertEqual(len(cleanup), 1)
+        self.assertEqual(cleanup[0].stat().st_ino, Path(artifact.path).stat().st_ino)
+
+    def test_provider_budget_rejects_unattached_cleanup_content(self) -> None:
+        artifact = self.persist({"safe": True})
+        provider_dir = Path(artifact.path).parent
+        (provider_dir / ".unattached.cleanup.tmp").write_bytes(b"unbudgeted")
+
+        with self.assertRaises(PersistenceError):
+            self.persist({"safe": False}, artifact_name="second.json")
+
+    def test_prune_removes_expired_artifact_and_its_cleanup_hardlink(self) -> None:
+        artifact = self.persist({"safe": True})
+        artifact_path = Path(artifact.path)
+        cleanup = list(artifact_path.parent.glob(".*.cleanup.tmp"))
+        self.assertEqual(len(cleanup), 1)
+        old = (NOW - timedelta(days=15)).timestamp()
+        os.utime(artifact_path, (old, old))
+
+        removed = prune_raw_artifacts(self.config(raw_retention_days=14), NOW)
+
+        self.assertEqual(removed, (artifact_path,))
+        self.assertFalse(artifact_path.exists())
+        self.assertFalse(cleanup[0].exists())
+
+    def test_prune_keeps_fresh_artifact_and_its_cleanup_hardlink(self) -> None:
+        artifact = self.persist({"safe": True})
+        artifact_path = Path(artifact.path)
+        cleanup = list(artifact_path.parent.glob(".*.cleanup.tmp"))
+        self.assertEqual(len(cleanup), 1)
+
+        removed = prune_raw_artifacts(self.config(raw_retention_days=14), NOW)
+
+        self.assertEqual(removed, ())
+        self.assertTrue(artifact_path.exists())
+        self.assertTrue(cleanup[0].exists())
 
     @unittest.skipUnless(os.name == "posix", "provider locking requires POSIX")
     def test_concurrent_provider_writes_cannot_oversubscribe_budget(self) -> None:
@@ -714,16 +880,20 @@ class ArtifactTests(unittest.TestCase):
         self.assertNotIn("private close detail", str(captured.exception))
 
     def test_temporary_cleanup_failure_is_reported(self) -> None:
-        real_unlink = os.unlink
+        real_rename = os.rename
 
-        def fail_temporary_cleanup(path: object, **kwargs: object) -> None:
-            if str(path).endswith(".tmp"):
+        def fail_temporary_retirement(
+            source: object,
+            target: object,
+            **kwargs: object,
+        ) -> None:
+            if str(target).endswith(".cleanup.tmp"):
                 raise OSError("private cleanup detail")
-            real_unlink(path, **kwargs)  # type: ignore[arg-type]
+            real_rename(source, target, **kwargs)  # type: ignore[arg-type]
 
         with mock.patch(
-            "unified_game_radar.artifacts.os.unlink",
-            side_effect=fail_temporary_cleanup,
+            "unified_game_radar.artifacts.os.rename",
+            side_effect=fail_temporary_retirement,
         ), self.assertRaises(PersistenceError) as captured:
             self.persist({"safe": True})
 
@@ -738,7 +908,7 @@ class ArtifactTests(unittest.TestCase):
 
         self.assertNotIn("private disk detail", str(captured.exception))
         run_dir = self.root / "data/raw" / RUN_ID / "steam_official"
-        self.assertEqual(list(run_dir.glob(".*.tmp")), [])
+        self.assertEqual(len(list(run_dir.glob(".*.failed.tmp"))), 1)
 
         expired = run_dir / "expired.json"
         expired.write_text("{}", encoding="utf-8")
@@ -763,7 +933,7 @@ class ArtifactTests(unittest.TestCase):
 
         self.assertNotIn("destination raced", str(captured.exception))
         run_dir = self.root / "data/raw" / RUN_ID / "steam_official"
-        self.assertEqual(list(run_dir.glob(".*.tmp")), [])
+        self.assertEqual(len(list(run_dir.glob(".*.failed.tmp"))), 1)
 
     @unittest.skipUnless(os.name == "posix", "secure descriptor assertions need POSIX")
     def test_persist_fsyncs_file_and_parent_directory(self) -> None:

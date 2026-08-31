@@ -529,6 +529,7 @@ def _atomic_install(
                 parent_descriptor,
                 destination.name,
                 installed_status,
+                "failed",
                 cleanup_errors,
             )
         if (
@@ -540,6 +541,11 @@ def _atomic_install(
                 parent_descriptor,
                 temporary_name,
                 temporary_status,
+                (
+                    "cleanup"
+                    if committed and installed_status is not None
+                    else "failed"
+                ),
                 cleanup_errors,
             )
         if (
@@ -681,31 +687,56 @@ def _lock_provider_budget(parent_descriptor: int) -> int:
 
 
 def _provider_usage(parent_descriptor: int) -> int:
-    total = 0
     with os.scandir(parent_descriptor) as entries:
         names = sorted(entry.name for entry in entries)
-    for name in names:
-        status = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-        if name.endswith(".tmp"):
-            if not (
-                stat.S_ISREG(status.st_mode)
-                or stat.S_ISLNK(status.st_mode)
-            ):
-                raise PersistenceError("unsafe raw provider temporary entry")
-            continue
-        if stat.S_ISLNK(status.st_mode):
-            raise PersistenceError("unsafe symlink found in raw provider directory")
+    entries = [
+        (
+            name,
+            os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False),
+        )
+        for name in names
+    ]
+    artifact_identities: set[tuple[int, int]] = set()
+    total = 0
+    for name, status in entries:
         if name == _BUDGET_LOCK_NAME:
             if not stat.S_ISREG(status.st_mode):
                 raise PersistenceError("unsafe raw provider control file")
             continue
         if not name.endswith(".json"):
-            if not stat.S_ISREG(status.st_mode):
-                raise PersistenceError("unsafe entry found in raw provider directory")
             continue
         if _ARTIFACT_NAME.fullmatch(name) is None or not stat.S_ISREG(status.st_mode):
             raise PersistenceError("unsafe raw provider artifact found")
-        total += status.st_size
+        identity = (status.st_dev, status.st_ino)
+        if identity not in artifact_identities:
+            artifact_identities.add(identity)
+            total += status.st_size
+
+    counted_identities = set(artifact_identities)
+    for name, status in entries:
+        if name == _BUDGET_LOCK_NAME or name.endswith(".json"):
+            continue
+        if name.endswith(".cleanup.tmp"):
+            if (
+                not stat.S_ISREG(status.st_mode)
+                or (status.st_dev, status.st_ino) not in artifact_identities
+            ):
+                raise PersistenceError("unsafe raw provider cleanup entry")
+            continue
+        if name.endswith(".tmp"):
+            if stat.S_ISLNK(status.st_mode):
+                # A failed write can leave an untrusted link behind.  It has
+                # no provider-owned bytes and must never be followed.
+                continue
+            if not stat.S_ISREG(status.st_mode):
+                raise PersistenceError("unsafe raw provider temporary entry")
+            identity = (status.st_dev, status.st_ino)
+            if identity not in counted_identities:
+                counted_identities.add(identity)
+                total += status.st_size
+            continue
+        if not stat.S_ISREG(status.st_mode):
+            raise PersistenceError("unsafe entry found in raw provider directory")
     return total
 
 
@@ -916,12 +947,14 @@ def _cleanup_installed_artifact(
     parent_descriptor: int,
     name: str,
     expected_status: os.stat_result,
+    retained_kind: str,
     errors: list[BaseException],
 ) -> None:
     _retire_owned_entry(
         parent_descriptor,
         name,
         expected_status,
+        retained_kind,
         errors,
     )
 
@@ -930,12 +963,14 @@ def _cleanup_temporary_file(
     parent_descriptor: int,
     name: str,
     expected_status: os.stat_result,
+    retained_kind: str,
     errors: list[BaseException],
 ) -> None:
     _retire_owned_entry(
         parent_descriptor,
         name,
         expected_status,
+        retained_kind,
         errors,
     )
 
@@ -944,6 +979,7 @@ def _retire_owned_entry(
     parent_descriptor: int,
     name: str,
     expected_status: os.stat_result,
+    retained_kind: str,
     errors: list[BaseException],
 ) -> None:
     try:
@@ -956,7 +992,12 @@ def _retire_owned_entry(
     if not _same_entry_identity(expected_status, visible):
         return
 
-    retired_name = _unused_retired_name(parent_descriptor, name, errors)
+    retired_name = _unused_retired_name(
+        parent_descriptor,
+        name,
+        retained_kind,
+        errors,
+    )
     if retired_name is None:
         return
     try:
@@ -985,20 +1026,56 @@ def _retire_owned_entry(
         return
     if not _same_entry_identity(expected_status, retired):
         errors.append(PersistenceError("raw artifact cleanup identity changed"))
+        _restore_unowned_entry(
+            parent_descriptor,
+            retired_name,
+            name,
+            retired,
+            errors,
+        )
         return
 
+    # POSIX has no compare-and-unlink primitive. Retain the verified owner
+    # under its hidden retirement name: an unlink after an identity check could
+    # otherwise delete a different file installed by a concurrent writer. A
+    # matching `.cleanup.tmp` is an internal hard link only; prune removes it
+    # with its JSON artifact after the retention period.
+
+
+def _restore_unowned_entry(
+    parent_descriptor: int,
+    retired_name: str,
+    original_name: str,
+    expected_status: os.stat_result,
+    errors: list[BaseException],
+) -> None:
+    """Restore an entry moved by a race without unlinking either pathname."""
+
     try:
-        still_owned = os.stat(
+        visible = os.stat(
             retired_name,
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
-        if not _same_entry_identity(expected_status, still_owned):
+        if not _same_entry_identity(expected_status, visible):
             errors.append(PersistenceError("raw artifact cleanup identity changed"))
             return
-        os.unlink(retired_name, dir_fd=parent_descriptor)
-    except FileNotFoundError:
-        return
+        os.link(
+            retired_name,
+            original_name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        restored = os.stat(
+            original_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not _same_entry_identity(expected_status, restored):
+            errors.append(PersistenceError("raw artifact cleanup identity changed"))
+    except FileExistsError:
+        errors.append(PersistenceError("raw artifact cleanup path changed"))
     except OSError as error:
         errors.append(error)
 
@@ -1006,10 +1083,14 @@ def _retire_owned_entry(
 def _unused_retired_name(
     parent_descriptor: int,
     name: str,
+    retained_kind: str,
     errors: list[BaseException],
 ) -> str | None:
+    if retained_kind not in {"cleanup", "failed"}:
+        errors.append(PersistenceError("invalid raw artifact retirement kind"))
+        return None
     for _ in range(128):
-        candidate = f".{name}.{secrets.token_hex(16)}.cleanup.tmp"
+        candidate = f".{name}.{secrets.token_hex(16)}.{retained_kind}.tmp"
         try:
             os.stat(
                 candidate,
@@ -1225,6 +1306,8 @@ def _delete_prune_candidate(
         )
         if not _same_frozen_candidate(candidate, final):
             raise PersistenceError("raw artifact changed during pruning")
+        for cleanup_name in _matching_cleanup_hardlinks(parent, candidate):
+            os.unlink(cleanup_name, dir_fd=parent)
         os.unlink(candidate.name, dir_fd=parent)
         _fsync_directory_descriptor(parent)
     finally:
@@ -1234,6 +1317,24 @@ def _delete_prune_candidate(
             else (parent,)
         )
         _close_descriptors(descriptors)
+
+
+def _matching_cleanup_hardlinks(
+    parent_descriptor: int,
+    candidate: _PruneCandidate,
+) -> tuple[str, ...]:
+    """Return only cleanup links that still name this exact artifact inode."""
+
+    with os.scandir(parent_descriptor) as entries:
+        names = sorted(entry.name for entry in entries)
+    matches: list[str] = []
+    for name in names:
+        if not name.endswith(".cleanup.tmp"):
+            continue
+        status = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if _same_frozen_candidate(candidate, status):
+            matches.append(name)
+    return tuple(matches)
 
 
 def _directory_open_flags() -> int:
