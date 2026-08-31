@@ -833,18 +833,12 @@ class RunLock:
         payload = self._payload
         identity = self._created_identity
         parent_descriptor = self._parent_descriptor
-        self._acquired = False
-        self._payload = None
-        self._created_identity = None
-        self._parent_descriptor = None
         if payload is None or identity is None or parent_descriptor is None:
-            if parent_descriptor is not None:
-                try:
-                    os.close(parent_descriptor)
-                except OSError:
-                    pass
+            if exc_type is None:
+                raise PersistenceError("run-lock ownership state is incomplete")
             return False
         gate_descriptor: Optional[int] = None
+        ownership_resolved = False
         try:
             try:
                 gate_descriptor = self._acquire_gate(parent_descriptor)
@@ -854,9 +848,17 @@ class RunLock:
                 return False
             try:
                 current, current_identity = self._read_existing(parent_descriptor)
-            except (_MissingLock, _UnsafeExistingLock):
+            except _MissingLock:
+                ownership_resolved = True
+                return False
+            except _UnsafeExistingLock as inspection_error:
+                if exc_type is None:
+                    raise PersistenceError(
+                        "cannot safely inspect owned run lock"
+                    ) from inspection_error
                 return False
             if current != payload or current_identity[:2] != identity[:2]:
+                ownership_resolved = True
                 return False
             try:
                 self._atomic_remove_expected(
@@ -869,12 +871,18 @@ class RunLock:
                     raise PersistenceError(
                         "cannot release owned run lock atomically"
                     ) from removal_error
+                return False
+            ownership_resolved = True
             return False
         finally:
             if gate_descriptor is not None:
                 self._release_gate(gate_descriptor)
-            try:
-                os.close(parent_descriptor)
-            except OSError:
-                pass
-
+            if ownership_resolved:
+                self._acquired = False
+                self._payload = None
+                self._created_identity = None
+                self._parent_descriptor = None
+                try:
+                    os.close(parent_descriptor)
+                except OSError:
+                    pass

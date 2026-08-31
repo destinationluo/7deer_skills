@@ -396,6 +396,59 @@ class RunLockTests(unittest.TestCase):
             self.assertFalse(missing.__exit__(None, None, None))
             self.assertFalse(path.exists())
 
+    def test_release_retries_after_transient_gate_or_read_failure(self) -> None:
+        with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
+            root = Path(directory)
+
+            gate_path = root / "gate-failure.lock"
+            gate_lock = self._lock(gate_path)
+            gate_lock.acquire()
+            with mock.patch.object(
+                gate_lock,
+                "_acquire_gate",
+                side_effect=PersistenceError("transient gate failure"),
+            ), self.assertRaisesRegex(PersistenceError, "transient gate failure"):
+                gate_lock.release()
+            self.assertTrue(gate_path.exists())
+            with self.assertRaises(RunBusyError):
+                self._lock(gate_path).__enter__()
+            gate_lock.release()
+            self.assertFalse(gate_path.exists())
+
+            read_path = root / "read-failure.lock"
+            read_lock = self._lock(read_path)
+            read_lock.acquire()
+            with mock.patch(
+                "unified_game_radar.run_lock.os.read",
+                side_effect=OSError("transient read failure"),
+            ), self.assertRaisesRegex(
+                PersistenceError,
+                "cannot safely inspect owned run lock",
+            ):
+                read_lock.release()
+            self.assertTrue(read_path.exists())
+            with self.assertRaises(RunBusyError):
+                self._lock(read_path).__enter__()
+            read_lock.release()
+            self.assertFalse(read_path.exists())
+
+            removal_path = root / "removal-failure.lock"
+            removal_lock = self._lock(removal_path)
+            removal_lock.acquire()
+            with mock.patch(
+                "unified_game_radar.run_lock.os.rename",
+                side_effect=OSError("transient quarantine failure"),
+            ), self.assertRaisesRegex(
+                PersistenceError,
+                "cannot release owned run lock atomically",
+            ):
+                removal_lock.release()
+            self.assertTrue(removal_path.exists())
+            with self.assertRaises(RunBusyError):
+                self._lock(removal_path).__enter__()
+            removal_lock.release()
+            self.assertFalse(removal_path.exists())
+
     def test_cleanup_on_body_exception_does_not_suppress_or_mask_it(self) -> None:
         with tempfile.TemporaryDirectory(dir=SAFE_TEMP_DIR) as directory:
             path = Path(directory) / "radar.lock"
@@ -422,6 +475,7 @@ class RunLockTests(unittest.TestCase):
                 "host": "worker-1",
                 "acquired_at": "2026-08-24T03:00:00Z",
             })
+            lock.release()
             quarantines[0].unlink()
 
             lock = self._lock(path)
@@ -435,6 +489,7 @@ class RunLockTests(unittest.TestCase):
             self.assertFalse(path.exists())
             self.assertEqual(len(quarantines), 1)
 
+            lock.release()
             quarantines[0].unlink()
             real_fchmod = os.fchmod
             fchmod_calls = 0
@@ -486,6 +541,8 @@ class RunLockTests(unittest.TestCase):
                 lock.__exit__(None, None, None)
             self.assertEqual(json.loads(before_move.read_text()), replacement_before)
             self.assertEqual(before_move.stat().st_ino, replacement_before_inode[0])
+            lock.release()
+            self.assertEqual(json.loads(before_move.read_text()), replacement_before)
 
             after_move = Path(directory) / "cleanup-after-move.lock"
             lock = self._lock(after_move)
