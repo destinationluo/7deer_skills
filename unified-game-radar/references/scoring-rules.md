@@ -190,3 +190,90 @@ key ascending, then observation IDs. Numeric inputs reject booleans, nonfinite
 values, and integers too large for finite float conversion with `ValueError`.
 Independent parameters such as `heat_floor` are validated even for an empty
 cohort.
+
+## Unified opportunity score
+
+`unified_game_radar.score` combines a normalized platform score with verified
+search, independent-spread, and exact-intent SERP evidence. Every scoring
+function is pure and requires an explicit UTC publication time whenever
+freshness affects credit. Missing or stale evidence contributes zero; its
+weight is never transferred to another component. Components and totals use
+decimal half-up rounding to one decimal place.
+
+| Component | Maximum |
+|---|---:|
+| Normalized platform momentum | 30 |
+| Search demand | 30 |
+| Independent external spread | 20 |
+| SEO content gap | 20 |
+
+### Search demand
+
+Only completed Trends days participate. Evidence that the demand classifier
+marks `unknown` earns no demand points.
+
+- Persistence: 2 points per completed nonzero day, capped at 8.
+- Latest retention: `8 * min(1, latest / peak)`.
+- Later local maximum: 6 points at 50% or more of peak, 3 points from 30%
+  through less than 50%, otherwise 0.
+- Relevant autocomplete: 2 points for one distinct normalized query, 4 for at
+  least two.
+- Relevant related queries: the same 0/2/4 rule, independently.
+
+The component is capped at 30. A repeated query with different casing or
+spacing is one query. Queries outside the intended game's supported game-intent
+suffixes receive no credit.
+
+### Independent external spread
+
+Only evidence with `author_relation=independent`, an observation no later than
+publication, and publication age from zero through exactly seven days scores.
+Developer and unknown-author rows stay available as provenance but earn zero.
+Distinct domains come from canonical HTTPS URL hostnames with a leading
+`www.` removed.
+
+- Domain diversity: 4 points per distinct domain, capped at 8.
+- Evidence rows: 2 points per qualifying row, capped at 4.
+- Highest verified engagement: 8 at 10,000+, 6 at 1,000+, 4 at 100+, 2 at
+  20+, 1 for a present count below 20, and 0 when every count is missing.
+- Recency: 4 points when the newest qualifying publication is at most two days
+  old; otherwise 2 through exactly seven days.
+
+The component is capped at 20.
+
+### SEO content gap
+
+Freshness is inclusive through 24 hours. Stale or absent SERP evidence earns
+zero. A missing count earns zero for that subcomponent without reweighting,
+but makes SERP evidence unknown for action selection.
+
+- Guide results: 10 points for 0, 7 for 1–2, 3 for 3–5, otherwise 0.
+- Relevant nonofficial results: 6 points for 0, 4 for 1–3, 2 for 4–10,
+  otherwise 0.
+- Missing intents among `guide`, `codes`, `answers`, and `wiki`: 1 point each,
+  capped at 4.
+
+### Hard-gated actions
+
+Numeric thresholds apply only after the search-demand and SERP gates:
+
+| Total | Action |
+|---|---|
+| 80–100 | `immediate_action` |
+| 65–79.9 | `worth_content_mvp` |
+| 50–64.9 | `watch` |
+| below 50 | `skip` |
+
+The overrides are authoritative: demand `fail` is always `skip`,
+`early_watch` is always `watch`, and `unknown` is always
+`needs_verification`. A `pass` with unknown/stale demand or SERP evidence is
+also `needs_verification`. A score of at least 80 without qualifying
+independent evidence is demoted to `worth_content_mvp`; a high total never
+overrides a hard gate.
+
+### Stable unified ordering
+
+The daily leaderboard sorts by action priority (`immediate_action`,
+`worth_content_mvp`, `watch`, `needs_verification`, `skip`), then total score,
+demand score, and platform score descending, followed by normalized name and
+`opportunity_id` ascending.
