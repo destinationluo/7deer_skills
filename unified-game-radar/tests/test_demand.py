@@ -354,6 +354,38 @@ class OrderedDemandGateTests(unittest.TestCase):
 
         self.assertEqual(self.classify(item), "pass")
 
+    def test_irrelevant_fresh_query_does_not_poison_relevant_support(self) -> None:
+        item = evidence(
+            (10, 20, 15),
+            autocomplete=(
+                suggestion("GeoSlice game codes"),
+                suggestion("GeoSlice soundtrack"),
+            ),
+        )
+
+        self.assertEqual(self.classify(item), "pass")
+
+    def test_irrelevant_only_queries_follow_missing_support_rules(self) -> None:
+        item = evidence(
+            (10, 20, 15),
+            autocomplete=(suggestion("GeoSlice soundtrack"),),
+        )
+
+        self.assertEqual(self.classify(item), "early_watch")
+
+    def test_stale_irrelevant_query_still_invalidates_evidence_bundle(self) -> None:
+        item = evidence(
+            (10, 20, 15),
+            autocomplete=(
+                suggestion(
+                    "GeoSlice soundtrack",
+                    observed_at=NOW - timedelta(hours=24, microseconds=1),
+                ),
+            ),
+        )
+
+        self.assertEqual(self.classify(item), "unknown")
+
     def test_verified_second_wave_can_replace_query_support(self) -> None:
         item = evidence((10, 100, 20, 60))
 

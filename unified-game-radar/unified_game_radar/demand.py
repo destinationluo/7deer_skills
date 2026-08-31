@@ -271,9 +271,12 @@ def _search_contract_is_usable(
     for row in support:
         if not _fresh(row.observed_at, publication_time):
             return False, ()
-        if not _is_relevant_support_query(game_name, row.query):
-            return False, ()
-    return True, support
+    relevant_support = tuple(
+        row
+        for row in support
+        if _is_relevant_support_query(game_name, row.query)
+    )
+    return True, relevant_support
 
 
 def classify_demand(
