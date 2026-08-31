@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -104,6 +105,7 @@ def make_health(
     run_id: str = RUN_ID,
     status: str = "fresh",
     warnings: tuple[WarningRecord, ...] = (),
+    capabilities: Mapping[str, bool] | None = None,
 ) -> SourceHealth:
     return SourceHealth(
         schema_version=1,
@@ -111,7 +113,9 @@ def make_health(
         collector=collector,
         status=status,
         observed_at=NOW,
-        capabilities={"listing": True},
+        capabilities=(
+            {"listing": True} if capabilities is None else capabilities
+        ),
         warnings=warnings,
     )
 
@@ -186,6 +190,105 @@ class CollectorContractTests(unittest.TestCase):
                 values = {**valid, **invalid}
                 with self.assertRaises(InputValidationError):
                     CollectorResult(**values)  # type: ignore[arg-type]
+
+    def test_result_rejects_health_warning_for_another_collector(self) -> None:
+        with self.assertRaisesRegex(
+            InputValidationError,
+            "warning collector must match result collector",
+        ):
+            CollectorResult(
+                collector="steam",
+                observations=(make_observation(),),
+                health=make_health(
+                    warnings=(make_warning(collector="roblox"),)
+                ),
+                raw_artifacts=(),
+            )
+
+        result = CollectorResult(
+            collector="steam",
+            observations=(make_observation(),),
+            health=make_health(warnings=(make_warning(collector=None),)),
+            raw_artifacts=(),
+        )
+        self.assertIsNone(result.health.warnings[0].collector)
+
+    def test_result_requires_observations_for_fresh_and_partial_health(self) -> None:
+        for health in (
+            make_health(status="fresh"),
+            make_health(
+                status="partial",
+                capabilities={"listing": False},
+            ),
+        ):
+            with self.subTest(status=health.status):
+                with self.assertRaisesRegex(
+                    InputValidationError,
+                    "requires at least one observation",
+                ):
+                    CollectorResult(
+                        collector="steam",
+                        observations=(),
+                        health=health,
+                        raw_artifacts=(),
+                    )
+
+    def test_result_enforces_fresh_and_partial_capability_meaning(self) -> None:
+        invalid_health = (
+            make_health(
+                status="fresh",
+                capabilities={"listing": True, "metadata": False},
+            ),
+            make_health(
+                status="partial",
+                capabilities={"listing": True},
+            ),
+            make_health(status="partial", capabilities={}),
+        )
+        for health in invalid_health:
+            with self.subTest(
+                status=health.status,
+                capabilities=dict(health.capabilities),
+            ):
+                with self.assertRaises(InputValidationError):
+                    CollectorResult(
+                        collector="steam",
+                        observations=(make_observation(),),
+                        health=health,
+                        raw_artifacts=(),
+                    )
+
+    def test_result_not_run_rejects_collection_output_or_success(self) -> None:
+        valid = {
+            "collector": "steam",
+            "observations": (),
+            "health": make_health(
+                status="not_run",
+                capabilities={"listing": False},
+            ),
+            "raw_artifacts": (),
+        }
+        invalid_values = (
+            {"observations": (make_observation(),)},
+            {"raw_artifacts": (make_artifact(),)},
+            {
+                "health": make_health(
+                    status="not_run",
+                    capabilities={"listing": True},
+                )
+            },
+        )
+        for invalid in invalid_values:
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(
+                    InputValidationError,
+                    "not_run",
+                ):
+                    CollectorResult(**{**valid, **invalid})  # type: ignore[arg-type]
+
+        result = CollectorResult(**valid)  # type: ignore[arg-type]
+        self.assertEqual("not_run", result.health.status)
+        self.assertEqual({"listing": False}, result.health.capabilities)
 
 
 class SourceHealthClassificationTests(unittest.TestCase):
@@ -365,6 +468,23 @@ class SourceHealthClassificationTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ValueError):
                     classify(**invalid)
+
+    def test_rejects_huge_hour_windows_with_stable_value_error(self) -> None:
+        invalid_values = (
+            {
+                "fresh_hours": 10**400,
+                "stale_fallback_hours": 10**401,
+            },
+            {
+                "active_observations": (),
+                "stale_fallback_hours": 10**400,
+            },
+        )
+        for invalid in invalid_values:
+            with self.subTest(field=tuple(invalid)):
+                with self.assertRaises(ValueError) as caught:
+                    classify(**invalid)
+                self.assertIs(type(caught.exception), ValueError)
 
     def test_rejects_invalid_capability_maps(self) -> None:
         invalid_values: tuple[object, ...] = (

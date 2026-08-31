@@ -66,10 +66,13 @@ def _aware_utc(value: object, name: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _positive_hours(value: object, name: str) -> int:
+def _positive_window(value: object, name: str) -> timedelta:
     if type(value) is not int or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
-    return value
+    try:
+        return timedelta(hours=value)
+    except OverflowError as error:
+        raise ValueError(f"{name} is too large") from error
 
 
 def _capability_map(value: object) -> dict[str, bool]:
@@ -92,6 +95,44 @@ def _capability_map(value: object) -> dict[str, bool]:
             raise ValueError("capability values must be booleans")
         parsed[key] = succeeded
     return parsed
+
+
+def _validate_result_semantics(
+    collector: str,
+    observations: tuple[PlatformObservation, ...],
+    health: SourceHealth,
+    raw_artifacts: tuple[RawArtifact, ...],
+) -> None:
+    for warning in health.warnings:
+        if warning.collector is not None and warning.collector != collector:
+            raise InputValidationError(
+                "warning collector must match result collector"
+            )
+
+    has_failed_capability = any(
+        not succeeded for succeeded in health.capabilities.values()
+    )
+    if health.status in {"fresh", "partial"} and not observations:
+        raise InputValidationError(
+            f"{health.status} health requires at least one observation"
+        )
+    if health.status == "fresh" and has_failed_capability:
+        raise InputValidationError(
+            "fresh health cannot contain a failed capability"
+        )
+    if health.status == "partial" and not has_failed_capability:
+        raise InputValidationError(
+            "partial health requires at least one failed capability"
+        )
+    if health.status == "not_run" and (
+        observations
+        or raw_artifacts
+        or any(health.capabilities.values())
+    ):
+        raise InputValidationError(
+            "not_run health cannot contain observations, raw artifacts, "
+            "or successful capabilities"
+        )
 
 
 @runtime_checkable
@@ -143,6 +184,12 @@ class CollectorResult:
                 raise InputValidationError(
                     "raw artifact run_id must match health run_id"
                 )
+        _validate_result_semantics(
+            collector,
+            observations,
+            self.health,
+            raw_artifacts,
+        )
         object.__setattr__(self, "collector", collector)
         object.__setattr__(self, "observations", observations)
         object.__setattr__(self, "raw_artifacts", raw_artifacts)
@@ -167,12 +214,12 @@ def classify_source_health(
     parsed_now = _aware_utc(now, "now")
     if type(attempted) is not bool:
         raise ValueError("attempted must be a boolean")
-    parsed_fresh_hours = _positive_hours(fresh_hours, "fresh_hours")
-    parsed_stale_hours = _positive_hours(
+    fresh_window = _positive_window(fresh_hours, "fresh_hours")
+    stale_window = _positive_window(
         stale_fallback_hours,
         "stale_fallback_hours",
     )
-    if parsed_fresh_hours >= parsed_stale_hours:
+    if fresh_window >= stale_window:
         raise ValueError("fresh_hours must be less than stale_fallback_hours")
 
     observations = _helper_records(
@@ -211,9 +258,8 @@ def classify_source_health(
             )
         status = "not_run"
     else:
-        fresh_limit = timedelta(hours=parsed_fresh_hours)
         active_is_fresh = bool(observations) and all(
-            timedelta(0) <= parsed_now - observation.observed_at <= fresh_limit
+            timedelta(0) <= parsed_now - observation.observed_at <= fresh_window
             for observation in observations
         )
         if active_is_fresh:
@@ -223,10 +269,9 @@ def classify_source_health(
                 else "fresh"
             )
         else:
-            stale_limit = timedelta(hours=parsed_stale_hours)
             fallback_is_usable = (
                 fallback is not None
-                and timedelta(0) <= parsed_now - fallback <= stale_limit
+                and timedelta(0) <= parsed_now - fallback <= stale_window
             )
             status = "stale" if fallback_is_usable else "unavailable"
 
