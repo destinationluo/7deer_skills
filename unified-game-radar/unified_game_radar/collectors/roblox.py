@@ -106,7 +106,13 @@ def _materialize_payload(value: object) -> Mapping[str, object]:
                 allow_nan=False,
                 separators=(",", ":"),
             ).encode("utf-8")
-        except (TypeError, ValueError, OverflowError, UnicodeError) as error:
+        except (
+            TypeError,
+            ValueError,
+            OverflowError,
+            UnicodeError,
+            RecursionError,
+        ) as error:
             raise _invalid(
                 "Roblox envelope must contain JSON-compatible data"
             ) from error
@@ -119,7 +125,7 @@ def _materialize_payload(value: object) -> Mapping[str, object]:
         )
     try:
         parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_json_object)
-    except (UnicodeError, json.JSONDecodeError) as error:
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
         raise _invalid("Roblox envelope must be valid UTF-8 JSON") from error
     if not isinstance(parsed, Mapping):
         raise _invalid("Roblox envelope must contain a JSON object")
@@ -153,6 +159,13 @@ def _text(value: object, name: str, maximum: int) -> str:
     return value
 
 
+def _visible_text(value: object, name: str, maximum: int) -> str:
+    parsed = _text(value, name, maximum)
+    if any(unicodedata.category(character).startswith("C") for character in parsed):
+        raise _invalid(f"{name} must not contain Unicode other-category characters")
+    return parsed
+
+
 def _literal(
     value: object,
     name: str,
@@ -181,6 +194,17 @@ def _integer(
 
 def _positive_id(value: object, name: str) -> int:
     return _integer(value, name, minimum=1, maximum=MAX_SAFE_INTEGER)
+
+
+def _positive_id_text(value: object, name: str) -> int:
+    if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]*", value) is None:
+        raise _invalid(f"{name} must be a positive ASCII integer")
+    maximum = str(MAX_SAFE_INTEGER)
+    if len(value) > len(maximum) or (
+        len(value) == len(maximum) and value > maximum
+    ):
+        raise _invalid(f"{name} exceeds the JSON safe integer limit")
+    return int(value)
 
 
 def _metric(value: object, name: str) -> int | None:
@@ -241,7 +265,10 @@ def _game_url(value: object, place_id: int) -> str:
     match = _GAME_PATH.fullmatch(split.path)
     if match is None or split.query or split.fragment:
         raise _invalid("game_url must be a canonical Roblox game URL")
-    path_place_id = _positive_id(int(match.group("place_id")), "game_url place ID")
+    path_place_id = _positive_id_text(
+        match.group("place_id"),
+        "game_url place ID",
+    )
     if path_place_id != place_id:
         raise _invalid("game_url place ID must match place_id")
     return parsed
@@ -279,8 +306,12 @@ class RobloxBrowserRow:
         place_id = _positive_id(self.place_id, "place_id")
         object.__setattr__(self, "universe_id", universe_id)
         object.__setattr__(self, "place_id", place_id)
-        object.__setattr__(self, "name", _text(self.name, "name", 256))
-        object.__setattr__(self, "developer", _text(self.developer, "developer", 256))
+        object.__setattr__(self, "name", _visible_text(self.name, "name", 256))
+        object.__setattr__(
+            self,
+            "developer",
+            _visible_text(self.developer, "developer", 256),
+        )
         object.__setattr__(self, "game_url", _game_url(self.game_url, place_id))
         surface = _literal(self.surface, "surface", _SURFACES)
         object.__setattr__(self, "surface", surface)

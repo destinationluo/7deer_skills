@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 import json
 import math
@@ -187,6 +187,24 @@ class RobloxEnvelopeContractTests(unittest.TestCase):
                 with self.assertRaises(InputValidationError):
                     parse_roblox_envelope(payload, radar_run())
 
+    def test_maps_deep_json_recursion_to_input_validation_error(self) -> None:
+        depth = sys.getrecursionlimit() + 100
+        deep_text = '{"nested":' * depth + "0" + "}" * depth
+        self.assertLess(len(deep_text.encode("utf-8")), MAX_ENVELOPE_BYTES)
+        self.assertLess(depth * 20, MAX_ENVELOPE_BYTES)
+
+        deep_mapping: dict[str, object] = {}
+        cursor = deep_mapping
+        for _ in range(depth):
+            child: dict[str, object] = {}
+            cursor["nested"] = child
+            cursor = child
+
+        for payload in (deep_text, deep_text.encode("utf-8"), deep_mapping):
+            with self.subTest(payload=type(payload).__name__):
+                with self.assertRaises(InputValidationError):
+                    parse_roblox_envelope(payload, radar_run())
+
 
 class RobloxRowValidationTests(unittest.TestCase):
     def test_accepts_exact_surfaces_scopes_and_bound_evidence_urls(self) -> None:
@@ -237,6 +255,7 @@ class RobloxRowValidationTests(unittest.TestCase):
                     )
 
     def test_requires_positive_json_safe_integer_ids_and_url_place_binding(self) -> None:
+        long_place_id = "9" * 5000
         invalid = (
             {"universe_id": 0},
             {"universe_id": True},
@@ -246,6 +265,11 @@ class RobloxRowValidationTests(unittest.TestCase):
             {"place_id": False},
             {"place_id": MAX_SAFE_INTEGER + 1},
             {"place_id": 123, "game_url": "https://www.roblox.com/games/9876543210/Signal-Garden"},
+            {
+                "game_url": (
+                    f"https://www.roblox.com/games/{long_place_id}/Signal-Garden"
+                )
+            },
         )
         for changes in invalid:
             with self.subTest(changes=changes):
@@ -294,6 +318,27 @@ class RobloxRowValidationTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 with self.assertRaises(InputValidationError):
                     parse_roblox_envelope(payload, radar_run())
+
+    def test_visible_names_reject_all_unicode_other_categories(self) -> None:
+        parsed = parse_roblox_envelope(valid_envelope(), radar_run())
+        forbidden = (
+            "\n",
+            "\t",
+            "\x1b",
+            "\u200b",
+            "\u202e",
+            "\u2066",
+            "\ud800",
+            "\ue000",
+        )
+        for field in ("name", "developer"):
+            for character in forbidden:
+                with self.subTest(field=field, character=ascii(character)):
+                    with self.assertRaises(InputValidationError):
+                        replace(
+                            parsed.rows[0],
+                            **{field: f"visible{character}text"},
+                        )
 
     def test_all_urls_use_exact_roblox_https_owned_hosts_and_canonical_paths(self) -> None:
         rejected = (
