@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "country": "US",
+  "language": "english",
+  "timezone": "Asia/Shanghai",
+  "schedule": "0 11 * * *",
+  "released_candidate_limit": 50,
+  "unreleased_candidate_limit": 50,
+  "preliminary_top_n": 20,
+  "enrichment_top_n": 10,
+  "final_top_n": 10,
+  "request_timeout_seconds": 15.0,
+  "max_retries": 3,
+  "minimum_request_interval_seconds": 1.0,
+  "raw_retention_days": 14,
+  "raw_max_bytes_per_provider": 5242880,
+  "stale_warning_hours": 36,
+  "stale_fallback_limit_hours": 72,
+  "data_dir": "data/steam-game-radar",
+  "report_dir": "reports/steam-game-radar"
+}

@@ -1,6 +1,6 @@
 ﻿# 🛠️ 7Deer Skills — Agent Skills 开放标准技能库
 
-> 25 个可复用的 AI Agent 技能模块，基于 [Agent Skills 开放标准](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)构建。
+> 33 个可复用的 AI Agent 技能模块，基于 [Agent Skills 开放标准](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)构建。
 > 克隆到项目中，你的 AI Agent 即可自动发现并加载这些能力。
 
 这是一个开源技能库，包含了从实际项目中提炼出来的可复用代码模块和指令模板。
@@ -25,7 +25,7 @@
 🔄 **内容自动同步** — `auto-page-sync` 让你只管往仓库写 Markdown，前端页面自动生成。配合 GitHub Actions 定时拉取，Google 爬虫看到的永远是最新内容。支持日报、博客、Changelog、Landing Page 等多种页面模式，一套机制复用所有项目。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
-[![Skills](https://img.shields.io/badge/skills-26-blue.svg)](#-完整技能清单)
+[![Skills](https://img.shields.io/badge/skills-33-blue.svg)](#-完整技能清单)
 [![Agent Skills Standard](https://img.shields.io/badge/standard-Agent_Skills-8A2BE2.svg)](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)
 [![Contributions Welcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](./CONTRIBUTING.md)
 
@@ -35,7 +35,7 @@
 
 ```bash
 # 克隆到项目的 skills 目录，Agent 自动加载
-git clone https://github.com/kennyzir/7deer_skills.git .agent/skills
+git clone https://github.com/destinationluo/7deer_skills.git .agent/skills
 ```
 
 就这样。你的 Agent 会自动扫描每个 `SKILL.md` 的 name 和 description，在你的请求匹配时自动激活对应技能。
@@ -61,13 +61,13 @@ git clone https://github.com/kennyzir/7deer_skills.git .agent/skills
 
 ```bash
 # Claude Code / Kiro / VS Code Copilot / Codex / Gemini CLI（通用）
-git clone https://github.com/kennyzir/7deer_skills.git .agent/skills
+git clone https://github.com/destinationluo/7deer_skills.git .agent/skills
 
 # Cursor（也支持 .agent/skills，或复制到 .cursor/skills）
-git clone https://github.com/kennyzir/7deer_skills.git .agent/skills
+git clone https://github.com/destinationluo/7deer_skills.git .agent/skills
 
 # OpenClaw（全局安装，所有项目共享）
-git clone https://github.com/kennyzir/7deer_skills.git ~/.openclaw/skills/7deer
+git clone https://github.com/destinationluo/7deer_skills.git ~/.openclaw/skills/7deer
 
 # 只要一个技能？直接复制文件夹
 cp -r 7deer_skills/google-trends-to-pages .agent/skills/
@@ -119,6 +119,16 @@ cp -r 7deer_skills/google-trends-to-pages .agent/skills/
 | 10 | **youtube-intel** | YouTube 内容情报与竞品监测（Discovery + Monitoring） | 选题策划/竞品分析 |
 | 11 | **youtube-transcribe** | YouTube 视频转录（yt-dlp + whisper） | 视频内容提取 |
 
+### 游戏 & 数据情报
+| # | 技能名称 | 描述 | 适用场景 |
+|---|---------|------|---------|
+| 12 | **unified-game-radar** | itch.io、Steam、Roblox 统一候选榜；零需求与单次尖峰不可进入“值得做” | 每日热词游戏监控 |
+| 13 | **steam-game-radar** | 已弃用的 Steam 手动兼容入口；当前监控转入统一雷达 | Steam 单平台手动扫描 |
+| 14 | **html5-game-radar** | 已弃用的 itch.io/HTML5 手动兼容入口；当前监控转入统一雷达 | Web 游戏手动扫描 |
+| 15 | **itchio-new-game-hunt** | itch.io 新游戏挖掘与趋势追踪 | 独立游戏选品 |
+| 16 | **youtube-game-scout** | YouTube 游戏趋势扫描与候选挖掘 | 游戏内容情报 |
+| 17 | **x-demand-radar** | X/Twitter 需求信号与热点扫描 | 需求与趋势情报 |
+
 ### 外链建设
 | # | 技能名称 | 描述 | 适用场景 |
 |---|---------|------|---------|
@@ -166,27 +176,27 @@ cp -r 7deer_skills/google-trends-to-pages .agent/skills/
 
 ```bash
 # 在项目根目录执行，适用于 Claude Code / Kiro / VS Code Copilot / Codex / Gemini CLI
-git clone https://github.com/kennyzir/7deer_skills.git .agent/skills
+git clone https://github.com/destinationluo/7deer_skills.git .agent/skills
 ```
 
 ### 方法 2: Git Submodule（团队协作推荐）
 
 ```bash
-git submodule add https://github.com/kennyzir/7deer_skills.git .agent/skills
+git submodule add https://github.com/destinationluo/7deer_skills.git .agent/skills
 ```
 
 ### 方法 3: npx 一键安装（无需 git）
 
 ```bash
 # 下载到当前项目
-npx degit kennyzir/7deer_skills .agent/skills
+npx degit destinationluo/7deer_skills .agent/skills
 ```
 
 ### 方法 4: 只要某个技能
 
 ```bash
 # 只复制你需要的技能
-npx degit kennyzir/7deer_skills/google-trends-to-pages .agent/skills/google-trends-to-pages
+npx degit destinationluo/7deer_skills/google-trends-to-pages .agent/skills/google-trends-to-pages
 ```
 
 ### 安装后验证
@@ -321,6 +331,10 @@ intent = classify_intent("how to get six eyes jujutsu infinite")
 │   └── references/
 │       ├── steering-template.md
 │       └── setup-checklist.md
+├── unified-game-radar/                # itch.io + Steam + Roblox 统一机会榜
+│   ├── SKILL.md
+│   ├── scripts/game_radar.py
+│   └── references/
 ├── site-keyword-research/             # 整站关键词研究
 │   ├── SKILL.md
 │   └── references/
@@ -395,7 +409,7 @@ OPENAI_API_KEY=your_openai_api_key_here
 
 ## 📊 技能统计
 
-- **总技能数**: 25 个
+- **总技能数**: 33 个
 - **P0 核心技能**: 3 个
 - **代码行数**: 15,000+ 行
 - **文档页数**: 70+ 页
@@ -418,6 +432,14 @@ OPENAI_API_KEY=your_openai_api_key_here
 ---
 
 ## 📝 更新日志
+
+### 2026-09-01
+- 🎮 添加 **unified-game-radar**（itch.io、Steam、Roblox 统一候选榜与搜索需求硬门槛）
+- 📊 技能总数 → 33
+
+### 2026-08-24
+- 🎮 添加 **steam-game-radar**（Steam 官方趋势、本地 SteamDB 导入、SEO 评分与定时路由）
+- 📊 技能总数 → 32
 
 
 ### 2026-04-12
@@ -486,10 +508,9 @@ MIT License - 开源分享，欢迎使用和贡献。详见 [LICENSE](./LICENSE)
 
 ## 📧 联系方式
 
-- GitHub: [@kennyzir](https://github.com/kennyzir)
-- Repository: [7deer_skills](https://github.com/kennyzir/7deer_skills)
+- GitHub: [@destinationluo](https://github.com/destinationluo)
+- Repository: [7deer_skills](https://github.com/destinationluo/7deer_skills)
 
 ---
 
 **⭐ 如果这个技能库对你有帮助，请给个 Star！**
-

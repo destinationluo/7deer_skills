@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "run_id": "20260831T020000Z-a1b2c3d4",
+  "collector": "roblox",
+  "geo": "US",
+  "locale": "en",
+  "metric_definition_version": 1,
+  "observed_at": "2026-08-31T02:05:00Z",
+  "rows": [
+    {
+      "universe_id": 1234567890,
+      "place_id": 9876543210,
+      "name": "Signal Garden",
+      "developer": "Tiny Studio",
+      "game_url": "https://www.roblox.com/games/9876543210/Signal-Garden",
+      "surface": "rising",
+      "surface_scope": "global",
+      "rank": 3,
+      "concurrent_players": 1250,
+      "visits": 400000,
+      "favorites": 18000,
+      "observed_at": "2026-08-31T02:05:00Z",
+      "evidence_url": "https://www.roblox.com/charts/top-trending"
+    },
+    {
+      "universe_id": 2234567890,
+      "place_id": 8876543210,
+      "name": "Pocket Workshop",
+      "developer": "Maker Group",
+      "game_url": "https://www.roblox.com/games/8876543210/Pocket-Workshop",
+      "surface": "up-and-coming",
+      "surface_scope": "personalized",
+      "rank": 8,
+      "concurrent_players": 420,
+      "visits": 75000,
+      "favorites": 3200,
+      "observed_at": "2026-08-31T02:05:00Z",
+      "evidence_url": "https://www.roblox.com/charts/top-up-and-coming"
+    },
+    {
+      "universe_id": 3234567890,
+      "place_id": 7876543210,
+      "name": "Orbit Run",
+      "developer": "Orbit Works",
+      "game_url": "https://www.roblox.com/games/7876543210/Orbit-Run",
+      "surface": "charts",
+      "surface_scope": "global",
+      "rank": 21,
+      "concurrent_players": 9300,
+      "visits": 12000000,
+      "favorites": 410000,
+      "observed_at": "2026-08-31T02:05:00Z",
+      "evidence_url": "https://www.roblox.com/charts/top-playing-now"
+    }
+  ]
+}
